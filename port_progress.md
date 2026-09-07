@@ -1,5 +1,202 @@
 # Registro de Progreso — Gangstar Miami Vindication (PS Vita)
 
+> Bitácora cronológica, un bug confirmado a la vez. Para el estado **estructural** del port (motor,
+> mapa JNI, filesystem, niveles de logging, checklist) ver `PORTING_PLAN.md`.
+
+## Estado actual — 2026-09-07 (intento en curso, SIN verificar en consola)
+
+**Dónde está el port:** el juego **carga y corre a ~30 fps estables con pantalla
+negra y sin sonido**. Tanda Fases 14-17 (esta sesión, un solo build release verde
+tras otro, **ninguno verificado en hardware todavía**):
+
+1. **Carga acelerada** (Fase 14): `frame 2` de 12,6 s → 7,4 s; log de 1092 → ~400
+   líneas (filtro de spam del motor, dedupe de `fopen FAILED`, syncs cada 256,
+   `MULTISAMPLE_NONE` + 12 MB). Verificado en `debug_local_022.log`.
+2. **Atribución del error pegajoso** (Fases 15-16): cada frame terminaba con
+   `GL_INVALID_ENUM`; instrumentación `[GL]` + `LOG_ERRORS` reenviado al log
+   identificó `glLightfv(GL_SPOT_DIRECTION)` — gap real de vitaGL (sin soporte
+   spot), más 4 ofensores benignos (`DITHER`/MSAA-caps/`FOG_HINT`/`PACK_ALIGNMENT`).
+   Verificado en `debug_local_023/024.log`.
+3. **Fix + ojos** (Fase 17): casos `SPOT_*` agregados en vitaGL `ffp.c` (solo
+   storage, los shaders siguen sin spots — cambio visual esperado: ninguno) y
+   capturas `shot_*.bmp` del framebuffer cada ~20 s.
+4. **Sonido scopeado, NO implementado**: el `.so` no importa audio nativo (todo es
+   JNI `SoundPool`/`MediaPlayer`); los 1722 sonidos son `.ogg` sin decoder
+   vendored → fase propia, después del render.
+
+**Lo que sigue (pendiente):** desplegar el último `eboot.bin`
+(`build/eboot.bin` de esta tanda), correr 3-4 min, traer `debug_local_025.log` +
+`shot_*.bmp`. Si `lastErr=0x0` y sigue negro → el spot no era; los BMP deciden
+(negro total vs. escena oscura vs. geometría fuera de vista). Si el negro persiste,
+el siguiente sospechoso es textura negra (PVR/`Loaded texture` vs `texUp`) o
+cámara/lógica de menú.
+
+**Deuda conocida (no bugs, funcionalidad sin portar):** audio, video, y los hooks de ciclo de vida
+`nativePause`/`nativeResume`/`nativeAccelerometer`/`nativeDone`/`nativeOpenIGM`/`nativeCanInterrupt`,
+que están exportados pero no cableados en `main.c`. Ver el checklist de `PORTING_PLAN.md` sección 7.
+
+## Fase 14: acelerar la carga + achicar el log (2026-09-06)
+
+### Diagnóstico sobre `logs/debug_local_021.log` (1092 líneas, varios minutos, a mitad de carga)
+
+- El loop NO estaba colgado: `frame 184 slow render (20656 ms)` retornó y las últimas
+  `Loaded texture` son de adentro del frame 185. Pantalla negra = carga a mitad de camino
+  (95 `createTextureImpl` vs 121 en `020`), no deadlock. Sin dump en esta corrida.
+- Tres costos medidos en el propio log, todos en la ruta de carga:
+  1. Cada `l_note()` en release = LwMutex + 2x snprintf + `sceNetSendto` bloqueante +
+     `sceIoWrite` (+ sync periódico). El spam del motor (~500/1092 líneas: 324x
+     `---------------locale/basic_ios`, 95x `createTextureImpl`, más `Loaded texture`/
+     `CTexture::mapImpl`) paga eso cientos de veces.
+  2. Cada `fopen FAILED` = `l_error` = `sceIoSyncByFd()` inmediato a la memory card.
+     Solo `dummy.tga` x18 ya son 18 syncs seguidos.
+  3. `vglSwapBuffers()` con `MULTISAMPLE_4X` en cada frame de una pantalla negra: resolve
+     multimuestra puro overhead + combinación riesgosa con el FBO OES que el motor usa
+     (receta Asphalt-5 de Fase 12, pendiente desde entonces).
+
+### Cambios (solo loader, sin tocar motor/render)
+
+1. `source/reimpl/log.c`: `is_load_spam()` — `---------------*`, `createTextureImpl 1`,
+   `Loaded texture`, `CTexture::mapImpl` (tags `GameLoft`/`Gameloft`) pasan de `l_note` a
+   `l_debug` en INFO y WARN. En release desaparecen (log chico + carga rápida); en debug
+   siguen visibles. Versión/driver/mismatch/unbound/duplicate/invalid-bind siguen en `l_note`.
+2. `source/reimpl/io.c`: `fopen_soloader` deduplica FAILED consecutivos del mismo path —
+   solo el primero lleva `l_error` (un sync); las repeticiones van por `l_debug` y al cambiar
+   de path sale una línea `l_note("fopen: %s failed x%d total")` con el conteo.
+3. `source/utils/logger.c`: `LOCAL_LOG_SYNC_EVERY` 64 → 256 (WARN o más sigue con sync
+   inmediato; peor caso ante crash duro: se pierden las últimas <256 líneas low-severity).
+4. `source/utils/glutil.c`: `vglInitExtended(0, 960, 544, 12MB, MULTISAMPLE_NONE)`
+   (antes 6MB + 4X). Reversible si los menús se ven mal.
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-06).
+- **Pendiente:** desplegar (`eboot.bin` → `/ux0:/app/PSVGMV002/`) y correr dejando
+  **5-10 min sin matar**. Qué esperar: log de ~1/3 del tamaño, mismos `slow render`/`alive`
+  pero llegando más lejos en el mismo tiempo; si se queda >10 min sin línea nueva y sin
+  dump, entonces sí es cuelgue dentro de `nativeRender` y se triagea con ese frame.
+
+## Fase 15: el juego corre a full-speed con pantalla negra — triage de render (2026-09-06)
+
+### Qué muestra `logs/debug_local_022.log` (443 líneas, build Fase 14)
+
+- La Fase 14 funcionó: log de 1092 → 443 líneas, `frame 2` de 12,6 s → 7,4 s, y el dedupe
+  (`fopen: ... failed x8 total`) visible. El eboot desplegado SÍ lleva los cambios.
+- El motor pasó la carga y **corre a velocidad real**: frames hasta 1668, renders de
+  ~14-80 ms, `DeviceKeyInput:23` x3 (el CROSS llega al motor), 24x `[SOUNDS-VV] PLAYEX`
+  (el mixer del juego pide sonidos — stubs silenciosos, no bloquean), 69 `Loaded texture`.
+  Sin dump. La pantalla negra ya NO es carga: es render (o espera de input en título).
+- Corrección al filtro Fase 14: los tags reales son `GameLoft Printer::log/log2/logf`
+  (censo: 188/92/75 líneas), así que el exact-match solo pescó 5 líneas y las 69
+  `Loaded texture` se colaron. `is_load_spam()` ahora matchea por prefijo de tag
+  (los textos siguen exactos, la señal no se toca).
+- Descartado: `glDrawTex*OES` (todas en `ret0`) — el `.so` no importa ningún `glDrawTex*`
+  (`objdump -T`, solo una C++ `Graphics2D::DrawTexture` no relacionada) y vitaGL ni lo
+  implementa. Los draws 2D/3D van por `glDrawArrays`/`glDrawElements`.
+
+### Instrumentación TEMP (`source/reimpl/gl.{c,h}`, `dynlib.c`, `glutil.c`)
+
+- Contadores draws/clears/texUploads/FBO-binds + viewport actual + último status de FBO
+  + `glGetError()` drenado una vez por frame (mismo hilo/contexto que el motor).
+- Wrappers 1:1 re-apuntados en `dynlib.c`: `glDrawArrays`/`glDrawElements`/`glClear`/
+  `glViewport`/`glBindFramebuffer(OES)`/`glCheckFramebufferStatus(OES)`.
+- `gl_frame_tick()` desde `gl_swap()`: FBO incompleto y cambio de `glGetError` salen al
+  instante por `l_note`; resumen `[GL] frames/draws/clears/texUp/fbo/vp/fboStatus/lastErr`
+  cada 5 s. Costo: unos incrementos por draw. Quitar al cerrar el triage de render.
+
+### Cómo leer el próximo log
+
+- `draws==0` con frames girando → el motor no envía geometría (espera lógica/input, no GL).
+- `draws>0` + negro → estado GL (`vp`, `fbo`, `lastErr` dicen cuál).
+- `lastErr!=0x0` pegajoso → el error mismo es la causa.
+- `FBO incomplete` → el render-to-texture del motor no completa en vitaGL.
+
+## Fase 16: sticky `GL_INVALID_ENUM` cada frame + heartbeat legible (2026-09-06)
+
+### Qué muestra `logs/debug_local_023.log` (412 líneas, build Fase 15)
+
+- El `[GL]` es decisivo: **draws>0 y creciendo** (13 → 48011, ~25 draws/frame), clears
+  ~2/frame, `fbo=0` con 1 solo bind (render al framebuffer default — hipótesis FBO
+  **descartada**), `vp=0,0,960,480` (el motor elige 480 de alto, no es bug nuestro),
+  `texUp=4-5` (las 69 `Loaded texture` del engine suben por vía comprimida/subimage,
+  antes invisible), y **`glGetError: 0x500 (GL_INVALID_ENUM)` pegajoso en CADA frame**
+  desde ~frame 200. El motor envía geometría pero una llamada con enum inválido falla
+  siempre — candidato directo a la pantalla negra.
+- Audio: el `.so` **no importa ningún símbolo nativo de audio** (`objdump -T | grep UND`
+  no trae OpenSL/AudioTrack/ALSA/nada) — todo el sonido va por JNI (`SoundPool` 5 streams
+  + `MediaPlayer`, 23 métodos ya stubbeados en `java.c`). Los 1722 sonidos en `data/` son
+  **.ogg Vorbis** (0 .wav) y no hay ningún decoder vendored en `lib/`. O sea: que suene
+  = vendorizar un decoder vorbis (ej. stb_vorbis) + emular SoundPool/MediaPlayer sobre
+  `SceAudioOut`. Es una fase propia, no un fix rápido; va después del render (sonido sin
+  imagen no sirve). Diseño listo para cuando toque.
+
+### Cambios
+
+1. `CMakeLists.txt`: `LOG_ERRORS` en `vitaGL_local` — prende las líneas internas
+   `file:line: func set GL_INVALID_ENUM (param: 0xVALUE)` de vitaGL.
+2. `lib/vitaGL/source/utils/debug_utils.h` (patch vendor marcado, TEMP): `vgl_log` →
+   `vgl_log_capture()` en vez de `sceClibPrintf` pelado, que ninguna captura ve.
+3. `source/reimpl/gl.c`: `vgl_log_capture()` reenvía a `l_note("[vitaGL] ...")` con
+   dedupe de repetidos (misma línea: silencio + recordatorio cada x300 + total al
+   cambiar — un error pegajoso a 30 fps no puede spamear).
+4. Contadores de subida completos: `glCompressedTexImage2D`/`glTexSubImage2D`/
+   `glCopyTexSubImage2D` cuentan y pasan; `glCompressedTexSubImage2D` (sin backend en
+   vitaGL, seguía en `ret0`) ahora cuenta y avisa una vez si el motor la usa
+   (`glCompressedTexSubImage2D_drop` — mismo comportamiento, sin cambio de conducta).
+5. Heartbeat legible (`main.c` + `gl_get_counters()`): la línea cada 5 s ahora es
+   `[022] frame N | F fps | render X ms | draws D clears C` — fps medido entre beats,
+   no estimado. Responde "¿pasa algo?" de un vistazo.
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-06).
+- **Pendiente:** desplegar y correr 2-3 min. La línea `[vitaGL] ... set
+  GL_INVALID_ENUM (...: 0xXXXX)` nombra **función + valor exactos** del culpable —
+  con eso se decide el fix (parámetro que vitaGL no acepta vs. bug del motor).
+
+## Fase 17: culpables con nombre + screenshots (2026-09-06)
+
+### Qué muestra `logs/debug_local_024.log` (398 líneas, build Fase 16)
+
+Rank de ofensores (`<GLES/gl.h>` para los valores):
+
+1. **`glLightfv pname 0x1204 = GL_SPOT_DIRECTION`, pegajoso (x4200+).** El motor setea
+   dirección de spotlight cada frame; `glLightfv`/`glLightxv` de vitaGL (`ffp.c`)
+   aceptan AMBIENT/DIFFUSE/SPECULAR/POSITION/attenuations pero **ningún `SPOT_*`** —
+   gap real de vitaGL (sus headers ni definen los enums; sus shaders FFP no tienen
+   falloff de spot, todo es point light). Resto benigno de una vez:
+2. `glDisable 0x809E/0x80A0` = `GL_SAMPLE_ALPHA_TO_COVERAGE`/`GL_SAMPLE_COVERAGE`
+   (una vez, arranque; corremos MSAA NONE) — benigno.
+3. `glDisable 0xBD0` = `GL_DITHER` (una vez) — benigno.
+4. `glHint 0xC54` = `GL_FOG_HINT` (2x) — solo calidad, benigno.
+5. `glPixelStorei 0xD05` = `GL_PACK_ALIGNMENT` (1x) — benigno.
+- El heartbeat nuevo funciona: `frame 1104 | 30.1 fps | render 14.4 ms | draws
+  12392` — el juego corre a 30 fps estables con pantalla negra. El avance que notas
+  es real (draws creciendo, sonidos, input).
+
+### Cambios
+
+1. `lib/vitaGL/source/ffp.c` (patch vendor marcado): casos `GL_SPOT_DIRECTION`/
+   `GL_SPOT_EXPONENT`/`GL_SPOT_CUTOFF` en `glLightfv` + `glLightxv`, con defines
+   locales (0x1204/0x1205/0x1206) y arrays de storage. Sin plumbing a uniforms: los
+   shaders FFP no saben de spots, las luces siguen evaluándose como point lights.
+   Efecto esperado: desaparece el error pegajoso (señal limpia); cambio visual
+   esperado: ninguno — si el negro persiste, el bug está en otro lado y ya no hay
+   error que lo tape.
+2. `source/utils/glutil.{c,h}` + `main.c`: `gl_shot(path)` vuelca el framebuffer
+   mostrado a BMP 32-bit; `main.c` captura `logs/shot_%05d.bmp` cada 600 frames
+   (~20 s) desde el frame 100, con `l_note("[022] screenshot ... -> rc")`.
+   Traer los BMP por FTP y mirarlos: negro total vs. escena oscura vs. geometría
+   fuera de vista deciden el siguiente paso sin adivinar.
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-06).
+- **Pendiente:** desplegar, correr 3-4 min, traer `logs/debug_local_025.log` **+ los
+  `logs/shot_*.bmp`**. Qué mirar: (a) si `lastErr` queda en 0x0 y el negro sigue →
+  el spot no era (confirmado por eliminación); (b) qué muestran los BMP.
+
+---
+
 ## Fase 1: Configuración y Preparación (Completada — 2026-08-23)
 - Repo creado desde soloader-boilerplate, `.gitignore` anti-DMCA.
 - APK `Gangstar-Miami-Vindication-HD.apk` copiado y extraído.
@@ -581,3 +778,463 @@ Implementados los 57 que el log real muestra que el juego pide:
   clip más adelante en el flujo (ej. logo de Gameloft antes del de "intro.m4v", o cinemáticas
   entre capítulos) debería resolverse solo con este mismo fix, al ser genérico para cualquier
   llamada a `loadMovie`.
+
+## Fase 7: crash en Application::PostInit — vitaGL reporta ES 2.0, el motor solo acepta <= 1.99 (2026-09-04)
+
+### Bug confirmado: `glGetString(GL_VERSION)` devuelve "OpenGL ES 2.0 VitaGL" -> `doVersionCheck()` falla -> NULL deref en `0x28ba68`
+
+- **Síntoma:** log `logs/debug_local_006.log` llega hasta `GameRenderer_nativeInit()` y termina con:
+  `Glitch Engine version 0.1.0.2` ... `OpenGL|ES driver version is 1.1 or better.` ...
+  `Could not create OpenGL|ES 1.1 driver.` Dump `logs/gangstarmiamivindication-psp2core-1788560906-0x0015fe2ba7-eboot.bin.psp2dmp`:
+  Data abort en `PC 0x9828ba68` (= file-offset `0x28ba68` con base real `0x98000000` del log, NO la
+  base autodetectada `0x981db000` del reporte), `R0=0`.
+- **Causa raíz (objdump `-M force-thumb` + vtable real):**
+  - `0x28ba68` es `Application::PostInit()` (`0x28b9e8`): `r0=createDeviceEx(app); ldr r0,[r0,#16]` sin
+    chequeo de NULL. `createDeviceEx` (`0x4a3a64`) devuelve NULL porque `[r4,#16]` (driver) es NULL.
+  - El driver es NULL porque `CGlfDevice::createDriver()` (`0x4a34cc`) llama a
+    `createOpenGLES1Driver()` (`0x4eba24`), que llama al virtual `+0x200` = `CCommonGLDriver::initDriver()`
+    (`0x4edc08`, resuelto vía `_ZTVN6glitch5video15COpenGLESDriverE` en `0x66d938` + `0x208`), que llama a
+    `genericDriverInit()`, que falla en `doVersionCheck()` (`0x4e8304`: `return (199 >= version)`).
+  - `version` se parsea de `glGetString(GL_VERSION)` con sscanf (`major*100+minor`). Nuestra vitaGL
+    vendorized (`lib/vitaGL/source/get_info.c:189`) devuelve `"OpenGL ES 2.0 VitaGL"` -> version 200 >
+    199 -> check devuelve 0 -> toda la cadena colapsa a NULL. `initDriverWithGlf()` (`0x4e81cc`) siempre
+    devuelve 1 y `driverInit()` (`0x4ead18`) siempre devuelve 1: descartados como causa.
+- **Fix:** nuevo `source/reimpl/gl.{c,h}` con `glGetString_soloader()`: si `name == GL_VERSION` devuelve
+  `"OpenGL ES 1.1 VitaGL"` (version 101: pasa el gate `> 100` y el check `<= 199`); el resto cae al vitaGL
+  real con log de debug. `source/dynlib.c` remapea `"glGetString"` al wrapper; `CMakeLists.txt` agrega
+  `source/reimpl/gl.c` al build.
+- **Build:** verde (`psvita-toolkit build --preset debug`, 2026-09-04).
+- **Pendiente:** desplegar en consola real y confirmar que el motor supera `PostInit` y llega al título.
+  Si aparece otro NULL más adelante, triage nuevo con log+dump de esa corrida (un bug a la vez).
+
+### Bug confirmado 2026-09-04 (bis): crash en el propio loader por instrumentación con dirección `.bss` hardcodeada y obsoleta
+
+- **Síntoma:** tras agregar `source/reimpl/gl.c` (fix de Fase 7), la corrida nueva muere al instante:
+  `logs/debug_local_007.log` solo tiene 2 líneas (`FIOS initialized`, `kubridge check passed`) y el dump
+  `logs/gangstarmiamivindication-psp2core-1788566141-0x000dd038b9-eboot.bin.psp2dmp` muestra Data abort en
+  el hilo `PSVGMV002` con `PC` en `log_guard_mutex_state` (`source/utils/init.c:57`) y `R3 = 0x811963d0`.
+- **Causa raíz:** instrumentación de triage temporal del viejo crash `0x98673b88` (ya cerrado en Fase 5)
+  que leía el mutex interno `static_mutex` de libsupc++ vía una dirección `.bss` hardcodeada
+  (`STATIC_MUTEX_ADDR 0x811963d0`, con su propio comentario avisando que se movería con cualquier cambio
+  del layout). Al agregar `gl.c` el layout cambió (`nm` del build actual: `static_mutex` en `0x811b6aa8`),
+  así que `*STATIC_MUTEX_ADDR` desreferenció una dirección rancia -> data abort en `soloader_init_all()`
+  antes siquiera de cargar el `.so`. Había una segunda copia del mismo patrón en
+  `lib/so_util/so_util.c` (`SO_INIT_STATIC_MUTEX_ADDR`, log `[020]` por cada ctor).
+- **Fix:** eliminada la instrumentación en ambos sitios (su propósito ya se cumplió): `init.c` pierde
+  `log_guard_mutex_state()` + sus 6 llamadas; `so_util.c:so_initialize()` conserva el log útil
+  `ctor[%d]=%p done` pero sin desreferenciar la dirección obsoleta. `so_util` es código vendorized del
+  repo (no submódulo), así que el cambio es local al port.
+- **Build:** verde (`psvita-toolkit build --preset debug`, 2026-09-04).
+- **Pendiente:** redesplegar en consola real; el binario ahora lleva el fix de Fase 7 (spoof ES 1.1) sin
+  este crash autoinfligido en el arranque.
+
+## Fase 8: la "pantalla negra en loop infinito" no era un deadlock — era el propio logging (2026-09-05)
+
+### Bug confirmado: el trace por-mutex convierte cada `malloc()`/`free()` del juego en 2 escrituras a `ux0:`
+
+- **Síntoma:** `logs/debug_local_013.log` llega bien hasta el título del motor —
+  `Glitch Engine version 0.1.0.2`, el gate de OpenGL ES 1.1 ya pasa (fix de Fase 7 confirmado),
+  se imprime la lista de extensiones y el `Driver/Renderer/Vendor` — entra en
+  `main loop: frame 2` y a partir de ahí las 2.600 líneas restantes del log son exclusivamente
+  `pthr: lock mutex=0x98aabcb8` / `pthr: unlock mutex=0x98aabcb8`, siempre desde el mismo hilo
+  `0x40010003`. Nunca vuelve de `GameRenderer_nativeRender()`.
+- **Causa raíz (identificada con los símbolos del `.so` real, no por inspección del loop):**
+  - `nm` sobre `libGangster2.so`: `_gm_` está en `.bss+0xaabb00` y mide `0x1cc`, así que
+    `0x98aabcb8` (= base `0x98000000` + `0xaabcb8`) cae DENTRO de `_gm_`. El juego linkea
+    estáticamente su propio **dlmalloc**, y `0x98aabcb8` es el `MLOCK_T` de su estado global.
+    Los vecinos lo confirman: `magic_init_mutex` (`0xaabae0`) y `morecore_mutex` (`0xaabae4`)
+    son los otros dos mutex que aparecen al arrancar. `0x98ae24c8` es
+    `std::_Node_Alloc_Lock::_S_lock` (el allocator de nodos de STLport).
+  - La instrumentación `[023]` que ya estaba puesta (muestreo del caller cada 500 locks) resolvió
+    los dos únicos callers observados: `0x983765c7` → `malloc` (`0x3765c6`, ARM Thumb) y
+    `0x98375c25` → `free` (`0x375c24`). O sea: el "loop infinito" es **tráfico normal de
+    asignación de memoria**, el motor está cargando recursos, no está trabado. Además el log no
+    tiene ni una sola línea `[017]`/`[018]` (`pthread_cond_wait`) y hay **un solo hilo** en toda
+    la corrida, así que un spin esperando a otro hilo era imposible por construcción.
+  - Lo que sí estaba roto: `pthread_mutex_lock_soloader`/`unlock_soloader` logueaban
+    `[013]`/`[014]` en CADA llamada, y `_log_print()` hacía `sceIoOpen` + `sceIoWrite` +
+    `sceIoClose` sobre `ux0:` por línea. Como el lock que dominaba era el de dlmalloc, eso son
+    **dos round-trips completos a la memory card por cada `malloc()` y cada `free()`**. La carga
+    de recursos pasa a correr a la velocidad de la tarjeta en vez de la del CPU: de ahí la
+    pantalla negra "para siempre".
+  - Segundo multiplicador, en el mismo camino: `_mutex_t_static_init()` corre en cada lock/unlock
+    y hacía *global LwMutex + scan lineal de 1024 slots* antes de responder "sí, ya está
+    inicializado" — otra vez, una vez por `malloc()` y una por `free()`.
+- **Fix:**
+  - `source/reimpl/pthr.c`: los traces `[011]`/`[012]`/`[013]`/`[014]`/`[015]`/`[021]` pasan a
+    `PTHR_TRACE()`, apagado salvo que se compile con `-DPTHR_TRACE_LOCKS` (nueva opción en
+    `CMakeLists.txt`, OFF por defecto). En su lugar queda `[023]` como sonda de progreso barata:
+    lee el reloj una vez cada 4096 locks y emite **como mucho una línea cada 3 s** con el contador
+    acumulado. Un motor realmente trabado ahora se ve como el contador quieto entre dos `[023]`,
+    en vez de como un muro de texto que él mismo provoca. `[017]`/`[018]` (`cond_wait`) siguen
+    siendo incondicionales: son raros y son exactamente lo que un cuelgue real sí produce.
+  - `source/reimpl/pthr.c`: caché "ya inicializado" de mapeo directo (1024 entradas atómicas)
+    delante de `initializedObjects`. El caso común se resuelve con una sola lectura, sin lock ni
+    scan; un miss cae al camino exacto de siempre, así que la caché solo puede ser una
+    optimización. Se invalida en `forgetObject()`. Además `_mutex_t_static_init()`/
+    `_cond_t_static_init()` ahora inicializan el handle en un puntero local y recién después
+    publican `real_ptr` + la entrada de caché (release store): antes se asignaba
+    `mutex->real_ptr = malloc(...)` ANTES de `pthread_mutex_init()`, lo que con un lector sin lock
+    expondría un handle a medio construir. También se eliminó el `sceClibMemcpy()` desde una
+    `pthread_mutex_t`/`pthread_cond_t` sin inicializar del stack.
+  - `source/utils/logger.c`: el archivo de sesión se abre **una vez** y el fd queda abierto, en
+    vez de open+write+close por línea. La supervivencia ante crash se mantiene con
+    `sceIoSyncByFd()` en toda línea de severidad `LT_WARN` o mayor y cada 64 líneas de debug.
+- **Fix adicional (latente, encontrado en el camino):** `munmap()` en `source/reimpl/mem.c` hacía
+  `free(addr)` sobre cualquier puntero. El dlmalloc del juego llama a `CALL_MUNMAP()` desde
+  `sys_trim()` para liberar solo la **cola** de un segmento (`sp->base + newsize`), o sea un
+  puntero interior — `free()` sobre eso corrompe el heap de newlib y explota mucho después en
+  cualquier otro lado. Ahora `mmap()` registra base+tamaño de cada mapeo emulado (256 slots) y
+  `munmap()` solo libera si la dirección es exactamente una base conocida; para un unmap parcial
+  o desconocido devuelve -1, que dlmalloc maneja quedándose con el segmento.
+- **Build:** verde (`psvita-toolkit build --preset debug`, 2026-09-05), sin warnings nuevos.
+- **Pendiente:** desplegar en consola real. La consola no estaba accesible por FTP
+  (`192.168.3.15:1337`) al momento de hacer estos cambios, así que **el fix no está verificado en
+  hardware**. Qué mirar en el log siguiente: `main loop: frame 2 returned` (y frames 3+) deberían
+  aparecer; las líneas `[023]` deberían mostrar el contador de locks creciendo. Si el contador se
+  queda quieto entre dos `[023]`, ahí sí hay un cuelgue real y hay que triagearlo con
+  `-DPTHR_TRACE_LOCKS` puesto o con GDB.
+
+## Fase 9: los assets se buscaban en `/sdcard/...` — crash en `ASprite::ASprite()` (2026-09-05)
+
+### Confirmación de la Fase 8
+
+`logs/debug_local_014.log` tiene 657 líneas contra las 3.410 de la corrida anterior, y llega
+*mucho* más lejos en mucho menos tiempo: `frame 1 returned (46382 us)` (antes 124.702 us) y el
+motor ya entra a cargar assets. El "loop infinito" era efectivamente el logging. Ni una línea
+`[023]`, o sea que nunca se llegó a 4096 locks: el arranque entero ahora cuesta menos que lo que
+antes costaba una fracción de un frame.
+
+### Bug confirmado: `ASprite::ASprite(const char*)` desreferencia sin chequear el resultado del open
+
+- **Síntoma:** `logs/debug_local_014.log` termina con decenas de
+  `fopen(./sdcard/gameloft/games/Gangstar2//./huds.bsprite, rb): 0x0` y el dump
+  `gangstarmiamivindication-psp2core-1788583236-0x000cc63f73` es un Data abort con `R0 = R4 = 0`.
+- **Causa raíz:** la base auto-detectada del reporte (`0x97ccf000`) es incorrecta; con la base real
+  del log (`0x98000000`) el `PC 0x98364bbe` cae en `ASprite::ASprite(char const*)` (`0x364b28`) a
+  +0x96. El desensamblado (`-M force-thumb`) muestra exactamente:
+  `364bbc: blx r3` (el virtual de apertura del vfs, vía `Application::GetInstance()`) e inmediato
+  `364bbe: ldr r3, [r0, #0]` — sin chequeo de NULL. La pila conserva el ASCII de
+  `"./huds_hi.bsprite"` y de `"./about_lo.engli..."`, y en la pila aparecen
+  `glitch::io::createReadFile()` (`0x400d4c`) y `glitch::IReferenceCounted::drop()`.
+  O sea: el archivo no se encuentra → `createReadFile()` devuelve NULL → boom.
+- **Por qué no se encuentra:** el `.so` tiene su raíz de contenido compilada como literal
+  (`strings`: `/sdcard/gameloft/games/Gangstar2/` en `.rodata+0x5e0d60`, más `.../igp` y
+  `.../tmp/`, y el dir privado de Android `/data/data/com.gameloft.android.TBFV.GloftGMHP.ML/`).
+  **No hay ningún JNI para setear la ruta** — los únicos `Java_*` que exporta la librería son los
+  cinco `nativeInit`/`nativeRender` que `main.c` ya llama — así que solo se puede corregir en el
+  camino al filesystem.
+- **Fix (`source/reimpl/io.c`):** capa de traducción Android → Vita:
+  - `/sdcard/gameloft/games/Gangstar2` → `DATA_PATH "data"`
+  - `/data/data/com.gameloft.android.TBFV.GloftGMHP.ML` → `DATA_PATH "saves"`
+  - `/sdcard` (cualquier otra cosa, ej. el código de IGP/ads) → `DATA_PATH "data"`
+  - Normaliza además los `//` y los segmentos `.`: el motor concatena su raíz con nombres que ya
+    empiezan con `./` y a veces le antepone otro `.` al conjunto, así que lo que llega a `fopen()`
+    es literalmente `./sdcard/gameloft/games/Gangstar2//./about.english`. sceLibcBridge no resuelve
+    eso. Un `./foo` genuinamente relativo se deja intacto, igual que `ux0:`/`app0:`/`/proc/...`.
+  - La traducción se aplica en `fopen`, `open`, `stat`, `opendir`, y en wrappers nuevos para
+    `access`, `chdir`, `chmod`, `mkdir`, `remove`, `rename`, `rmdir`, `unlink`, `realpath`,
+    `freopen` y `lstat`, todos los cuales estaban mapeados directo a newlib en `dynlib.c` y por lo
+    tanto seguían mirando un `/sdcard` que no existe.
+  - `lstat` de paso deja de ser un bug latente: estaba mapeado a la `lstat()` de newlib, que
+    escribe un `struct stat` de newlib en un buffer que el `.so` dimensionó como el `struct stat64`
+    de bionic — la misma discrepancia que `stat_soloader()` existe para evitar.
+  - Escrituras: `fopen(...,"w"/"a"/"+")` y `open(..., O_CREAT)` crean los directorios padre que
+    falten, y `io_prepare_dirs()` (llamado desde `soloader_init_all()`) crea `data/`, `saves/`,
+    `data/tmp/` y `data/igp/`. En Android el motor da por sentado que su "home" y su `tmp/` ya
+    existen; acá solo existen si los creamos, y una escritura que falla por eso es invisible hasta
+    que el motor tropieza con el resultado a medio escribir mucho después.
+  - El `l_warn` de `fopen`/`open` fallidos ahora imprime la ruta traducida **y** la original
+    (`[was: ...]`), para que el próximo asset que falte se identifique de una.
+- **Verificación:** la traducción se probó en el host contra las rutas exactas del log
+  (`./sdcard/...//./about.english`, `.../tmp/x.tmp`, `.../igp`, el dir privado, rutas relativas,
+  `ux0:`/`app0:`/`/proc`) — todos los casos dan el resultado esperado.
+- **Datos:** `zipinfo` de `Gangstar-Miami-V.zip` (3248 archivos, incluido el subdirectorio `igp/`)
+  contra `ux0_data/gangstarmiamivindication/data/`: **coinciden exactamente, no falta ninguno**.
+  Así que una vez traducida la ruta, todos los assets están donde el motor los va a buscar.
+- **Build:** verde (`psvita-toolkit build --preset debug`, 2026-09-05).
+- **Pendiente:** desplegar (la consola seguía sin responder en `192.168.3.15:1337`). Antes de
+  correr, confirmar que `ux0:/data/gangstarmiamivindication/data/` está realmente en la consola con
+  sus 3248 archivos — hasta ahora ninguna corrida había intentado abrir un asset de verdad, así que
+  eso nunca se ejerció. En el log siguiente, los `fopen(...)` deberían pasar de `l_warn` a `l_debug`
+  con rutas `ux0:data/gangstarmiamivindication/data/...`.
+
+## Fase 10: el log de la corrida en release estaba ciego (2026-09-05)
+
+### Qué mostraba el log
+
+`logs/live_session_20260905_025658.log` tiene **6 líneas**, todas iguales, dos ciclos de:
+
+```
+[WARN][FalsoJNI_ImplBridge.c:263][methodIntCall] method ID 27 not found!
+[WARN][FalsoJNI_ImplBridge.c:263][methodIntCall] method ID 28 not found!
+[WARN][FalsoJNI_ImplBridge.c:263][methodIntCall] method ID 29 not found!
+```
+
+### Por qué el log estaba vacío (causa de "no me muestra nada", no del pantallazo negro)
+
+`build/CMakeCache.txt` tenía `CMAKE_BUILD_TYPE:STRING=` (vacío), o sea que la corrida se hizo con
+un build **sin `DEBUG_SOLOADER`**. Con eso, `logger.h` define `l_debug/l_info/l_warn/l_success/
+l_wait` como **nada**: se compilan fuera. Se van con ellos los `l_checkpoint()` de `main.c`, todo
+`io.c`, y — lo más caro — el log propio del motor, porque `reimpl/log.c` mandaba
+`__android_log_*()` de nivel INFO/WARN a `l_info()`/`l_warn()`. Lo único que sobrevivía eran los
+`l_error`/`l_fatal` y el logger **propio** de FalsoJNI (`FalsoJNI_Logger.c`), que no depende de
+`DEBUG_SOLOADER` sino de `FALSOJNI_DEBUGLEVEL`, cuyo default (`FalsoJNI.h:22`) es
+`FALSOJNI_DEBUG_WARN`. De ahí que el único sobreviviente fueran esos tres warnings.
+
+El otro lado del problema es real y está documentado en la Fase 8: un build Debug prende *todos*
+los `l_debug` de golpe, incluidos los `fread()`/`fseek()` por llamada de `io.c`, y ese volumen
+frena la carga de assets lo suficiente como para cambiar el comportamiento bajo prueba. No había
+punto medio entre "3.400 líneas de fread" y "3 líneas".
+
+### Dato importante: la corrida en release llegó MÁS LEJOS que cualquier corrida en debug
+
+Ningún `debug_local_0*.log` tiene una sola línea `method ID ... not found` — ninguna corrida en
+debug llegó nunca a **llamar** a `setMusicGain`. Todas registraban el método
+(`GetStaticMethodID(env, ..., "setMusicGain", ...)`) y morían antes, adentro del **segundo**
+`GameRenderer_nativeRender()` (todos los logs terminan en `frame 2 enter` sin su `frame 2
+returned`); la última, `debug_local_016`, terminó en un data abort dentro de SceLibKernel
+(dump `...-1788589177`). La corrida en release del 02:51/02:57 **no generó dump** — no crasheó,
+sigue viva. O sea: el port avanza más de lo que decía la Fase 9, y el motor ya está en el
+setup de audio cuando la pantalla queda negra.
+
+### Bug confirmado: IDs 27/28/29 nunca estuvieron en la tabla `methodsInt`
+
+- `setMusicGain`/`setSfxGain`/`setVfxGain` son `private static void` en `GLMediaPlayer.java`, así
+  que estaban registrados como `METHOD_TYPE_VOID` y solo en `methodsVoid[]`.
+- Pero el `.so` **no** los invoca por `CallStaticVoidMethod`. El pseudo-C de Ghidra
+  (`nativeSetMusicGain`/`SfxGain`/`VfxGain`) muestra
+  `(**(code **)(iVar4 + 0x204))(piVar1, uVar2, setMusicGain, ..., uVar5)`, y el offset `0x204`
+  del `JNINativeInterface` es el índice 129 = **`CallStaticIntMethod`**. Por eso `methodIntCall()`
+  no encontraba nada y devolvía -1.
+- **Es ruido, no es el pantallazo negro:** los wrappers nativos (`void nativeSetMusicGain(void)`)
+  descartan el valor de retorno, así que el -1 no cambia nada. Pero era lo único que quedaba
+  visible en el log y había que sacarlo del medio.
+- **Auditoría completa de los sitios de despacho JNI del binario** (contando sobre el pseudo-C):
+  `0x1c4` `GetStaticMethodID` x57 (= exactamente las 57 entradas de `nameToMethodId`),
+  `0x1c8` `CallStaticObjectMethod` x5, `0x204` `CallStaticIntMethod` x18,
+  `0x234` `CallStaticVoidMethod` x34. Cruzados uno por uno contra `java.c`: **27/28/29 eran el
+  único hueco**; todos los demás métodos se llaman por la variante que su entrada ya cubría.
+
+### Fixes
+
+- `source/java.c`: nuevo `Method_soundGainStub()` (devuelve 0) y entradas 27/28/29 en
+  `methodsInt[]`. Se dejan también en `methodsVoid[]` para que cualquiera de los dos caminos
+  resuelva. `nameToMethodId` pasa a `METHOD_TYPE_INT` en esos tres.
+- `source/utils/logger.h`: nuevo nivel **`l_note()`** (`_log_print(LT_INFO, ...)`), que se compila
+  **siempre**, también en Release. Reservado para líneas que son a la vez de bajo volumen y de
+  alta señal.
+- `source/reimpl/log.c`: `__android_log_*()` de nivel INFO/WARN pasa a `l_note()`. El log propio
+  del motor (`[ALOG][GameLoft Printer::log] ...`) es la mejor descripción de lo que está haciendo
+  y son unas pocas decenas de líneas por boot; ahora sobrevive a un build de release. El DEBUG/
+  VERBOSE del motor sigue detrás de `DEBUG_SOLOADER`.
+- `source/main.c`: los latidos de frame `[022]` pasan de `l_checkpoint()` (= `l_debug`) a
+  `l_note()`. En release ahora se puede responder lo primero que hay que preguntar ante una
+  pantalla negra: *¿el loop de render está girando?* Volumen acotado: los primeros 10 frames y
+  después uno cada 300 (~10 s al pacing de 30 FPS).
+- `source/reimpl/io.c`: los `fread()`/`fseek()` por llamada quedan detrás de `IO_TRACE_STREAMS`
+  (nueva opción de CMake, OFF por default) — mismo razonamiento que `PTHR_TRACE_LOCKS` en la
+  Fase 8. Y un `fopen()`/`open()` que falla pasa de `l_warn` a **`l_error`**: un asset que falta
+  es la causa más común de un NULL-deref posterior (Fase 9) y `l_warn` desaparece en release.
+- `CMakeLists.txt`: opción `IO_TRACE_STREAMS`.
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-05).
+- **Pendiente:** desplegar. La consola seguía sin responder en `192.168.3.15:1337`, así que
+  **nada de esto está verificado en hardware**.
+- **Qué mirar en el próximo log** (ya sirve un build de *release*, no hace falta debug):
+  1. Las líneas `[ALOG]` del motor: dicen hasta dónde llegó y qué estaba creando.
+  2. `[022] main loop: frame N` — si aparecen frames 3, 4, ... y después uno cada 300, el loop
+     gira y el problema es de **render** (vitaGL/estado GL). Si se corta en `frame N enter` sin
+     su `returned`, el motor está trabado o crasheando **adentro** de `nativeRender`.
+  3. Cualquier `fopen(...): FAILED` — asset que falta.
+  4. Ya no debería haber ningún `method ID ... not found`.
+
+## Fase 11: crash por format string — `sceClibPrintf(buffer_b)` (2026-09-05)
+
+La instrumentación de la Fase 10 funcionó a la primera: `logs/debug_local_019.log` son **89 líneas
+legibles** (contra 3 antes y 2.400 en debug), con todo el arranque del motor visible y el punto
+exacto donde muere.
+
+### Síntoma
+
+El log termina en:
+
+```
+[022] main loop: frame 1 returned (10222 us)
+[022] main loop: frame 2 enter (t=3961368)
+[ALOG][GameLoft Printer::log] Glitch Engine version 0.1.0.2
+...
+[ALOG][GameLoft] createTextureImpl 1
+[ALOG][GameLoft] nativedetectPhoneLang:0
+[ALOG][GameLoft] createTextureImpl 1     ← última línea
+```
+
+Dump: `gangstarmiamivindication-psp2core-1788592309-0x0018152ed7`. Data abort,
+`PC = SceLibKernel seg1 + 0x60a2`, `LR = +0x7d1d`, `R0 = R1 = R4 = 0xb472dd63` (basura),
+`R12 = 0xdeadbeef`. **Firma idéntica** a la del dump `...-1788589177` de la Fase 9/10 — es el
+mismo bug, no uno nuevo.
+
+### Causa raíz
+
+Descomprimiendo el core (es un ELF gzippeado) y volcando la pila cruda alrededor de `SP`, en
+`0x815c0164` aparece el buffer que `sceClibPrintf` estaba formateando, cortado a mitad de línea:
+
+```
+ \x1b[38;5;32mℹ info\x1b[0m     [ALOG][GameLoft Printer::logf] parameter type mismatch when setting "
+```
+
+Ese prefijo ANSI + el tag ya sustituido dicen que lo que se estaba expandiendo era **`buffer_b`,
+o sea la salida YA terminada de `_log_print()`**. Y el string completo está en el `.so`
+(`.rodata+0x5d1f00`):
+
+```
+parameter type mismatch when setting "%s/%s": want %s, got %s
+```
+
+La cadena de llamadas, confirmada en el pseudo-C de Ghidra:
+
+```c
+glitch::os::Printer::logf(ELOG_LEVEL lvl, char *fmt, ...) {
+    appDebugLog("GameLoft Printer::logf", fmt);   // ← pasa el FORMATO CRUDO, sin expandir varargs
+    ...
+}
+void appDebugLog(tag, msg) { __android_log_write(4, tag, msg); }
+```
+
+O sea: el motor manda su format string al log **sin expandirla**. En Android eso es inofensivo,
+porque `__android_log_write()` nunca la reinterpreta. Acá:
+
+1. `reimpl/log.c` la pasa como argumento: `l_note("[ALOG][%s] %s", tag, text)` — correcto, `%s`
+   copia `text` tal cual.
+2. `_log_print()` la deja en `buffer_b`, que queda conteniendo cuatro `%s` literales.
+3. `source/utils/logger.c:239` hacía **`sceClibPrintf(buffer_b)`** — pasando datos de runtime como
+   **format string**. `sceClibPrintf` reparsea esos cuatro `%s` y lee cuatro punteros basura de la
+   pila. El primero devolvió 2 bytes (por eso el `"` y el `/` del formato alcanzan a escribirse),
+   el segundo era `0xb472dd63` → data abort adentro de SceLibKernel.
+
+Bug de format string de manual. Cualquier línea del motor que contenga un `%` mataba el proceso.
+
+### Por qué recién aparece ahora
+
+En un build de release previo a la Fase 10 los `[ALOG]` de nivel INFO se compilaban fuera, así que
+esa línea nunca llegaba a `sceClibPrintf` — de ahí que la corrida de las 02:51 no crasheara y
+quedara en pantalla negra. Los builds debug (Fases 8-9) **sí** la ejecutaban: por eso todos
+terminaban en el segundo `nativeRender`. El crash estaba latente desde siempre.
+
+### Fix
+
+- `source/utils/logger.c:239` → `sceClibPrintf("%s", buffer_b)`.
+- `lib/falso_jni/FalsoJNI_Logger.c:58` → `sceClibPrintf("%s", _fjni_log_buffer_2)`. Mismo bug,
+  heredado de FalsoJNI upstream; no había disparado todavía porque las líneas de FalsoJNI no
+  llevan `%` del lado de los datos, pero es la misma trampa.
+- (`buffer_a` se sigue construyendo embebiendo `fmt` y usándose como formato — eso es seguro:
+  `fmt` siempre es un literal de compilación de nuestro propio código, nunca datos del motor.)
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-05), sin warnings nuevos.
+- **Desplegado:** sí, `eboot.bin` subido a `/ux0:/app/PSVGMV002/` (2026-09-05 03:24).
+- **Pendiente de verificar en consola.** Qué esperar en el próximo log:
+  1. La línea ahora debería imprimirse entera y literal:
+     `[ALOG][GameLoft Printer::logf] parameter type mismatch when setting "%s/%s": want %s, got %s`
+     — con los `%s` sin expandir, porque el motor nunca los expande. Eso es lo correcto.
+  2. El motor debería **seguir de largo** en vez de morir ahí, y el `frame 2` debería retornar.
+- **Pista para lo que viene:** ese warning del motor es real y es del camino de render —
+  *parameter type mismatch* al setear un parámetro de material/shader. Como el motor no expande
+  los argumentos no sabemos cuál es. Si después del fix la pantalla sigue negra con geometría que
+  no aparece, ese mensaje es por dónde empezar (probablemente un uniform que vitaGL reporta con
+  otro tipo del que el material espera).
+
+## Fase 13: el fix de format-string verificado + heartbeat ciego tras el frame 10 (2026-09-06)
+
+### Qué muestra `logs/debug_local_020.log` (1471 líneas, build release con Fase 11)
+
+- El Data abort de firma fija (Fase 11) **desapareció**: la línea
+  `parameter type mismatch when setting "%s/%s": want %s, got %s` sale entera y
+  literal, y el motor sigue de largo. Tal como se predijo, los `%s` sin expandir
+  son correctos (el motor nunca los expande).
+- `frame 2 returned (7788468 us)` — ~7,8 s de carga pesada adentro del segundo
+  `nativeRender`, y después **frames 3-10 retornando a ~10 ms**. El loop gira.
+- 121 `createTextureImpl`, 69 `Loaded texture`, cero dumps (sin crash).
+- `dummy.tga` x20 `FAILED`: ese archivo **no existe entre los 3214 datos**
+  (verificado en `ux0_data/.../data/`), o sea que en Android tampoco lo
+  encontraría — el motor lo tolera (`Could not find texture file` y sigue con
+  60+ texturas más). Benigno, no es el blocker. No se toca.
+- El log **termina a mitad de carga** (`Loaded texture`, sin `frame 11` ni dump):
+  no es un cuelgue confirmado — a partir del frame 11 el heartbeat anterior se
+  quedaba mudo por diseño (solo 1-10 + uno cada 300 frames, y con cargas de
+  varios segundos por frame esos 300 pueden ser minutos). La próxima corrida con
+  el heartbeat por tiempo dirá si el frame 11+ avanza o se traba.
+
+### Cambios (`source/main.c`, sin tocar motor/render)
+
+1. **Heartbeat por tiempo + slow-frame** (sigue en `l_note`, release-safe):
+   frames 1-10 igual que antes; después, una línea si `nativeRender` tarda
+   > 0,5 s (la carga se ve como slow frames) y un `frame N alive` como mucho
+   cada 5 s de pared. Reemplaza el `frame_no % 300` (ciego durante cargas).
+2. **Botones mapeados a keycodes Android** por el mismo camino
+   `s_keyDownCode/s_keyUpCode` que usa la Activity real (`GameRenderer.java:71`):
+   dpad → 19/20/21/22, CROSS → 23 (confirm), CIRCLE → 4 (back, como antes),
+   START → 82 (menu). El motor ignora los códigos que no usa, igual que en un
+   equipo real con teclado — para poder navegar menús y continuar el juego
+   además del táctil (que sigue igual).
+
+### Qué mirar en el próximo log
+
+1. `frame 11+ slow render / alive` — si aparecen, el juego sigue cargando o ya
+   está en título/menú y el problema restante es de **render/input**, no de loop.
+2. Si se queda en `frame N enter` sin `returned` ni `alive` → trabado adentro de
+   `nativeRender`, triage nuevo con ese N.
+
+## Fase 12: verificación del fix de format-string + inventario de instrumentación TEMP (2026-09-05)
+
+### Verificación: `logs/debug_local_017.log` — sin crash, el juego avanza
+
+- La corrida con el `eboot.bin` del fix de Fase 11 (desplegado 03:24) **no genera dump** y la
+  pantalla negra "avanza" (hay animación/progreso visible). El Data abort de firma fija
+  (`SceLibKernel+0x60a2`, `R0=R1=R4` basura) desapareció: era efectivamente el `%s` sin expandir
+  de `parameter type mismatch when setting "%s/%s": want %s, got %s`.
+- El log trae solo 3 líneas (`method ID 27/28/29 not found`, build release sin `DEBUG_SOLOADER`):
+  el motor ya llega al setup de audio (`setMusicGain/SfxGain/VfxGain`). Esas 3 advertencias
+  corresponden al comportamiento pre-Fase-10 (IDs solo en `methodsVoid[]`); el fix (`methodsInt[]`
+  + `Method_soundGainStub()`, ya en el árbol) debería silenciarlas en el próximo binario
+  desplegado — si reaparecen, el `eboot.bin` en consola es anterior al fix.
+- Análisis corroborante independiente (sesión paralela, dumps `...-1788586817` y `...-1788589177`):
+  descomprimiendo el core (gzip) y barriendo la pila cruda del hilo `PSVGMV002` se recuperó la
+  cadena viva completa — `Application::Init → PostPostInit → CHudManager::load → ASprite →
+  CTextureManager::getTexture → loadTextureFromFile → bind → CImageLoaderPVR::loadTextureData →
+  setData → forceCommitTexture → createMaterialRenderer → constructEffect →
+  setMaterialParameter → Printer::logf → appDebugLog → strings/malloc → kernel`. Coincide con el
+  punto del format string de Fase 11 (el `logf` del parámetro de material). Nota metodológica: la
+  base auto-detectada del reporte (`0x80dcd000`/`0x80bcd000`) es incorrecta; la base real es el
+  `LOAD_ADDRESS` fijo (`0x98000000`), y los offsets del reporte solo valen con `--so-base`.
+- Archivos de datos verificados (`huds.bmp` y cía. son originales Gameloft con header propio, no
+  BMP estándar; tamaños sanos) y todo el I/O con retornos OK — el crash nunca fue de datos.
+
+### Inventario de instrumentación TEMP pendiente de limpieza
+
+- `source/reimpl/pthr.c`: el muestreador de caller cada 500 locks (id 23) ya fue reemplazado por
+  la sonda `[023]` barata de Fase 8 (reloj cada 4096 locks, máx. 1 línea/3 s). Nada que hacer.
+- `source/reimpl/io.c` + `io.h` + `CMakeLists.txt`: los wrappers `fread/fseek` con log de
+  entrada/salida quedaron correctamente detrás de `IO_TRACE_STREAMS` (OFF por defecto). Nada que
+  hacer.
+- `source/reimpl/gl.{c,h}` + `source/dynlib.c`: **siguen activos sin flag**:
+  `glTexImage2D_soloader` (loguea CADA upload en debug) y `memcpy_soloader` (solo `>8MB`, barato).
+  En release son costo cero (`l_debug` se compila fuera; el `l_error` de `INSANE`/`HUGE` es raro
+  por construcción). Recomendación: si el próximo debug se vuelve lento cargando texturas, poner
+  el `l_debug` por-upload detrás de un flag como `IO_TRACE_STREAMS`; los `l_error` pueden quedar.
+- `memcpy`/`__aeabi_memcpy[48]` siguen apuntando a `memcpy_soloader` (idéntico fast-path a
+  `sceClibMemcpy` salvo la comparación de tamaño). Revertir a `sceClibMemcpy` cuando se cierre el
+  triage de heap.
+
+### Estado y siguiente paso
+
+- El loop de render vive (pantalla negra con progreso, sin crash): el problema restante es de
+  **render**, no de lógica. Dos puntas anotadas, en este orden:
+  1. El `parameter type mismatch` de Fase 11 (uniform con tipo distinto al esperado por vitaGL).
+  2. `vglInitExtended(0, 960, 544, 6MB, MULTISAMPLE_4X)` vs. la receta de Asphalt 5
+     (`12MB, MULTISAMPLE_NONE` + downsample por FBO a 800x480 para menús correctos): MSAA 4X +
+     FBO OES (que este motor usa) es combinación riesgosa en vitaGL. Cambiar a NONE es un cambio
+     de comportamiento: probar solo y medir.

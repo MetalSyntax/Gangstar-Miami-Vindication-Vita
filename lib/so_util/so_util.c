@@ -522,25 +522,12 @@ int so_resolve_with_dummy(so_module *mod, so_default_dynlib *default_dynlib, int
     return 0;
 }
 
-// Triage instrumentation for the 0x98673b88-signature crash in PSVGMV002 --
-// see port_progress.md. [019] in source/utils/init.c already confirmed the
-// process-wide C++ magic-static guard mutex (libsupc++.a's
-// `_ZN12_GLOBAL__N_1L12static_mutexE`) is still NULL (never lazily
-// initialized) right up through so_flush_caches(), so its first-ever
-// __cxa_guard_acquire()-triggered pthread_once/pthread_mutex_init() must
-// happen somewhere in here, inside one of the .so's own global constructors.
-// Same hardcoded-address caveat as [019]: re-check with
-// `arm-vita-eabi-nm build/gangstarmiamivindication.elf | grep static_mutex`
-// after any change that could shift the loader's .bss layout.
-#define SO_INIT_STATIC_MUTEX_ADDR ((void **) 0x811963d0)
-
 void so_initialize(so_module *mod) {
     for (int i = 0; i < mod->num_init_array; i++) {
         if (mod->init_array[i] && (int)mod->init_array[i] != -1)
             mod->init_array[i]();
-        void *handle = *SO_INIT_STATIC_MUTEX_ADDR;
-        l_checkpoint(20, "so_initialize: ctor[%d]=%p done, static_mutex handle=%p *handle=%p",
-                     i, mod->init_array[i], handle, handle ? *(void **) handle : NULL);
+        l_checkpoint(20, "so_initialize: ctor[%d]=%p done",
+                     i, mod->init_array[i]);
     }
 }
 

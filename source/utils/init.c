@@ -14,6 +14,7 @@
 #include "utils/logger.h"
 #include "utils/utils.h"
 #include "utils/settings.h"
+#include "reimpl/io.h"
 
 #include <string.h>
 
@@ -28,36 +29,6 @@
 
 // Base address for the Android .so to be loaded at
 #define LOAD_ADDRESS 0x98000000
-
-// Triage instrumentation for the 0x98673b88-signature crash in PSVGMV002
-// (real pthread_mutex_unlock() jumping to a garbage PC, bit-identical across
-// 6 real-hardware runs). Disassembling libsupc++.a's own __cxa_guard_acquire/
-// __cxa_guard_release (guard.o) shows they don't touch any per-guard-variable
-// mutex at all -- every C++ "magic static" in the whole program (both our own
-// loader's and the .so's, e.g. its _Locale_true/_Init_timeinfo function-local
-// statics) serializes through ONE process-wide global mutex+cond pair,
-// `_ZN12_GLOBAL__N_1L12static_mutexE`/`..._1L11static_condE`, lazily
-// pthread_once-initialized the first time __cxa_guard_acquire() is ever
-// called anywhere. If THAT single mutex's calloc'd internal struct gets
-// corrupted early (its first word ends up holding a .so-data-looking pointer
-// instead of a semaphore UID), every later __cxa_guard_release() anywhere in
-// the program would crash with this exact identical signature -- matching
-// the total determinism observed.
-//
-// `static_mutex` has C++ internal (anonymous-namespace) linkage, so it can't
-// be `extern`-declared from here -- the address below was read via
-// `arm-vita-eabi-nm build/gangstarmiamivindication.elf | grep static_mutex`
-// on THIS exact build. It WILL shift if the loader binary's .bss layout
-// changes (e.g. adding more static locals) -- re-run that nm command after
-// any further code change and update this if it moved, or the log will
-// print the wrong address's value.
-#define STATIC_MUTEX_ADDR ((void **) 0x811963d0)
-
-static void log_guard_mutex_state(const char *when) {
-    void *handle = *STATIC_MUTEX_ADDR;
-    l_checkpoint(19, "cxa guard static_mutex %s: handle=%p *handle=%p",
-                 when, handle, handle ? *(void **) handle : NULL);
-}
 
 extern so_module so_mod;
 
@@ -91,6 +62,10 @@ void soloader_init_all() {
     }
     l_success("kubridge check passed.");
 
+    // The .so writes into subdirectories of its (translated) content root that
+    // nothing else creates -- see io_prepare_dirs() in reimpl/io.c.
+    io_prepare_dirs();
+
     if (!file_exists(SO_PATH)) {
         fatal_error("Looks like you haven't installed the data files for this "
                     "port, or they are in an incorrect location. Please make "
@@ -101,27 +76,21 @@ void soloader_init_all() {
         l_fatal("SO could not be loaded.");
         fatal_error("Error: could not load %s.", SO_PATH);
     }
-    log_guard_mutex_state("after so_file_load");
 
     settings_load();
     l_success("Settings loaded.");
-    log_guard_mutex_state("after settings_load");
 
     so_relocate(&so_mod);
     l_success("SO relocated.");
-    log_guard_mutex_state("after so_relocate");
 
     resolve_imports(&so_mod);
     l_success("SO imports resolved.");
-    log_guard_mutex_state("after resolve_imports");
 
     so_patch();
     l_success("SO patched.");
-    log_guard_mutex_state("after so_patch");
 
     so_flush_caches(&so_mod);
     l_success("SO caches flushed.");
-    log_guard_mutex_state("after so_flush_caches");
 
     // Triage instrumentation for the 0x98673b88-signature crash in PSVGMV002
     // (pthread_mutex_unlock jumping to a garbage PC, confirmed bit-identical

@@ -86,6 +86,10 @@ int close_soloader(int fd);
 
 int fclose_soloader(FILE *f);
 
+// TEMP triage wrappers (see io.c) -- remove with the entry logging there.
+size_t fread_soloader(void *ptr, size_t size, size_t nmemb, FILE *stream);
+int fseek_soloader(FILE *stream, long offset, int whence);
+
 int closedir_soloader(DIR *dir);
 
 int fcntl_soloader(int fd, int cmd, ...);
@@ -93,6 +97,26 @@ int fcntl_soloader(int fd, int cmd, ...);
 int ioctl_soloader(int fd, int request, ... /* arg */);
 
 int fsync_soloader(int fd);
+
+FILE * freopen_soloader(const char * filename, const char * mode, FILE * stream);
+
+int lstat_soloader(const char * path, stat64_bionic * buf);
+
+int access_soloader(const char * path, int mode);
+int mkdir_soloader(const char * path, mode_t mode);
+int rmdir_soloader(const char * path);
+int remove_soloader(const char * path);
+int unlink_soloader(const char * path);
+int rename_soloader(const char * from, const char * to);
+int chmod_soloader(const char * path, mode_t mode);
+int chdir_soloader(const char * path);
+char * realpath_soloader(const char * path, char * resolved);
+
+/**
+ * Creates the writable directories the .so expects to already exist under its
+ * (translated) content root. Call once, before so_initialize().
+ */
+void io_prepare_dirs(void);
 
 #ifdef __cplusplus
 };

@@ -10,9 +10,11 @@
 
 #include "reimpl/pthr.h"
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <psp2/kernel/clib.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 #include <stdatomic.h>
 
@@ -39,8 +41,75 @@ enum {
 
 #define PTHR_INLINE static inline __attribute__((always_inline))
 
+// Per-mutex-operation tracing ([011]/[012]/[013]/[014]/[015]/[021]).
+//
+// This was the instrumentation that found the PSVGMV002 real_ptr race (see
+// port_progress.md Fase 4), but it must stay OFF by default: the game
+// statically links its own dlmalloc, so pthread_mutex_lock/unlock run once per
+// malloc() and once per free(), and every l_checkpoint() line costs an
+// sceIoOpen/sceIoWrite/sceIoClose round-trip on ux0:. That is what turned the
+// engine's resource-loading path into the apparent infinite black-screen loop
+// in logs/debug_local_013.log: 2600 log lines of nothing but
+// `lock/unlock mutex=0x98aabcb8` -- which the .so's own symbols identify as
+// `_gm_`'s dlmalloc lock, i.e. ordinary allocation traffic, not a deadlock.
+// Rebuild with -DPTHR_TRACE_LOCKS to get it back for the next mutex bug.
+#ifdef PTHR_TRACE_LOCKS
+#define PTHR_TRACE(n, fmt, ...) l_checkpoint(n, fmt, ##__VA_ARGS__)
+#else
+#define PTHR_TRACE(n, fmt, ...) do {} while (0)
+#endif
+
 void * initializedObjects[PTHR_MAX_OBJECTS] = {0};
 static SceKernelLwMutexWork pthr_mutex;
+
+// Direct-mapped "already initialized" cache in front of `initializedObjects`.
+//
+// `_mutex_t_static_init()` runs on EVERY pthread_mutex_lock/unlock, and this
+// game statically links its own dlmalloc (`_gm_` at .bss+0xaabb00, its lock at
+// +0xaabcb8 -- the single mutex that dominates logs/debug_local_013.log), so
+// that path is taken once per malloc() and once per free(). Doing it the old
+// way -- take the global PTHR_LOCK, then linearly scan 1024 slots -- serialized
+// and taxed every allocation the engine makes while loading. The cache answers
+// the overwhelmingly common "yes, this one is already set up" case with a
+// single load and no locking; a miss falls through to the exact, unchanged
+// slow path below, so the cache can only ever be an optimization.
+//
+// Entries are only ever published for objects that ARE in `initializedObjects`,
+// and are cleared again by forgetObject(), so a hit is never stale unless the
+// game destroys a mutex while another thread is locking it (already UB).
+#define PTHR_CACHE_SIZE 1024u
+#define PTHR_CACHE_MASK (PTHR_CACHE_SIZE - 1u)
+static atomic_uintptr_t pthr_init_cache[PTHR_CACHE_SIZE];
+
+PTHR_INLINE unsigned _pthr_cache_slot(const void * obj) {
+    // Mutex addresses are at least 4-byte aligned and often laid out in
+    // regular strides, so the low bits alone make a poor index -- mix first.
+    uint32_t h = (uint32_t) (uintptr_t) obj;
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    return h & PTHR_CACHE_MASK;
+}
+
+PTHR_INLINE int _pthr_cache_hit(const void * obj) {
+    return atomic_load_explicit(&pthr_init_cache[_pthr_cache_slot(obj)],
+                                memory_order_acquire) == (uintptr_t) obj;
+}
+
+// Must only be called for an object already present in `initializedObjects`,
+// and only once its real_ptr holds a fully initialized handle.
+PTHR_INLINE void _pthr_cache_put(const void * obj) {
+    atomic_store_explicit(&pthr_init_cache[_pthr_cache_slot(obj)],
+                          (uintptr_t) obj, memory_order_release);
+}
+
+PTHR_INLINE void _pthr_cache_drop(const void * obj) {
+    unsigned slot = _pthr_cache_slot(obj);
+    uintptr_t expected = (uintptr_t) obj;
+    atomic_compare_exchange_strong_explicit(&pthr_init_cache[slot], &expected, 0,
+                                            memory_order_release,
+                                            memory_order_relaxed);
+}
 
 // 0 = not created, 1 = a thread is creating it right now, 2 = ready to use.
 enum { PTHR_META_UNINIT = 0, PTHR_META_CREATING = 1, PTHR_META_READY = 2 };
@@ -107,6 +176,9 @@ int rememberObject(void * mut) {
 }
 
 int forgetObject(const void * mut) {
+    // Drop the fast-path entry first: after this point a concurrent
+    // _mutex_t_static_init() can only reach the exact, locked slow path.
+    _pthr_cache_drop(mut);
     PTHR_LOCK
     for (int i = 0; i < PTHR_MAX_OBJECTS; ++i) {
         if (initializedObjects[i] == mut) {
@@ -145,9 +217,16 @@ PTHR_INLINE int _attr_t_static_init(pthread_attr_t_bionic * attr) {
 PTHR_INLINE int _mutex_t_static_init(pthread_mutex_t_bionic * mutex, const pthread_mutexattr_t * attr) {
     int ret = 0, kind = PTHREAD_MUTEX_NORMAL;
 
+    // Hot path: this runs once per malloc() and once per free() (the game's
+    // statically linked dlmalloc guards `_gm_` with a bionic mutex), so the
+    // already-initialized case must cost a single load. See the cache's
+    // comment above -- a miss just falls through to the same exact check.
+    if (_pthr_cache_hit(mutex)) return 0;
+
     PTHR_LOCK
     for (int i = 0; i < PTHR_MAX_OBJECTS; ++i) {
         if (initializedObjects[i] == mutex) {
+            _pthr_cache_put(mutex);
             PTHR_UNLOCK
             return 0;
         }
@@ -161,25 +240,38 @@ PTHR_INLINE int _mutex_t_static_init(pthread_mutex_t_bionic * mutex, const pthre
         else if (* (int *) mutex == BIONIC_PTHREAD_ERRORCHECK_MUTEX_INITIALIZER) kind = PTHREAD_MUTEX_ERRORCHECK;
     }
 
-    pthread_mutex_t mut;
-    mutex->real_ptr = malloc(sizeof(pthread_mutex_t));
-    sceClibMemcpy(mutex->real_ptr, &mut, sizeof(pthread_mutex_t));
+    pthread_mutex_t * real = malloc(sizeof(pthread_mutex_t));
+    if (!real) {
+        l_error("mutex allocation for %p has failed", mutex);
+        PTHR_UNLOCK
+        return ENOMEM;
+    }
+    sceClibMemset(real, 0, sizeof(pthread_mutex_t));
 
     pthread_mutexattr_t mutattr;
     pthread_mutexattr_init(&mutattr);
     pthread_mutexattr_settype(&mutattr, kind);
-    ret = pthread_mutex_init(mutex->real_ptr, &mutattr);
+    ret = pthread_mutex_init(real, &mutattr);
     pthread_mutexattr_destroy(&mutattr);
 
     if (ret == 0) {
+        // Publish the finished handle BEFORE anything can advertise this mutex
+        // as initialized: the fast-path cache is read without holding
+        // PTHR_LOCK, so a reader that sees the cache entry must be guaranteed
+        // to see a real_ptr pointing at an already-pthread_mutex_init()'d
+        // object -- not the half-built one the old ordering exposed by
+        // assigning mutex->real_ptr before calling pthread_mutex_init() on it.
+        mutex->real_ptr = real;
         for (int i = 0; i < PTHR_MAX_OBJECTS; ++i) {
             if (initializedObjects[i] == 0) {
                 initializedObjects[i] = mutex;
                 break;
             }
         }
-        l_checkpoint(11, "pthr: first-time lazy mutex init %p from thread 0x%x", mutex, sceKernelGetThreadId());
+        _pthr_cache_put(mutex);
+        PTHR_TRACE(11, "pthr: first-time lazy mutex init %p from thread 0x%x", mutex, sceKernelGetThreadId());
     } else {
+        free(real);
         l_error("mutex initialization for %p has failed", mutex);
     }
 
@@ -192,29 +284,40 @@ PTHR_INLINE int _mutex_t_static_init(pthread_mutex_t_bionic * mutex, const pthre
 PTHR_INLINE int _cond_t_static_init(pthread_cond_t_bionic * cond, const pthread_condattr_t * attr) {
     int ret = 0;
 
+    if (_pthr_cache_hit(cond)) return 0;
+
     PTHR_LOCK
     for (int i = 0; i < PTHR_MAX_OBJECTS; ++i) {
         if (initializedObjects[i] == cond) {
+            _pthr_cache_put(cond);
             PTHR_UNLOCK
             return 0;
         }
     }
 
-    pthread_cond_t c;
-    cond->real_ptr = malloc(sizeof(pthread_cond_t));
-    sceClibMemcpy(cond->real_ptr, &c, sizeof(pthread_cond_t));
+    pthread_cond_t * real = malloc(sizeof(pthread_cond_t));
+    if (!real) {
+        l_error("cond allocation for %p has failed", cond);
+        PTHR_UNLOCK
+        return ENOMEM;
+    }
+    sceClibMemset(real, 0, sizeof(pthread_cond_t));
 
-    ret = pthread_cond_init(cond->real_ptr, attr);
+    ret = pthread_cond_init(real, attr);
 
     if (ret == 0) {
+        // Same publish-after-init ordering as _mutex_t_static_init(); see there.
+        cond->real_ptr = real;
         for (int i = 0; i < PTHR_MAX_OBJECTS; ++i) {
             if (initializedObjects[i] == 0) {
                 initializedObjects[i] = cond;
                 break;
             }
         }
-        l_checkpoint(12, "pthr: first-time lazy cond init %p from thread 0x%x", cond, sceKernelGetThreadId());
+        _pthr_cache_put(cond);
+        PTHR_TRACE(12, "pthr: first-time lazy cond init %p from thread 0x%x", cond, sceKernelGetThreadId());
     } else {
+        free(real);
         l_error("cond initialization for %p has failed", cond);
     }
 
@@ -269,8 +372,8 @@ int pthread_mutex_init_soloader(pthread_mutex_t_bionic *uid, const pthread_mutex
     // an explicit pthread_mutex_init(&obj, &recursive_attr) call, e.g. the
     // game's own glf::Mutex::Impl constructor -- see port_progress.md for
     // the 0x98673b88-signature crash this is chasing).
-    l_checkpoint(21, "pthr: init mutex=%p attr=%p from thread 0x%x",
-                 uid, attr, sceKernelGetThreadId());
+    PTHR_TRACE(21, "pthr: init mutex=%p attr=%p from thread 0x%x",
+               uid, attr, sceKernelGetThreadId());
     return _mutex_t_static_init(uid, attr);
 }
 
@@ -286,28 +389,57 @@ int pthread_mutex_destroy_soloader(pthread_mutex_t_bionic *mutex)
     // is gone, a later lock/unlock on the stale bionic mutex would explain
     // the corruption without needing any thread-scheduling race. Remove once
     // the real cause is confirmed -- see port_progress.md.
-    l_checkpoint(15, "pthr: destroy mutex=%p real_ptr=%p from thread 0x%x",
-                 mutex, mutex->real_ptr, sceKernelGetThreadId());
+    PTHR_TRACE(15, "pthr: destroy mutex=%p real_ptr=%p from thread 0x%x",
+               mutex, mutex->real_ptr, sceKernelGetThreadId());
     int ret = pthread_mutex_destroy(mutex->real_ptr);
     if (mutex->real_ptr) free(mutex->real_ptr);
     mutex->real_ptr = 0x0;
     return ret;
 }
 
+// Liveness probe replacing the old per-lock [013] trace.
+//
+// It answers the only question the flood of lock/unlock lines was actually
+// answering -- "is the .so still making progress, and how fast?" -- for a
+// bounded cost: the clock is read once every 4096 locks, and at most one line
+// is logged every PTHR_PROGRESS_INTERVAL_US. A stalled engine now shows up as
+// the counter standing still between two [023] lines instead of as an
+// unbounded wall of text that itself causes the stall.
+#ifdef DEBUG_SOLOADER
+#define PTHR_PROGRESS_INTERVAL_US (3 * 1000 * 1000)
+#define PTHR_PROGRESS_SAMPLE_MASK 0xFFFu
+static atomic_ulong pthr_lock_count = 0;
+static SceUInt64 pthr_progress_last_us = 0;
+
+PTHR_INLINE void _pthr_note_lock(const void * mutex, void * caller) {
+    unsigned long n = atomic_fetch_add_explicit(&pthr_lock_count, 1,
+                                                memory_order_relaxed) + 1;
+    if ((n & PTHR_PROGRESS_SAMPLE_MASK) != 0) return;
+
+    SceUInt64 now = sceKernelGetProcessTimeWide();
+    if (now - pthr_progress_last_us < PTHR_PROGRESS_INTERVAL_US) return;
+    pthr_progress_last_us = now;
+    l_checkpoint(23, "pthr: %lu mutex locks so far (last mutex=%p caller=%p)",
+                 n, mutex, caller);
+}
+#else
+#define _pthr_note_lock(mutex, caller) do {} while (0)
+#endif
+
 int pthread_mutex_lock_soloader(pthread_mutex_t_bionic *mutex)
 {
     if (!mutex) return EINVAL;
     _mutex_t_static_init(mutex, NULL);
-    // *real_ptr is logged too (not just the real_ptr slot's own address) --
-    // confirmed via checkpoint [016] that the crash's dereferenced value
-    // (0x98673b88) falls INSIDE the .so's own data range, not our heap, so
-    // the working theory is real_ptr's 4-byte slot itself gets clobbered
-    // with a .so-data-looking value instead of holding the calloc'd PTE
-    // struct pointer pthread_mutex_init() wrote there. See port_progress.md.
-    l_checkpoint(13, "pthr: lock mutex=%p real_ptr=%p *real_ptr=%p from thread 0x%x",
-                 mutex, mutex->real_ptr,
-                 mutex->real_ptr ? *(void **) mutex->real_ptr : NULL,
-                 sceKernelGetThreadId());
+    _pthr_note_lock(mutex, __builtin_return_address(0));
+    // *real_ptr is traced too (not just the real_ptr slot's own address) --
+    // confirmed via checkpoint [016] that the 0x98673b88 crash's dereferenced
+    // value falls INSIDE the .so's own data range, not our heap. Only under
+    // -DPTHR_TRACE_LOCKS; see PTHR_TRACE above for why it can't be on by
+    // default. See port_progress.md.
+    PTHR_TRACE(13, "pthr: lock mutex=%p real_ptr=%p *real_ptr=%p from thread 0x%x",
+               mutex, mutex->real_ptr,
+               mutex->real_ptr ? *(void **) mutex->real_ptr : NULL,
+               sceKernelGetThreadId());
     return pthread_mutex_lock(mutex->real_ptr);
 }
 
@@ -341,9 +473,9 @@ int pthread_mutex_unlock_soloader(pthread_mutex_t_bionic *mutex)
     // this is always safe to call here too.
     _mutex_t_static_init(mutex, NULL);
     if (!mutex->real_ptr) return EINVAL;
-    l_checkpoint(14, "pthr: unlock mutex=%p real_ptr=%p *real_ptr=%p from thread 0x%x",
-                 mutex, mutex->real_ptr, *(void **) mutex->real_ptr,
-                 sceKernelGetThreadId());
+    PTHR_TRACE(14, "pthr: unlock mutex=%p real_ptr=%p *real_ptr=%p from thread 0x%x",
+               mutex, mutex->real_ptr, *(void **) mutex->real_ptr,
+               sceKernelGetThreadId());
     return pthread_mutex_unlock(mutex->real_ptr);
 }
 
@@ -405,9 +537,9 @@ int pthread_cond_timedwait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t
     // the last point where mutex/real_ptr/*real_ptr can be logged before
     // control leaves our code.
     l_checkpoint(18, "pthr: cond_timedwait cond=%p mutex=%p real_ptr=%p *real_ptr=%p from thread 0x%x",
-                 cond, mutex, mutex->real_ptr,
-                 mutex->real_ptr ? *(void **) mutex->real_ptr : NULL,
-                 sceKernelGetThreadId());
+               cond, mutex, mutex->real_ptr,
+               mutex->real_ptr ? *(void **) mutex->real_ptr : NULL,
+               sceKernelGetThreadId());
     return pthread_cond_timedwait(cond->real_ptr, mutex->real_ptr, abstime);
 }
 
@@ -421,9 +553,9 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
 
     // Same rationale as pthread_cond_timedwait_soloader above.
     l_checkpoint(17, "pthr: cond_wait cond=%p mutex=%p real_ptr=%p *real_ptr=%p from thread 0x%x",
-                 cond, mutex, mutex->real_ptr,
-                 mutex->real_ptr ? *(void **) mutex->real_ptr : NULL,
-                 sceKernelGetThreadId());
+               cond, mutex, mutex->real_ptr,
+               mutex->real_ptr ? *(void **) mutex->real_ptr : NULL,
+               sceKernelGetThreadId());
     return pthread_cond_wait(cond->real_ptr, mutex->real_ptr);
 }
 

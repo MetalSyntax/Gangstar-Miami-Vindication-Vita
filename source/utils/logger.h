@@ -43,6 +43,22 @@ extern "C" {
 #define l_fatal(...)   _log_print(LT_FATAL,   __VA_ARGS__)
 
 /**
+ * Always-compiled informational line -- survives a Release build, unlike
+ * l_info()/l_debug().
+ *
+ * Why this tier exists: a Debug build turns on EVERY l_debug() in the project
+ * at once, including the per-fread()/fseek() traces in reimpl/io.c, and that
+ * volume slows the engine's asset loading down enough to change its behaviour
+ * (see port_progress.md Fase 8 -- logging itself was the "infinite black
+ * screen"). A Release build has the opposite problem: it compiles out
+ * l_debug/l_info/l_warn wholesale, so a run that hangs leaves nothing behind
+ * but FalsoJNI's own warnings. `l_note()` is the middle ground, reserved for
+ * lines that are BOTH low-volume and high-signal: the engine's own
+ * __android_log_*() output, and the main loop's frame heartbeat.
+ */
+#define l_note(...)    _log_print(LT_INFO,    __VA_ARGS__)
+
+/**
  * Numbered breadcrumb for crash triage: prints "[NNN] <msg>" via l_debug so
  * the last line in the log before a crash pins down exactly which checkpoint
  * was reached. Numbers are a project-wide sequence (001-999, zero-padded),

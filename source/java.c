@@ -159,6 +159,24 @@ jint Method_getResourceLength(jmethodID id, va_list args) {
 void Method_soundVoidStub(jmethodID id, va_list args) {}
 jint Method_soundNotLoaded(jmethodID id, va_list args) { return 0; }
 
+// setMusicGain(float) / setSfxGain(float) / setVfxGain(float).
+//
+// These are `private static void` in GLMediaPlayer.java, but the .so does NOT
+// invoke them through CallStaticVoidMethod: nativeSetMusicGain/SfxGain/VfxGain
+// all dispatch through JNIEnv offset 0x204, i.e. CallStaticIntMethod (see the
+// Ghidra pseudo-C -- `(**(code **)(iVar4 + 0x204))(piVar1, uVar2, setMusicGain,
+// ..., uVar5)`). Registering them only as METHOD_TYPE_VOID left methodIntCall()
+// with nothing to find, hence the "[WARN] method ID 27/28/29 not found!" lines
+// that were the ONLY output of the 2026-09-05 release run. The native wrappers
+// return void and discard the result, so the -1 was harmless -- but the noise
+// was the last thing standing between us and a clean log.
+//
+// Auditing every JNI dispatch site in the binary (0x1c4 GetStaticMethodID x57,
+// 0x1c8 CallStaticObjectMethod x5, 0x204 CallStaticIntMethod x18, 0x234
+// CallStaticVoidMethod x34) confirms these three were the only gap: every other
+// method is invoked through the variant its table entry already covers.
+jint Method_soundGainStub(jmethodID id, va_list args) { return 0; }
+
 /*
  * Device / system queries
  */
@@ -285,9 +303,12 @@ NameToMethodID nameToMethodId[] = {
         { 24, "stopAllBig", METHOD_TYPE_VOID },
         { 25, "destroySoundPool", METHOD_TYPE_VOID },
         { 26, "initSoundPoolArray", METHOD_TYPE_VOID },
-        { 27, "setMusicGain", METHOD_TYPE_VOID },
-        { 28, "setSfxGain", METHOD_TYPE_VOID },
-        { 29, "setVfxGain", METHOD_TYPE_VOID },
+        // Declared `void` in Java, but the .so calls them via CallStaticIntMethod
+        // -- see Method_soundGainStub(). They are listed in BOTH methodsInt and
+        // methodsVoid so either dispatch path resolves.
+        { 27, "setMusicGain", METHOD_TYPE_INT },
+        { 28, "setSfxGain", METHOD_TYPE_INT },
+        { 29, "setVfxGain", METHOD_TYPE_INT },
         { 30, "isSoundLoaded", METHOD_TYPE_INT },
         { 31, "isSoundLoadedBig", METHOD_TYPE_INT },
         { 32, "isMediaPlaying", METHOD_TYPE_INT },
@@ -332,6 +353,9 @@ MethodsFloat methodsFloat[] = {};
 
 MethodsInt methodsInt[] = {
         { 3, Method_getResourceLength },
+        { 27, Method_soundGainStub },
+        { 28, Method_soundGainStub },
+        { 29, Method_soundGainStub },
         { 30, Method_soundNotLoaded },
         { 31, Method_soundNotLoaded },
         { 32, Method_isMediaPlaying },

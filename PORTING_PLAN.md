@@ -1,7 +1,9 @@
 # Plan de Port — Gangstar Miami Vindication (PS Vita)
 
-> Generado por psvita-port-toolkit el 2026-08-23. Punto de partida con lo detectado automáticamente --
-confirmar todo con objdump/Ghidra/jadx a mano antes de asumirlo como cierto.
+> Generado por psvita-port-toolkit el 2026-08-23; **documento vivo, última revisión 2026-09-07.**
+> Lo que dice "CONFIRMADO" se verificó a mano contra el `.so` real (objdump/Ghidra), el Java de jadx
+> o un log de consola física. Lo que no lo dice sigue siendo detección automática -- no asumirlo.
+> La bitácora cronológica, bug por bug, está en `port_progress.md`.
 
 ## 0. Contexto
 
@@ -10,8 +12,24 @@ confirmar todo con objdump/Ghidra/jadx a mano antes de asumirlo como cierto.
 - **APK original:** `Gangstar-Miami-Vindication-HD.apk`
 - **TITLEID asignado:** `PSVGMV002`
 
-**¿Motor conocido?** Revisar si algún port hermano (bajo la misma BASE_DIR) comparte motor antes de
-reusar su código -- confirmar con símbolos JNI reales, no por analogía superficial.
+**Motor: CONFIRMADO 2026-09-05.** Es **glitch engine 0.1.0.2**, el motor propio de Gameloft (no
+Unity/UE/cocos2d, y ningún port hermano lo comparte -- no hay código que reusar). Identificado por
+la línea que el propio motor imprime al arrancar (`[ALOG][GameLoft Printer::log] Glitch Engine
+version 0.1.0.2`, ver `logs/debug_local_019.log`) y por el namespace `glitch::` en todo el pseudo-C
+de Ghidra (`glitch::os::Printer`, `glitch::io::createReadFile`, `glitch::IReferenceCounted`,
+`glitch::ILogger`, `glitch::scene_node`).
+
+Lo que eso implica y ya está confirmado:
+
+- **C++ con STLport**, no libstdc++ (`std::_Node_Alloc_Lock::_S_lock` aparece en el arranque).
+- **dlmalloc propio, linkeado estáticamente**: el juego no usa el malloc de newlib para su heap
+  interno. Ver `port_progress.md` Fase 8 -- por eso un log por lock de mutex se traduce en dos
+  round-trips a la memory card por cada `malloc()`/`free()` del juego.
+- **Formatos de asset propios:** `.bdae` (modelos/escenas), `.bsprite` + `.bmp` (sprites/HUD),
+  `.gmap`, `.array`, `.english` (textos). Los `.bdae` son contenedores que el motor recorre con
+  miles de `fread()`/`fseek()` chicos.
+- **Su logger manda la format string SIN expandir** a `__android_log_write()` (ver Fase 11) --
+  cualquier `[ALOG]` con `%s` va a aparecer literal en el log. Es correcto, no es un bug nuestro.
 
 ## 1. Detección automática
 
@@ -80,32 +98,103 @@ Exports confirmados (clase → métodos):
    es resume real desde `onResume()`).
 
 
-## 4. Checklist
+## 4. Mapa de despacho JNI -- AUDITADO COMPLETO 2026-09-05
+
+El `.so` no llama a `RegisterNatives`: pide cada método por nombre con `GetStaticMethodID` y después
+lo invoca por el offset de la variante correspondiente en `JNINativeInterface`. Contando los sitios
+sobre el pseudo-C de Ghidra, el binario entero usa **exactamente cuatro** entradas de esa tabla:
+
+| Offset  | Índice | Función                  | Sitios | Cubierto por          |
+|---------|--------|--------------------------|--------|-----------------------|
+| `0x1c4` | 113    | `GetStaticMethodID`      | 57     | `nameToMethodId[]` (57 entradas, coincide 1:1) |
+| `0x1c8` | 114    | `CallStaticObjectMethod` | 5      | `methodsObject[]`     |
+| `0x204` | 129    | `CallStaticIntMethod`    | 18     | `methodsInt[]`        |
+| `0x234` | 141    | `CallStaticVoidMethod`   | 34     | `methodsVoid[]`       |
+
+Cruzados uno por uno contra `source/java.c`, el único hueco que había eran `setMusicGain`/
+`setSfxGain`/`setVfxGain`: son `void` en el Java pero el motor los llama por `CallStaticIntMethod`,
+así que estaban solo en `methodsVoid[]` y `methodIntCall()` no los encontraba (Fase 10). Ya
+corregido. **No queda ningún otro método sin cubrir.**
+
+Regla para el futuro: no alcanza con mirar la firma Java para decidir en qué tabla va un método --
+hay que mirar por qué offset lo llama el `.so`.
+
+## 5. Filesystem: traducción Android → Vita
+
+El `.so` tiene su raíz de contenido compilada como literal y **no hay ningún JNI para cambiarla**,
+así que la corrección va en el camino al filesystem (`source/reimpl/io.c`, Fase 9):
+
+| Ruta Android                                          | Vita                    |
+|-------------------------------------------------------|-------------------------|
+| `/sdcard/gameloft/games/Gangstar2`                     | `DATA_PATH "data"`      |
+| `/data/data/com.gameloft.android.TBFV.GloftGMHP.ML`    | `DATA_PATH "saves"`     |
+| `/sdcard` (cualquier otra cosa: IGP/ads)               | `DATA_PATH "data"`      |
+
+Además normaliza los `//` y los segmentos `.` (el motor concatena su raíz con nombres que ya
+empiezan con `./`, así que lo que llega a `fopen()` es literalmente
+`./sdcard/gameloft/games/Gangstar2//./about.english`, que sceLibcBridge no resuelve). Se aplica en
+`fopen`, `freopen`, `open`, `stat`, `lstat`, `opendir`, `access`, `chdir`, `chmod`, `mkdir`,
+`remove`, `rename`, `rmdir`, `unlink` y `realpath`.
+
+**Datos:** 3214 archivos en `ux0:data/gangstarmiamivindication/data/`, verificados contra el
+`zipinfo` del zip original -- no falta ninguno.
+
+## 6. Logging: tres niveles, y por qué
+
+Aprendido a los golpes (Fases 8, 10 y 11). El logging de este port **cambia el comportamiento bajo
+prueba** si se pasa de volumen, así que está estratificado a propósito:
+
+| Nivel | Macro | ¿Compila en Release? | Para qué |
+|-------|-------|----------------------|----------|
+| Siempre | `l_error` / `l_fatal` / **`l_note`** | Sí | El `[ALOG]` del motor (INFO/WARN), el latido de frames `[022]`, `fopen()` fallidos. Bajo volumen, alta señal. |
+| Debug | `l_debug` / `l_info` / `l_warn` | No (`DEBUG_SOLOADER`) | Todo `io.c`, los checkpoints numerados, FalsoJNI verboso (`FALSOJNI_DEBUGLEVEL=0`). |
+| Opt-in | `PTHR_TRACE_LOCKS`, `IO_TRACE_STREAMS` | No (opciones CMake, OFF) | Un lock o un `fread()` por línea. Solo para cazar un bug puntual: a este volumen el juego deja de reproducir lo que hace sin el trace. |
+
+**Nunca** pasar una cadena de runtime como format string (Fase 11): `sceClibPrintf("%s", buf)`,
+jamás `sceClibPrintf(buf)`. El motor manda mensajes con `%s` adentro.
+
+## 7. Checklist
 
 - [x] Repo creado desde soloader-boilerplate, git init, .gitignore anti-DMCA.
 - [x] APK decompilado (jadx) y .so decompilado(s) (Ghidra) -- ver sección 2/3.
-- [x] Análisis del motor real (ciclo de vida nativo, reuso de otro port o boilerplate genérico) --
-      ver sección 3 y `port_progress.md` Fase 3 (2026-08-31).
-- [x] Bootstrap del loader: so_file_load/so_relocate/so_resolve, primer build -- `source/main.c`
-      reescrito (ya no depende de `JNI_OnLoad`, inexistente en este .so), build verde el 2026-08-31
-      (se arreglaron además: `lib/falso_jni` vacío -- submódulo nunca clonado -- y colisión de
-      símbolos EGL entre `source/reimpl/egl.c` y el vitaGL instalado, que ahora trae su propio EGL).
-- [x] Tabla JNI (FalsoJNI): completada el 2026-09-01 con los **57 métodos** que el log real de
-      consola muestra que el motor pide (`source/java.c`) -- carga de recursos
-      (`getResourceFull`/`getResourceBytes`/`getResourceLength`, semántica sacada de
-      `GLResLoader.java`), audio (aceptado e ignorado hasta portar audio), dispositivo/sistema, y
-      el SDK muerto de Verizon. Ver `port_progress.md` Fase 5.
-- [x] Símbolos importados: los 26 que faltaban en `source/dynlib.c` (`__aeabi_i2f` y demás helpers
-      ARM EABI de float/double, `__dso_handle`, `__isfinitef`, `_ZSt7nothrow`,
-      `_ZnajRKSt9nothrow_t`) agregados el 2026-09-01. Verificado con `objdump -T`: cero símbolos
-      sin resolver.
-- [x] Primer arranque en consola real: el motor arranca y corre (~17 s en la corrida del
-      2026-09-01), ya pasando el crash de `pthread_mutex_unlock` que bloqueaba el boot.
-- [ ] Gráficos (wrappers GL según versión detectada).
-- [ ] Input, Audio, Assets, LiveArea/VPK.
-- [ ] Pruebas en hardware real.
+- [x] Análisis del motor real (ciclo de vida nativo, motor identificado) -- secciones 0 y 3,
+      `port_progress.md` Fase 3.
+- [x] Bootstrap del loader: `source/main.c` reescrito (no depende de `JNI_OnLoad`, inexistente en
+      este .so). Build verde desde el 2026-08-31.
+- [x] Tabla JNI (FalsoJNI): 57 métodos en `source/java.c`, **auditada completa** contra los sitios
+      de despacho reales del binario el 2026-09-05 (sección 4).
+- [x] Símbolos importados: cero sin resolver (`objdump -T`).
+- [x] Primer arranque en consola real (2026-09-01).
+- [x] **Assets**: capa de traducción de rutas Android → Vita, los 3214 archivos en su lugar
+      (sección 5, Fase 9).
+- [x] **Input**: touch frontal (5 slots, mapeo a `nativeOnTouch` down/move/up) +
+      botones como keycodes Android por el camino `s_keyDownCode/s_keyUpCode`
+      (dpad → 19-22, CROSS → 23, CIRCLE → 4/BACK, START → 82/MENU) + heartbeat
+      por tiempo y slow-frames en release (`source/main.c`, Fase 13).
+- [x] **Gráficos (parcial)**: vitaGL vendorizado (`lib/vitaGL` + `lib/vitashark`), shaders GLSL con
+  `DUMP_COMPILED_SHADERS`, y el spoof de `glGetString(GL_VERSION)` a "OpenGL ES 1.1" que el
+  motor exige (`source/reimpl/gl.h`, Fase 7). **Todavía no se vio un solo frame dibujado
+  (2026-09-07: el juego corre a 30 fps con pantalla negra; instrumentación `[GL]` +
+  capturas BMP cada ~20 s en vuelo, gap `SPOT_*` de vitaGL parchado en `ffp.c` —
+  ver `port_progress.md` Fases 15-17, pendiente verificar en consola).**
+- [ ] **Gráficos (real)**: que el motor dibuje. Pendiente el warning
+  `parameter type mismatch when setting "%s/%s"` del camino de material/shader (Fase 11),
+  más la pista nueva: 69 `Loaded texture` del engine vs un puñado de uploads GL
+  (posible textura negra vía PVR) o cámara fuera de vista (los BMP lo dirán).
+- [ ] **Audio**: sin portar (scopeado 2026-09-07: el `.so` no importa audio nativo —
+  todo es JNI `SoundPool` 5 streams + `MediaPlayer`; 1722 `.ogg` sin decoder vendored.
+  Requiere vendorizar vorbis + backend `SceAudioOut`; fase propia tras el render).
+  Los 23 métodos de `GLMediaPlayer` se aceptan y se ignoran; los dos
+  `isSoundLoaded*` responden "no cargado" para que el motor no espere.
+- [ ] **Video**: sin portar. `loadMovie()` devuelve 1 y dispara
+      `nativeSetOnVideoCompletion()` al instante, como si el clip terminara solo (Fase 6).
+- [ ] **Ciclo de vida incompleto**: `nativePause`/`nativeResume`/`nativeAccelerometer`/`nativeDone`/
+      `nativeOpenIGM`/`nativeCanInterrupt` están exportados pero **no cableados** en `main.c`.
+      Hacen falta para suspender/reanudar la consola y para el menú in-game.
+- [ ] LiveArea/VPK definitivos.
+- [ ] Pruebas de juego en hardware real.
 
-## 5. Herramientas
+## 8. Herramientas
 
 Este port se gestiona con **psvita-port-toolkit** (standalone, fuera de este repo). Desde el
 toolkit: `Continuar con un port existente` → elegí esta carpeta (ya tiene `.psvita-toolkit.json`).

@@ -9,6 +9,7 @@
 
 #include "utils/glutil.h"
 
+#include "reimpl/gl.h"
 #include "utils/utils.h"
 #include "utils/dialog.h"
 #include "utils/logger.h"
@@ -17,6 +18,8 @@
 #include <malloc.h>
 #include <string.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/display.h>
+#include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 
 // Helpers for our handling of shaders
@@ -37,11 +40,76 @@ void gl_preload() {
 }
 
 void gl_init() {
-    vglInitExtended(0, 960, 544, 6 * 1024 * 1024, SCE_GXM_MULTISAMPLE_4X);
+    // MULTISAMPLE_NONE + 12 MB (2026-09-06): the Asphalt-5 recipe from
+    // port_progress.md Fase 12. The old 4X MSAA made every vglSwapBuffers()
+    // pay a multisample resolve -- pure overhead during the minutes-long
+    // black-screen asset load -- and MSAA + the FBO OES path this engine
+    // uses is a risky combination in vitaGL. Reversible if menus look off.
+    vglInitExtended(0, 960, 544, 12 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
 }
 
 void gl_swap() {
+    gl_frame_tick();
     vglSwapBuffers(GL_FALSE);
+}
+
+// TEMP triage (black screen with live draws, 2026-09-06): dump the displayed
+// framebuffer to a 32-bit BMP so a human can see whether the backbuffer is
+// truly all-black, a very dark scene, or something rendered outside the
+// visible area. Called every few hundred frames from main.c -- a ~2 MB write
+// once per ~20 s, negligible next to asset loading. Remove with the triage.
+int gl_shot(const char *path) {
+    SceDisplayFrameBuf fb;
+    memset(&fb, 0, sizeof(fb));
+    fb.size = sizeof(fb);
+    if (sceDisplayGetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME) < 0 || !fb.base)
+        return -1;
+    if (fb.pixelformat != SCE_DISPLAY_PIXELFORMAT_A8B8G8R8)
+        return -2;
+    if (fb.width == 0 || fb.height == 0 || fb.width > 1024 || fb.height > 1024)
+        return -3;
+
+    // BMP headers, 32-bit BI_RGB top-down (negative height).
+    uint8_t hdr[54];
+    memset(hdr, 0, sizeof(hdr));
+    uint32_t row_bytes = fb.width * 4;
+    uint32_t img_bytes = row_bytes * fb.height;
+    uint32_t file_bytes = sizeof(hdr) + img_bytes;
+    hdr[0] = 'B'; hdr[1] = 'M';
+    hdr[2] = file_bytes & 0xFF; hdr[3] = (file_bytes >> 8) & 0xFF;
+    hdr[4] = (file_bytes >> 16) & 0xFF; hdr[5] = (file_bytes >> 24) & 0xFF;
+    hdr[10] = sizeof(hdr);
+    hdr[14] = 40;
+    hdr[18] = fb.width & 0xFF; hdr[19] = (fb.width >> 8) & 0xFF;
+    int32_t neg_h = -(int32_t)fb.height;
+    hdr[22] = neg_h & 0xFF; hdr[23] = (neg_h >> 8) & 0xFF;
+    hdr[24] = (neg_h >> 16) & 0xFF; hdr[25] = (neg_h >> 24) & 0xFF;
+    hdr[26] = 1; hdr[28] = 32;
+
+    SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd < 0) return -4;
+    if (sceIoWrite(fd, hdr, sizeof(hdr)) != (SceSSize)sizeof(hdr)) {
+        sceIoClose(fd);
+        return -5;
+    }
+    // Display memory is R,G,B,A byte order; BMP 32-bit wants B,G,R,A.
+    static uint8_t row[1024 * 4];
+    const uint8_t *base = (const uint8_t *)fb.base;
+    for (unsigned y = 0; y < fb.height; y++) {
+        const uint8_t *src = base + y * fb.pitch * 4;
+        for (unsigned x = 0; x < fb.width; x++) {
+            row[x * 4 + 0] = src[x * 4 + 2];
+            row[x * 4 + 1] = src[x * 4 + 1];
+            row[x * 4 + 2] = src[x * 4 + 0];
+            row[x * 4 + 3] = src[x * 4 + 3];
+        }
+        if (sceIoWrite(fd, row, row_bytes) != (SceSSize)row_bytes) {
+            sceIoClose(fd);
+            return -6;
+        }
+    }
+    sceIoClose(fd);
+    return 0;
 }
 
 void glShaderSource_soloader(GLuint shader, GLsizei count,

@@ -61,6 +61,26 @@ if (CMAKE_BUILD_TYPE STREQUAL "Debug")
   add_definitions(-DFALSOJNI_DEBUGLEVEL=0)
 endif()
 
+# Per-mutex-operation tracing in source/reimpl/pthr.c ([011]..[015], [021]).
+# OFF by default and deliberately so: the game statically links its own
+# dlmalloc, so those hooks fire once per malloc() and once per free(), and one
+# log line per allocation makes the engine's loading path take effectively
+# forever (that was the "infinite black-screen loop", see port_progress.md
+# Fase 8). Turn on only while chasing a mutex bug.
+option(PTHR_TRACE_LOCKS "Log every pthread mutex lock/unlock/init/destroy" OFF)
+if (PTHR_TRACE_LOCKS)
+  add_definitions(-DPTHR_TRACE_LOCKS)
+endif()
+
+# Per-call fread()/fseek() tracing in source/reimpl/io.c. OFF by default for the
+# same reason as PTHR_TRACE_LOCKS: the engine reads its .bdae/.bsprite archives
+# with thousands of tiny reads, and logging each one slows the loading path
+# enough to change the behaviour under test. Turn on only to chase a bad read.
+option(IO_TRACE_STREAMS "Log every fread()/fseek() call" OFF)
+if (IO_TRACE_STREAMS)
+  add_definitions(-DIO_TRACE_STREAMS)
+endif()
+
 # makes sincos, sincosf, etc. visible
 add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 
@@ -74,6 +94,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/patch.c
                source/reimpl/bits/_ctype.c
                source/reimpl/errno.c
+               source/reimpl/gl.c
                source/reimpl/io.c
                source/reimpl/log.c
                source/reimpl/sysconf.c
@@ -107,11 +128,44 @@ target_include_directories(${CMAKE_PROJECT_NAME}
                            PUBLIC ${CMAKE_SOURCE_DIR}/source
                            )
 
+file(GLOB VITAGL_SRC
+    lib/vitaGL/source/*.c
+    lib/vitaGL/source/*.cpp
+    lib/vitaGL/source/utils/*.c
+    lib/vitaGL/source/utils/*.cpp
+    lib/vitaGL/source/utils/preprocessor/*.c
+    lib/vitaGL/source/utils/preprocessor/*.cpp
+)
+list(FILTER VITAGL_SRC EXCLUDE REGEX ".*/\\._.*")
+add_library(vitaGL_local STATIC ${VITAGL_SRC})
+target_include_directories(vitaGL_local PUBLIC lib/vitaGL/source)
+target_compile_definitions(vitaGL_local PRIVATE VGL_GIT_HASH="vendorized")
+target_compile_options(vitaGL_local PRIVATE -Wno-incompatible-pointer-types -Wno-stringop-overflow -mfp16-format=ieee)
+# Add some usual speedhacks for ports, if not needed they can be removed
+target_compile_definitions(vitaGL_local PRIVATE
+    MATH_SPEEDHACK
+    VITA3K_SUPPORT
+    SKIP_SPLASHSCREEN
+    # TEMP triage (black screen + sticky GL_INVALID_ENUM every frame,
+    # 2026-09-06): enables vitaGL's vgl_log() error lines
+    # ("file:line: func set GL_INVALID_ENUM (param: 0xVALUE)"), which our
+    # loader forwards into the session log -- see vgl_log_capture() in
+    # source/reimpl/gl.c and lib/vitaGL/source/utils/debug_utils.h.
+    # Remove once the offender is fixed (it also costs a printf per error).
+    LOG_ERRORS
+)
+
+add_library(vitashark_local STATIC lib/vitashark/source/vitashark.c)
+target_include_directories(vitashark_local PUBLIC lib/vitashark/source)
+target_compile_options(vitashark_local PRIVATE -Wno-incompatible-pointer-types)
+
+target_link_libraries(vitaGL_local PUBLIC vitashark_local)
+
 target_link_libraries(${CMAKE_PROJECT_NAME}
                       -Wl,--whole-archive pthread -Wl,--no-whole-archive
                       stdc++
-                      vitaGL
-                      vitashark
+                      vitaGL_local
+                      vitashark_local
                       SceShaccCgExt
                       taihen_stub
                       SceShaccCg_stub
@@ -144,14 +198,14 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 vita_create_self(eboot.bin ${CMAKE_PROJECT_NAME} UNSAFE NOASLR)
 vita_create_vpk(${VITA_VPKNAME}.vpk ${VITA_TITLEID} eboot.bin
                 VERSION ${VITA_VERSION}
-                NAME ${VITA_APP_NAME}
-                FILE ${CMAKE_SOURCE_DIR}/extras/cpuinfo cpuinfo
-                ${CMAKE_SOURCE_DIR}/extras/meminfo meminfo
-                ${CMAKE_SOURCE_DIR}/extras/livearea/icon0.png sce_sys/icon0.png
-                ${CMAKE_SOURCE_DIR}/extras/livearea/pic0.png sce_sys/pic0.png
-                ${CMAKE_SOURCE_DIR}/extras/livearea/startup.png sce_sys/livearea/contents/startup.png
-                ${CMAKE_SOURCE_DIR}/extras/livearea/bg0.png sce_sys/livearea/contents/bg0.png
-                ${CMAKE_SOURCE_DIR}/extras/livearea/template.xml sce_sys/livearea/contents/template.xml
+                NAME "${VITA_APP_NAME}"
+                FILE "${CMAKE_SOURCE_DIR}/extras/cpuinfo" cpuinfo
+                "${CMAKE_SOURCE_DIR}/extras/meminfo" meminfo
+                "${CMAKE_SOURCE_DIR}/extras/livearea/icon0.png" sce_sys/icon0.png
+                "${CMAKE_SOURCE_DIR}/extras/livearea/pic0.png" sce_sys/pic0.png
+                "${CMAKE_SOURCE_DIR}/extras/livearea/startup.png" sce_sys/livearea/contents/startup.png
+                "${CMAKE_SOURCE_DIR}/extras/livearea/bg0.png" sce_sys/livearea/contents/bg0.png
+                "${CMAKE_SOURCE_DIR}/extras/livearea/template.xml" sce_sys/livearea/contents/template.xml
                 )
 
 add_custom_target(send

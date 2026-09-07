@@ -15,11 +15,30 @@ Este port **no** tiene una copia local de `porting_tools/` -- todo el build/depl
 desde **psvita-port-toolkit**, la herramienta standalone (fuera de este repo). Abrí el toolkit y
 elegí "Continuar con un port existente" apuntando a esta carpeta.
 
-## Hallazgos de motor (automáticos, sin confirmar)
+## Hallazgos de motor (CONFIRMADOS -- ver PORTING_PLAN.md secciones 0-6)
 
-- ABI: armeabi (preferida: armeabi)
-- GLES: AndroidManifest.xml no declara glEsVersion -- usar heurística (GLES1 (pipeline fijo: glVertexPointer/glClearColorx/glTexParameterx))
-- Paquete Java: com.gameloft.android.TBFV.GloftGMHP.ML
+- **Motor: glitch engine 0.1.0.2**, propio de Gameloft. C++ con STLport, dlmalloc propio linkeado
+  estático, assets `.bdae`/`.bsprite`/`.bmp`/`.gmap`. Ningún port hermano lo comparte.
+- **ABI:** armeabi (ARMv6, soft-float).
+- **GLES 1.1**, pipeline fijo + VBOs + FBO OES. NO usa GLES2 (confirmado con `objdump -T`: no hay
+  `glCreateShader`/`glUseProgram`). El motor rechaza cualquier `GL_VERSION` > 1.99, así que
+  `source/reimpl/gl.c` spoofea "OpenGL ES 1.1".
+- **Paquete Java:** com.gameloft.android.TBFV.GloftGMHP.ML
+- **JNI:** sin `JNI_OnLoad` ni `RegisterNatives` -- 24 exports `Java_*` por convención de nombre,
+  resueltos a mano en `source/main.c`. La tabla de 57 métodos de `source/java.c` está **auditada
+  completa** contra los cuatro offsets de `JNINativeInterface` que el binario realmente usa.
+
+## Reglas aprendidas a los golpes (no repetir)
+
+1. **El logging cambia el comportamiento bajo prueba.** Un log por `malloc()` o por `fread()` hace
+   que la carga de assets tarde una eternidad y parezca un deadlock. `PTHR_TRACE_LOCKS` y
+   `IO_TRACE_STREAMS` están OFF por default por eso.
+2. **Nunca pasar una cadena de runtime como format string.** `sceClibPrintf("%s", buf)`, jamás
+   `sceClibPrintf(buf)` -- el motor manda mensajes con `%s` sin expandir.
+3. **Un build de release no es ciego:** `l_note()` (siempre compilado) lleva el `[ALOG]` del motor
+   y el latido de frames. Preferir release para reproducir; debug solo para cazar un bug puntual.
+4. **La firma Java no dice en qué tabla JNI va un método** -- hay que mirar por qué offset de
+   `JNINativeInterface` lo llama el `.so`.
 
 ## Flujo de trabajo esperado
 

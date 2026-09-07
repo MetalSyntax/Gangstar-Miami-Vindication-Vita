@@ -102,6 +102,22 @@ static void _debugnet_send(const char *line) {
 
 static char _localfile_path[128];
 static bool _localfile_init_done = false;
+static SceUID _localfile_fd = -1;
+static unsigned _localfile_unsynced = 0;
+
+// How many low-severity lines may sit in the filesystem's write-back cache
+// before an explicit sceIoSyncByFd(). The whole point of the local mirror is
+// that the LAST line before a crash survives, so anything at LT_WARN or above
+// syncs immediately; ordinary debug chatter only pays for a sync once every
+// this many lines.
+//
+// 256, not 64 (2026-09-06): with the load-spam filtered out of l_note() and
+// repeated fopen FAILEDs deduplicated, low-severity lines are rare anyway;
+// each sync stalls on the memory card right in the middle of the engine's
+// asset loading, so syncing 4x less often is pure load-time win. Worst case
+// on a hard crash is losing the last <256 low-severity lines -- WARN and
+// above still sync immediately, so triage signal is preserved.
+#define LOCAL_LOG_SYNC_EVERY 256
 
 static void _localfile_init(void) {
     _localfile_init_done = true;
@@ -129,16 +145,31 @@ static void _localfile_init(void) {
         sceIoWrite(fd, counter_buf, len);
         sceIoClose(fd);
     }
+
+    _localfile_fd = sceIoOpen(_localfile_path,
+                              SCE_O_WRONLY | SCE_O_APPEND | SCE_O_CREAT, 0777);
 }
 
-static void _localfile_send(const char *line) {
+// The session log used to be opened, written and closed again for EVERY line.
+// That is three ux0: round-trips per log call, and this loader logs from
+// pthread_mutex_lock/unlock -- i.e. from inside the game's own dlmalloc lock,
+// once per malloc() and once per free(). The engine's resource loading then
+// runs at the speed of the memory card instead of the CPU, which is what the
+// "infinite black-screen loop" in logs/debug_local_013.log actually was.
+// The fd is opened once and kept; crash-survivability is preserved by syncing
+// on every important line and periodically on the rest.
+static void _localfile_send(const char *line, bool important) {
     if (!_localfile_init_done) {
         _localfile_init();
     }
-    SceUID fd = sceIoOpen(_localfile_path, SCE_O_WRONLY | SCE_O_APPEND | SCE_O_CREAT, 0777);
-    if (fd < 0) return;
-    sceIoWrite(fd, line, strlen(line));
-    sceIoClose(fd);
+    if (_localfile_fd < 0) return;
+
+    sceIoWrite(_localfile_fd, line, strlen(line));
+
+    if (important || ++_localfile_unsynced >= LOCAL_LOG_SYNC_EVERY) {
+        sceIoSyncByFd(_localfile_fd, 0);
+        _localfile_unsynced = 0;
+    }
 }
 
 // Buffer A is used to adjust the format string.
@@ -159,7 +190,7 @@ void l_raw_line(const char *line) {
     }
 
     _debugnet_send(line);
-    _localfile_send(line);
+    _localfile_send(line, false);
 
     sceKernelUnlockLwMutex(&_log_mutex, 1);
 }
@@ -212,9 +243,24 @@ void _log_print(int t, const char* fmt, ...) {
     va_start(list, fmt);
     sceClibVsnprintf(buffer_b, sizeof(buffer_b), buffer_a, list);
     va_end(list);
-    sceClibPrintf(buffer_b);
+    // "%s", buffer_b -- NOT sceClibPrintf(buffer_b). buffer_b is finished
+    // output, i.e. runtime data, and handing it to printf as the FORMAT makes
+    // any '%' inside it a conversion with no argument behind it.
+    //
+    // This is not hypothetical: the engine's glitch::os::Printer::logf() does
+    //   appDebugLog(tag, fmt);  ->  __android_log_write(4, tag, fmt)
+    // i.e. it hands its format string to the log WITHOUT expanding the varargs
+    // (harmless on Android, where __android_log_write never reparses). So a
+    // line like
+    //   parameter type mismatch when setting "%s/%s": want %s, got %s
+    // reached us verbatim, went through l_note("[ALOG][%s] %s", tag, text)
+    // into buffer_b, and then sceClibPrintf() reparsed those four %s and read
+    // four garbage pointers off the stack -- data abort inside SceLibKernel
+    // (dumps ...-1788589177 and ...-1788592309, PC = SceLibKernel+0x60a2 both
+    // times, R0=R1=R4 = the bogus char*).
+    sceClibPrintf("%s", buffer_b);
     _debugnet_send(buffer_b);
-    _localfile_send(buffer_b);
+    _localfile_send(buffer_b, t >= LT_WARN);
 
     if (atomic_load_explicit(&_log_mutex_ready, memory_order_relaxed)) {
         sceKernelUnlockLwMutex(&_log_mutex, 1);

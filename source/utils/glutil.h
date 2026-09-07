@@ -27,6 +27,10 @@ void gl_preload();
 
 void gl_swap();
 
+// TEMP triage (2026-09-06): dump displayed framebuffer to a 32-bit BMP.
+// Returns 0 on success, negative on failure. See glutil.c.
+int gl_shot(const char *path);
+
 void glCompileShader_soloader(GLuint shader);
 
 void glShaderSource_soloader(GLuint shader, GLsizei count,
