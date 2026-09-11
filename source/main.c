@@ -2,6 +2,7 @@
 #include "utils/glutil.h"
 #include "utils/logger.h"
 #include "utils/dialog.h"
+#include "utils/audio.h"
 #include "reimpl/gl.h"
 
 #include <psp2/kernel/threadmgr.h>
@@ -87,6 +88,11 @@ int main() {
     l_checkpoint(6, "main: GLResLoader_nativeInit() done");
     GLMediaPlayer_nativeInit(&jni, NULL, 0);
     l_checkpoint(7, "main: GLMediaPlayer_nativeInit() done");
+    // Fase 31: no hay VM Java que ejecute GLMediaPlayer.init(), asi que el
+    // SoundPool/MediaPlayer nunca se crearia solo. Levantar el backend real
+    // (SceAudioOut + vorbis) aqui; es barato y sin el los queries de estado
+    // harian que el motor reintentara la radio cada frame (ver audio.c).
+    audio_init();
     Gangster2_nativeInit(&jni, NULL, 1); // 1 == demo mode, matches a fresh install's default state
     l_checkpoint(8, "main: Gangster2_nativeInit() done -- most likely place the engine spawns its worker thread(s)");
     GameRenderer_nativeInit(&jni, NULL, 1);
@@ -194,6 +200,9 @@ int main() {
         oldButtons = pad.buttons;
 
         GameRenderer_nativeRender(&jni, NULL);
+        // Fase 31: evitar que el governor baje relojes / suspenda durante
+        // cargas largas (el frame 2 y la rafaga de shaders tardan minutos).
+        sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
         SceUInt64 render_us = sceKernelGetProcessTimeWide() - frame_start;
         if (frame_no <= 10) {
             l_note("[022] main loop: frame %d returned (%llu us)", frame_no, render_us);
@@ -224,16 +233,35 @@ int main() {
         gl_swap();
 
         // TEMP triage (black screen with live draws, 2026-09-06): one BMP of
-        // the displayed framebuffer every 600 frames (~20 s at 30 fps) so the
-        // log run also produces pictures -- fetch
+        // the displayed framebuffer -- fetch
         // ux0:data/gangstarmiamivindication/logs/shot_*.bmp over FTP and look
-        // at them instead of guessing from counters. Remove with the triage.
-        if (frame_no > 100 && frame_no % 600 == 0) {
+        // at them instead of guessing from counters.
+        // Fase 25: frame 150 cae en la ventana del splash (tras la carga del
+        // frame 2, antes de la rafaga de shaders ~185); luego cada 300.
+        //
+        // Fase 30 (2026-09-10): apagado por default. debug_local_035.log
+        // muestra que CADA captura (gl_shot: 2 MB, ~522240 px escritos fila
+        // por fila con sceIoWrite bloqueante en source/utils/glutil.c) coincide
+        // 1:1 con un pozo de fps en la ventana de 5 s siguiente (0.6-2.7 fps,
+        // ver frames 151/1201/1801/2101/2401/2701/3001/4201 -- todos justo
+        // después de un "screenshot shot_*.bmp" log, con el render normal
+        // (7-10 ms) intacto: el costo no está en dibujar, está en el I/O
+        // síncrono de la captura). Esa misma pausa de 1-2 s cada ~10 s
+        // (300 frames a 30 fps) es la causa más probable de que el táctil
+        // "deje de responder a veces" -- si el toque llega durante el I/O
+        // bloqueante, no hay vuelta de main loop para leerlo hasta que
+        // termina. Ya cumplió su misión (Fase 26 confirmó la imagen real);
+        // reactivar con GMV_SHOT_TRIAGE=1 solo si hace falta ver el
+        // framebuffer de nuevo para triage.
+#define GMV_SHOT_TRIAGE 0
+#if GMV_SHOT_TRIAGE
+        if (frame_no == 150 || (frame_no > 150 && frame_no % 300 == 0)) {
             char shot[128];
             sceClibSnprintf(shot, sizeof(shot), DATA_PATH "logs/shot_%05d.bmp", frame_no);
             int sr = gl_shot(shot);
             l_note("[022] screenshot %s -> %d", shot, sr);
         }
+#endif
 
         // Mirrors GameRenderer.onDrawFrame()'s own 30 FPS pacing (33ms/frame).
         SceUInt64 frame_time = sceKernelGetProcessTimeWide() - frame_start;

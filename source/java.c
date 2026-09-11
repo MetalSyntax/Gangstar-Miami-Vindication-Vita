@@ -6,9 +6,11 @@
 #include <string.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
+#include <psp2/kernel/processmgr.h>
 
 #include <so_util/so_util.h>
 
+#include "utils/audio.h"
 #include "utils/logger.h"
 
 extern so_module so_mod;
@@ -150,14 +152,208 @@ jint Method_getResourceLength(jmethodID id, va_list args) {
 /*
  * Audio
  *
- * The engine drives Android's SoundPool/MediaPlayer through these. Audio isn't
- * wired up yet (see PORTING_PLAN.md section 4), so they're accepted and
- * ignored -- the engine only ever checks the two isSoundLoaded* queries, and
- * answering "not loaded" keeps it from waiting on a sound that will never
- * arrive.
+ * Real backend (Fase 31, 2026-09-11): every entry below drives
+ * source/utils/audio.c (SceAudioOut + libvorbisfile streaming/decoding).
+ * Reporting true loaded/playing state is load-bearing -- SoundManager::
+ * update() polls isMediaPlaying() every frame and re-issues
+ * playRadio/playSound whenever it reads "not playing", so the old
+ * accept-and-ignore stubs were both the silence AND the dominant per-frame
+ * cost behind the 10-13 fps (operator new[] + sprintf + appDebugLog + JNI
+ * per retry). Conventions from GLMediaPlayer.java: isSoundLoaded* return
+ * 0 when loaded / -1 when not; isMediaPlaying returns 1/0.
+ *
+ * Floats arrive through FalsoJNI varargs promoted to double; each is
+ * range-checked so a misread can only mistune loudness, never state.
  */
-void Method_soundVoidStub(jmethodID id, va_list args) {}
-jint Method_soundNotLoaded(jmethodID id, va_list args) { return 0; }
+static float audio_float_arg(va_list *args) {
+    double d = va_arg(*args, double);
+    float f = (float)d;
+    if (!(f >= 0.0f) || !(f <= 8.0f))
+        return 1.0f;
+    return f;
+}
+
+static float audio_pitch_arg(va_list *args) {
+    double d = va_arg(*args, double);
+    float f = (float)d;
+    if (!(f >= 0.25f) || !(f <= 4.0f))
+        return 1.0f;
+    return f;
+}
+
+void Method_loadSound(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    va_arg(args, jint); /* SoundPriority / instance, unused */
+    audio_load(index);
+}
+
+void Method_loadSoundBig(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    audio_load_big(index);
+}
+
+void Method_unloadSound(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    va_arg(args, jint);
+    audio_unload(index);
+}
+
+void Method_unloadSoundBig(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    audio_unload_big(index);
+}
+
+void Method_playSound(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    va_arg(args, jint);
+    float vol = audio_float_arg(&args);
+    float pitch = audio_pitch_arg(&args);
+    audio_play(index, vol, pitch);
+}
+
+void Method_playSoundBig(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    float vol = audio_float_arg(&args);
+    jint loop = va_arg(args, jint);
+    audio_play_big(index, vol, loop);
+}
+
+void Method_pauseSound(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    jint inst = va_arg(args, jint);
+    audio_pause_sfx(index, inst);
+}
+
+void Method_pauseSoundBig(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    audio_pause_big(index);
+}
+
+void Method_resumeSound(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    jint inst = va_arg(args, jint);
+    audio_resume_sfx(index, inst);
+}
+
+void Method_resumeSoundBig(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    audio_resume_big(index);
+}
+
+void Method_stopSound(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    jint inst = va_arg(args, jint);
+    audio_stop_sfx(index, inst);
+}
+
+void Method_stopSoundBig(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    audio_stop_big(index);
+}
+
+void Method_setVolume(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    jint inst = va_arg(args, jint);
+    float vol = audio_float_arg(&args);
+    audio_set_volume_sfx(index, inst, vol);
+}
+
+void Method_setVolumeBig(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    float vol = audio_float_arg(&args);
+    audio_set_volume_big(index, vol);
+}
+
+void Method_resetSound(jmethodID id, va_list args) {
+    (void)id;
+    va_arg(args, jint);
+}
+
+void Method_setPitch(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    jint inst = va_arg(args, jint);
+    float pitch = audio_pitch_arg(&args);
+    audio_set_pitch(index, inst, pitch);
+}
+
+void Method_stopAllSounds(jmethodID id, va_list args) {
+    (void)id;
+    (void)args;
+    audio_stop_all();
+}
+
+void Method_pauseAllSounds(jmethodID id, va_list args) {
+    (void)id;
+    (void)args;
+    audio_pause_all();
+}
+
+void Method_resumeAllSounds(jmethodID id, va_list args) {
+    (void)id;
+    (void)args;
+    audio_resume_all();
+}
+
+void Method_stopAllPool(jmethodID id, va_list args) {
+    (void)id;
+    va_arg(args, jint);
+    audio_stop_all();
+}
+
+void Method_stopAllBig(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    if (index < 0)
+        audio_stop_all();
+    else
+        audio_stop_big(index);
+}
+
+void Method_destroySoundPool(jmethodID id, va_list args) {
+    (void)id;
+    (void)args;
+    audio_stop_all();
+}
+
+void Method_initSoundPoolArray(jmethodID id, va_list args) {
+    (void)id;
+    (void)args;
+    audio_init();
+}
+
+jint Method_isSoundLoaded(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    va_arg(args, jint);
+    return audio_is_loaded(index) ? 0 : -1;
+}
+
+jint Method_isSoundLoadedBig(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    return audio_is_loaded_big(index) ? 0 : -1;
+}
+
+jint Method_isMediaPlaying(jmethodID id, va_list args) {
+    (void)id;
+    jint index = va_arg(args, jint);
+    return audio_is_media_playing(index) ? 1 : 0;
+}
 
 // setMusicGain(float) / setSfxGain(float) / setVfxGain(float).
 //
@@ -175,7 +371,49 @@ jint Method_soundNotLoaded(jmethodID id, va_list args) { return 0; }
 // 0x1c8 CallStaticObjectMethod x5, 0x204 CallStaticIntMethod x18, 0x234
 // CallStaticVoidMethod x34) confirms these three were the only gap: every other
 // method is invoked through the variant its table entry already covers.
-jint Method_soundGainStub(jmethodID id, va_list args) { return 0; }
+//
+// Fase 31: the gains now feed the real backend (kept in audio.c statics);
+// the int-dispatch variants return 0 as before.
+static float gain_music_tmp = 1.0f, gain_sfx_tmp = 1.0f, gain_vfx_tmp = 1.0f;
+
+jint Method_setMusicGain(jmethodID id, va_list args) {
+    (void)id;
+    gain_music_tmp = audio_float_arg(&args);
+    audio_set_gains(gain_music_tmp, gain_sfx_tmp, gain_vfx_tmp);
+    return 0;
+}
+
+jint Method_setSfxGain(jmethodID id, va_list args) {
+    (void)id;
+    gain_sfx_tmp = audio_float_arg(&args);
+    audio_set_gains(gain_music_tmp, gain_sfx_tmp, gain_vfx_tmp);
+    return 0;
+}
+
+jint Method_setVfxGain(jmethodID id, va_list args) {
+    (void)id;
+    gain_vfx_tmp = audio_float_arg(&args);
+    audio_set_gains(gain_music_tmp, gain_sfx_tmp, gain_vfx_tmp);
+    return 0;
+}
+
+void Method_setMusicGainV(jmethodID id, va_list args) {
+    (void)id;
+    gain_music_tmp = audio_float_arg(&args);
+    audio_set_gains(gain_music_tmp, gain_sfx_tmp, gain_vfx_tmp);
+}
+
+void Method_setSfxGainV(jmethodID id, va_list args) {
+    (void)id;
+    gain_sfx_tmp = audio_float_arg(&args);
+    audio_set_gains(gain_music_tmp, gain_sfx_tmp, gain_vfx_tmp);
+}
+
+void Method_setVfxGainV(jmethodID id, va_list args) {
+    (void)id;
+    gain_vfx_tmp = audio_float_arg(&args);
+    audio_set_gains(gain_music_tmp, gain_sfx_tmp, gain_vfx_tmp);
+}
 
 /*
  * Device / system queries
@@ -209,8 +447,8 @@ jint Method_unlockDemo(jmethodID id, va_list args) { return 0; }
 // nag counter; with no persisted counter there's nothing to disable.
 jint Method_DisableLaunchGame(jmethodID id, va_list args) { return 0; }
 
-// isMediaPlaying(int) -> int. No MediaPlayer, so nothing is ever playing.
-jint Method_isMediaPlaying(jmethodID id, va_list args) { return 0; }
+// isMediaPlaying(int) -> int: real backend version lives in the Audio
+// section above (Method_isMediaPlaying -> audio_is_media_playing).
 
 // loadMovie(String) -> int. Video playback isn't ported (no real Android
 // Activity/VideoView here) -- but the real Java side always returns 1 (see
@@ -250,6 +488,20 @@ jint Method_loadMovie(jmethodID id, va_list args) {
 void Method_voidStub(jmethodID id, va_list args) {}
 
 /*
+ * Gangster2.Exit() -- the real Java does sendAppToBackground + finish +
+ * System.exit(0). There is no Activity here; leaving this as a no-op is
+ * what froze the port on quit (log 036: "Native Exit Triggered" looping
+ * forever, user-reported hang). Exit the process so "Quit" from the
+ * in-game menu returns to LiveArea instead of hanging.
+ */
+void Method_Exit(jmethodID id, va_list args) {
+    (void)id;
+    (void)args;
+    audio_stop_all();
+    sceKernelExitProcess(0);
+}
+
+/*
  * Verizon in-app-purchase / carrier-network SDK
  *
  * Dead code on this build -- there's no carrier billing to talk to. The
@@ -279,7 +531,7 @@ NameToMethodID nameToMethodId[] = {
         { 2, "getResourceBytes", METHOD_TYPE_OBJECT },
         { 3, "getResourceLength", METHOD_TYPE_INT },
 
-        // Audio (accepted, ignored)
+        // Audio (real backend: source/utils/audio.c, Fase 31)
         { 4, "loadSound", METHOD_TYPE_VOID },
         { 5, "loadSoundBig", METHOD_TYPE_VOID },
         { 6, "unloadSound", METHOD_TYPE_VOID },
@@ -353,11 +605,11 @@ MethodsFloat methodsFloat[] = {};
 
 MethodsInt methodsInt[] = {
         { 3, Method_getResourceLength },
-        { 27, Method_soundGainStub },
-        { 28, Method_soundGainStub },
-        { 29, Method_soundGainStub },
-        { 30, Method_soundNotLoaded },
-        { 31, Method_soundNotLoaded },
+        { 27, Method_setMusicGain },
+        { 28, Method_setSfxGain },
+        { 29, Method_setVfxGain },
+        { 30, Method_isSoundLoaded },
+        { 31, Method_isSoundLoadedBig },
         { 32, Method_isMediaPlaying },
         { 33, Method_getDeviceWidth },
         { 34, Method_GetDeviceType },
@@ -385,35 +637,35 @@ MethodsObject methodsObject[] = {
 MethodsShort methodsShort[] = {};
 
 MethodsVoid methodsVoid[] = {
-        { 4, Method_soundVoidStub },
-        { 5, Method_soundVoidStub },
-        { 6, Method_soundVoidStub },
-        { 7, Method_soundVoidStub },
-        { 8, Method_soundVoidStub },
-        { 9, Method_soundVoidStub },
-        { 10, Method_soundVoidStub },
-        { 11, Method_soundVoidStub },
-        { 12, Method_soundVoidStub },
-        { 13, Method_soundVoidStub },
-        { 14, Method_soundVoidStub },
-        { 15, Method_soundVoidStub },
-        { 16, Method_soundVoidStub },
-        { 17, Method_soundVoidStub },
-        { 18, Method_soundVoidStub },
-        { 19, Method_soundVoidStub },
-        { 20, Method_soundVoidStub },
-        { 21, Method_soundVoidStub },
-        { 22, Method_soundVoidStub },
-        { 23, Method_soundVoidStub },
-        { 24, Method_soundVoidStub },
-        { 25, Method_soundVoidStub },
-        { 26, Method_soundVoidStub },
-        { 27, Method_soundVoidStub },
-        { 28, Method_soundVoidStub },
-        { 29, Method_soundVoidStub },
+        { 4, Method_loadSound },
+        { 5, Method_loadSoundBig },
+        { 6, Method_unloadSound },
+        { 7, Method_unloadSoundBig },
+        { 8, Method_playSound },
+        { 9, Method_playSoundBig },
+        { 10, Method_pauseSound },
+        { 11, Method_pauseSoundBig },
+        { 12, Method_resumeSound },
+        { 13, Method_resumeSoundBig },
+        { 14, Method_stopSound },
+        { 15, Method_stopSoundBig },
+        { 16, Method_setVolume },
+        { 17, Method_setVolumeBig },
+        { 18, Method_resetSound },
+        { 19, Method_setPitch },
+        { 20, Method_stopAllSounds },
+        { 21, Method_pauseAllSounds },
+        { 22, Method_resumeAllSounds },
+        { 23, Method_stopAllPool },
+        { 24, Method_stopAllBig },
+        { 25, Method_destroySoundPool },
+        { 26, Method_initSoundPoolArray },
+        { 27, Method_setMusicGainV },
+        { 28, Method_setSfxGainV },
+        { 29, Method_setVfxGainV },
         { 40, Method_voidStub },
         { 41, Method_voidStub },
-        { 42, Method_voidStub },
+        { 42, Method_Exit },
         { 43, Method_voidStub },
         { 44, Method_voidStub },
         { 45, Method_voidStub },

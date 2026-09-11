@@ -3,11 +3,180 @@
 > Bitácora cronológica, un bug confirmado a la vez. Para el estado **estructural** del port (motor,
 > mapa JNI, filesystem, niveles de logging, checklist) ver `PORTING_PLAN.md`.
 
-## Estado actual — 2026-09-07 (intento en curso, SIN verificar en consola)
+## Estado actual — 2026-09-11 (Fase 32: audio estridente = stride stereo aplicado a ogg mono + overdrive sin cota)
 
-**Dónde está el port:** el juego **carga y corre a ~30 fps estables con pantalla
-negra y sin sonido**. Tanda Fases 14-17 (esta sesión, un solo build release verde
-tras otro, **ninguno verificado en hardware todavía**):
+**Causa (revisión de `source/utils/audio.c`, bug propio):** tanto el cache de SFX como el
+streaming calculaban offsets y contaban frames como si todo fuera stereo. La mayoría de los
+SFX son mono: la mitad del buffer quedaba sin escribir (`malloc` sin inicializar) y el
+resample mezclaba muestra real con basura de heap = chirrido permanente. Además la ganancia
+efectiva no tenía cota y `sane_vol` dejaba pasar hasta 8.0 → clipping duro.
+
+**Fix:** decodificación por chunks con upmix mono→stereo explícito en los dos caminos,
+`calloc` en el PCM cacheado, `sane_vol` acotado a [0,2] (fuera de rango = 1.0), ganancia
+efectiva por voz capada a 1.5, y traza one-shot (`first play/play_big`, `gains` al cambiar)
+para ver en el próximo log la escala real que usa el nativo (el `playRadio` pasa vol=85.0).
+Build release verde 2026-09-11. Pendiente: correr, confirmar audio limpio y leer los valores
+de la traza.
+
+## Estado previo — 2026-09-11 (Fase 31: backend real de audio; el loop de reintentos de radio era el costo de los 10-13 fps y el silencio)
+
+**Causa raíz (confirmada en desensamblado, sin adivinar):** `SoundManager::isSoundPlaying(int)`
+(`0x0036ee5c`) llama a `nativeIsMediaPlaying` → Java `isMediaPlaying`, y nuestro stub devolvía
+0 siempre ("nada sonando"). `SoundManager::update()` (`0x0036f528-558`) reemitía entonces
+`playRadio`/`playSound` en casi cada frame — cada reintento pagando `operator new[]` + `sprintf`
++ `appDebugLog` + round-trip JNI (visible en el disasm de `playRadio`/`stopRadio`/`update`).
+Ese churn es el costo dominante tras los 10-13 fps del `debug_local_036.log` (cientos de líneas
+`-----playRadio------`/`-----stopRadio------` por minuto) y, a la vez, la causa del silencio total.
+
+**Cambios (solo loader, sin tocar motor/vitaGL):**
+- `source/utils/audio.{c,h}` (nuevo): SceAudioOut MAIN 48 kHz stereo + libvorbisfile
+  (vitasdk trae `libvorbisfile/vorbis/ogg`). SFX (path SoundPool) decodificados a PCM y cacheados
+  (40 slots, 8 voces, volumen+pitch); música/radio/voz (path MediaPlayer) en streaming con loop
+  (4 voces). Reemisión del mismo índice ya sonando = no-op (dedup que asienta el loop de radio).
+- `source/sound_files.h` (generado): los 1737 nombres de `SOUND_FILES` de `GLMediaPlayer.java`
+  en orden → índice a `DATA_PATH "data/<nombre>"`.
+- `source/java.c`: los 26 métodos de audio pasan de stubs a backend real; `isSoundLoaded*`
+  0/-1 e `isMediaPlaying` 1/0 desde estado real; gains music/sfx/vfx aplicados por categoría
+  (`m_*`/`sfx_*`/resto). `Gangster2.Exit()` ahora termina el proceso (antes colgaba en el loop
+  `Native Exit Triggered` del 036).
+- `source/main.c`: `audio_init()` tras `GLMediaPlayer_nativeInit` (no hay VM que ejecute el
+  `init()` Java) + `sceKernelPowerTick` por frame contra throttling en cargas largas.
+- `CMakeLists.txt`: `source/utils/audio.c` + link `vorbisfile/vorbis/ogg` (cero warnings).
+
+**Build:** verde release 2026-09-11 (`build/eboot.bin` + VPK). **Sin desplegar** (requiere consola
+con FTP): al correr, esperar (a) sonido (radio/menús/SFX), (b) `frame N | fps` estable sin el
+spam play/stopRadio, (c) `[AUDIO] backend up: 1737 sounds` al arranque en el log, (d) salida
+limpia al LiveArea con Quit.
+
+## Estado previo — 2026-09-10 (Fase 30: la sonda de screenshots periódica, no vitaGL, causaba los pozos de fps y probablemente el táctil "sordo")
+
+**Actualización más reciente (Fase 30, ver sección debajo del resumen de Fase 29):**
+`debug_local_035.log` confirma que el fix de la Fase 29 (pool circular a 64 MB)
+funcionó a fondo: **cero** líneas `Circular pool overrun` en todo el log (antes
+299) y el `render X ms` de cada `frame N | fps` cae de 27-150 ms a **6-10 ms**
+en steady-state. El fps de crucero ahora es 26-30 fps -- el objetivo de 25+ fps
+está cumplido en la mayoría de los frames. Pero el usuario reporta que "en
+ocasiones el táctil deja de responder", y el log tiene un patrón nuevo,
+clarísimo: **cada una de las 17 líneas `screenshot shot_*.bmp` (Fase 25, cada
+300 frames) es seguida, sin excepción, por un pozo de fps a 0.6-2.7** en la
+ventana de 5 s siguiente (frames 151/1201/1801/2101/2401/2701/3001/4201, etc.)
+-- con el `render` de esos mismos frames en 7-10 ms normal: el costo no está
+en dibujar, está en el I/O bloqueante de volcar el framebuffer a un .bmp de
+~2 MB (`gl_shot()`, `source/utils/glutil.c`, un `sceIoWrite` por fila). Esa
+sonda era de triage (Fase 25, para confirmar que había imagen real) y ya
+cumplió su función desde la Fase 26; ahora es la causa más probable de que el
+táctil "se duerma" cada ~10 s: si el toque llega durante esos 1-2 s de I/O
+bloqueante, el main loop no vuelve a leer touch hasta que termina. Fix de una
+línea: apagar la captura por default con `#define GMV_SHOT_TRIAGE 0` (mismo
+patrón que `GMV_PROBE_SELFTEST` de la Fase 25) en `source/main.c`, sin tocar
+vitaGL ni el motor. Build verde, **sin desplegar todavía** (consola sin FTP
+disponible -- `build/eboot.bin` listo para subir en cuanto se active FTP por
+VitaShell/SELECT).
+
+---
+
+## Estado actual (resumen previo a Fase 30) — 2026-09-10 (Fase 29: pool circular de vitaGL desbordado en ~1/3 de los frames de gameplay real, causa del ~9 fps sostenido)
+
+**Actualización más reciente (Fase 29, ver sección debajo del resumen de Fase 28):**
+Con los fixes de Fase 27/28 desplegados, `debug_local_034.log` muestra el juego
+llegando a gameplay real (draws creciendo hasta 50688, texUp hasta 260+) pero
+con un promedio de ~9 fps reportado por el usuario, coincidiendo con el
+promedio de las líneas `frame N | X fps` del log (frames 272-1501). Causa
+encontrada leyendo `lib/vitaGL/source/gxm.c`/`vgl.c` (sin dump): **299 líneas
+`Circular pool overrun on frame N` entre los frames 705 y 1500** (~37% de los
+frames de esa ventana), picos de hasta 956 KB por encima del cupo. El pool
+circular de vitaGL (32 MB por defecto ÷ 3 buffers = ~10,7 MB/buffer,
+`vgl.c:111,364`) recibe los arrays de vértice/color/texcoord client-side que
+la FFP copia por cada draw call; los primeros frames (pantalla de carga, quads
+simples) nunca lo llenan, pero los modelos 3D reales del gameplay sí. Una vez
+lleno, `vgl_reserve_data_pool()` (`vgl.c:127-149`) dejar de hacer bump-pointer
+barato y cae a un `gpu_alloc_mapped_for_cpu()` — alloc de kernel real — **por
+cada reserva que exceda el cupo**, en cada draw, en cada frame donde pasa esto
+— exactamente el patrón de tiempos de frame dispares del log (picos de
+588 ms-21 s mezclados con frames normales), no un costo constante como el bug
+de Fase 28. Fix: `vglSetCircularPoolSize(64 * 1024 * 1024)` (duplica el
+default) llamado ANTES de `vglInitExtended()` en `gl_init()`
+(`source/utils/glutil.c`) — los buffers se dimensionan una sola vez al init,
+así que el orden importa. Sin tocar el motor ni el resto de vitaGL. Build
+verde, desplegado (solo `eboot.bin`, sin FTP para VPK completo) — pendiente
+correr y traer el log siguiente para confirmar si el steady-state sube de
+~9 fps hacia los 25+ fps objetivo, o si sigue habiendo overruns (en cuyo caso
+subir el pool otra vez con más margen, con evidencia del nuevo log).
+
+---
+
+## Estado actual (resumen previo a Fase 29) — 2026-09-10 (Fase 28: bug real de logging desbordado, no vitaGL, detrás de la lentitud en carga de gameplay)
+
+**Actualización más reciente (Fase 28, ver sección debajo del resumen de Fase 27):**
+`debug_local_033.log` confirma que el fix de la Fase 27 funcionó — el juego
+ahora pasa el 20%, llega al título/menú y a la pantalla de carga del
+gameplay (nunca antes llegó tan lejos). Pero esa carga es "extremadamente
+lenta" (reporte del usuario). El log muestra DOS problemas distintos, no uno:
+(a) el pico real de compilación de shaders FFP en frames 177/179 (34 s + 47 s
+combinados — la primera corrida con el cache recién creado, Fase 27, paga
+esto una vez) y (b) **cada frame desde el 271 en adelante corre a 700-1200 ms
+sostenidos, sin excepción** — un patrón totalmente distinto (sin huecos entre
+picos) que apunta a un costo constante por frame, no a compilación. Se
+encontró la causa de (b): un bug de desborde en `gl_note_once()`
+(`source/reimpl/gl.c`, instrumentación de la Fase 22) que, una vez su array
+de 8 slots se llena (un modelo 3D real usa muchas más de 8 combinaciones de
+vertex array), volvía a loguear CADA llamada con una combinación nueva no
+trackeada en vez de quedarse en silencio — con el motor llamando estas
+funciones por-mesh antes de cada draw, eso pagaba el costo completo de
+`l_note()` (mutex + 2 snprintf + UDP bloqueante + sync a disco) varias veces
+por draw durante toda la carga real, no solo durante el setup inicial como
+se pensaba. Fix de una línea (`if (n >= 8) return;`), sin tocar vitaGL ni el
+motor. Build verde, pendiente desplegar (consola sin FTP disponible) — con
+este fix, el pico de la Fase 27 debería ser la única causa de lentitud que
+quede, y encima debería encogerse en la SEGUNDA corrida (cache de shaders ya
+poblado). El README de vitaGL no aportó ningún flag adicional justificado por
+evidencia todavía; ver detalle en la sección Fase 28.
+
+---
+
+## Estado actual (resumen previo a Fase 28) — 2026-09-10 (Fase 27: causa del atasco a shaders FFP recompilando en cada corrida)
+
+**Actualización más reciente (Fase 27, ver sección debajo del resumen viejo):**
+`debug_local_032.log` (Fase 26) mostró la primera imagen real del port ("Loading
+20%", arte de Gangstar) pero el log se corta a mitad de la ráfaga de shaders del
+frame 176 (4,8 s) — el mismo punto donde TODAS las corridas desde la Fase 17 se
+frenan 15-34 s. Se encontró la causa raíz: el cache en disco de shaders FFP de
+vitaGL (`ux0:data/shader_cache/v28/{v,f}/*.gxp`) nunca persistía porque nada
+creaba esos directorios — cada corrida recompilaba TODOS los shaders desde cero
+con vitaShaRK en vez de reusar los `.gxp` ya compilados. Fix: crear el árbol de
+directorios una vez en `gl_init()`. Build verde, pendiente desplegar (consola sin
+FTP disponible al momento de este commit) y confirmar que la segunda corrida en
+adelante llega más allá del 20% y más rápido al título/menú.
+
+---
+
+## Estado actual (resumen previo a Fase 27) — 2026-09-10 (negro confirmado a nivel de píxel; sonda de auto-test desplegada, Fase 23)
+
+**Dónde está el port:** `logs/debug_local_025.log` es la primera corrida real en
+consola de un build con el fix de la Fase 17 (`GL_SPOT_*` en vitaGL). Confirma
+**`lastErr=0x0(x0)` en los 5 checkpoints `[GL]` de la corrida** — el
+`GL_INVALID_ENUM` pegajoso desapareció, tal como predecía la Fase 17. La
+pantalla siguió negra, pero esta vez el usuario cortó la corrida (o el juego se
+frenó) durante una ráfaga de spam de link de shaders en el frame 177-178
+(`frame 177 slow render (34429 ms)` seguido de >100 líneas de `finalizing
+renderer .../ Duplicate parameter name` sin llegar a "returned") — mucho peor
+que el pico equivalente de `debug_local_024.log` (18 s). Ver Fase 19 más abajo:
+esa misma ráfaga ya estaba identificada como diagnóstico inofensivo (Fase 18) y
+ahora se demovió a `l_debug` porque el propio logging (mutex + UDP bloqueante +
+sync a disco por línea, mecanismo de Fase 8/14) es la sospecha más probable de
+por qué esos frames se ven "trabados" en vez de solo lentos.
+
+También apareció **C1-9654-4 / `SCE_KERNEL_ERROR_MODULEMGR_NOEXEC`** al intentar
+lanzar el juego en algún punto de esta sesión, con "Enable Unsafe Homebrew" ya
+activado — no se pudo diagnosticar más a fondo (la consola quedó sin FTP
+disponible en ese momento) y el usuario terminó pudiendo correr el juego
+igual, así que **queda sin causa confirmada**; si vuelve a aparecer, revisar
+`ur0:tai/config.txt` (kubridge.skprx registrado en `*KERNEL` y presente en
+disco) y considerar una reinstalación completa del `.vpk` para descartar un
+`eboot.bin` corrupto.
+
+Tanda Fases 14-19 (build release verde en cada una; Fase 17 ya verificada
+arriba, Fase 19 recién desplegada sin verificar todavía):
 
 1. **Carga acelerada** (Fase 14): `frame 2` de 12,6 s → 7,4 s; log de 1092 → ~400
    líneas (filtro de spam del motor, dedupe de `fopen FAILED`, syncs cada 256,
@@ -20,20 +189,786 @@ tras otro, **ninguno verificado en hardware todavía**):
 3. **Fix + ojos** (Fase 17): casos `SPOT_*` agregados en vitaGL `ffp.c` (solo
    storage, los shaders siguen sin spots — cambio visual esperado: ninguno) y
    capturas `shot_*.bmp` del framebuffer cada ~20 s.
-4. **Sonido scopeado, NO implementado**: el `.so` no importa audio nativo (todo es
+4. **Limpieza del resto de `GL_INVALID_ENUM`** (Fase 18, 2026-09-09): los 4
+   ofensores benignos que quedaban de la Fase 17 (`GL_DITHER`,
+   `GL_SAMPLE_ALPHA_TO_COVERAGE`/`GL_SAMPLE_COVERAGE`, `GL_FOG_HINT`,
+   `GL_PACK_ALIGNMENT`) ahora son no-ops en vitaGL en vez de levantar error —
+   ver detalle abajo. Revisión de `decompiled/.../out_ghidra.c` (agente de
+   investigación) confirmó que ninguno de los warnings del motor
+   (`parameter type mismatch`, `unbound parameter`, `finalizing renderer:
+   unused parameter`, `invalid bind symbol`, `Duplicate parameter name`) anula
+   alpha, salta el bind de la textura diffuse, ni cae a un material negro —
+   son diagnósticos de un solo tiro en el link del shader/material, no tocan
+   el estado por-frame. Se descarta esa vía como causa de la pantalla negra.
+5. **Sonido scopeado, NO implementado**: el `.so` no importa audio nativo (todo es
    JNI `SoundPool`/`MediaPlayer`); los 1722 sonidos son `.ogg` sin decoder
    vendored → fase propia, después del render.
+6. **Spam de link de shaders demovido a `l_debug`** (Fase 19, 2026-09-09):
+   `finalizing renderer %s: unused parameter: %s`, `Duplicate parameter name :
+   %s`, `unbound parameter %s for shader %s` y `%s/%s: invalid bind symbol:
+   %s` — los mismos diagnósticos que la Fase 18 confirmó inofensivos, ahora
+   fuera del build release (antes iban por `l_note`, que nunca se compila
+   fuera). Motivado directamente por `debug_local_025.log` (100+ líneas de
+   este spam en un solo frame que tardó >34 s). Ver Fase 19 abajo.
 
-**Lo que sigue (pendiente):** desplegar el último `eboot.bin`
-(`build/eboot.bin` de esta tanda), correr 3-4 min, traer `debug_local_025.log` +
-`shot_*.bmp`. Si `lastErr=0x0` y sigue negro → el spot no era; los BMP deciden
-(negro total vs. escena oscura vs. geometría fuera de vista). Si el negro persiste,
-el siguiente sospechoso es textura negra (PVR/`Loaded texture` vs `texUp`) o
-cámara/lógica de menú.
+**Lo que sigue (pendiente): correr el build de la Fase 23 y mirar el BMP.**
+El `eboot.bin` con la sonda de auto-test (barras propias dibujadas justo antes
+del swap) **ya está desplegado** (2026-09-10). Falta correr **5-10 min sin
+cortar** y traer `debug_local_030.log` + `shot_*.bmp`.
+
+Esa sola imagen parte el árbol en dos y decide toda la fase siguiente: si las
+barras aparecen, vitaGL/present/vertex arrays están sanos y el negro es el
+estado que setea el motor (y el `[GL] draw-state @frame 400` del log dice qué
+perilla); si sigue todo negro, el problema está por debajo del motor y las
+hipótesis de estado desde la Fase 15 eran pistas falsas. Ver la tabla de la
+Fase 23.
+
+Notas para esa corrida:
+
+1. Los frames ~185-190 (link de shaders) tardan ~15-17 s **en release**: es
+   compilación real de shaders, no un cuelgue. Hay que esperarlos.
+2. La ráfaga de `Duplicate parameter name`/`unbound parameter` recién ahora
+   queda fuera del release (el `strncmp` tenía el off-by-one de la Fase 21).
+3. Si vuelve a aparecer **C1-9654-4** al lanzar, avisar antes de asumir que es
+   lo mismo (quedó sin causa confirmada; ver la nota al pie de la Fase 19).
 
 **Deuda conocida (no bugs, funcionalidad sin portar):** audio, video, y los hooks de ciclo de vida
 `nativePause`/`nativeResume`/`nativeAccelerometer`/`nativeDone`/`nativeOpenIGM`/`nativeCanInterrupt`,
 que están exportados pero no cableados en `main.c`. Ver el checklist de `PORTING_PLAN.md` sección 7.
+
+## Fase 30: la sonda de screenshots periódica (Fase 25) es la causa de los pozos de fps y probable culpable del táctil sordo (2026-09-10, build verde, sin desplegar -- consola sin FTP)
+
+### Punto de partida: `debug_local_035.log` — el fix de Fase 29 funcionó a fondo
+
+`grep -c "Circular pool overrun" debug_local_035.log` → **0** (antes 299). El
+`render X ms` de cada línea `frame N | fps` cae de 27-150 ms (Fase 28) a
+**6-10 ms** en steady-state (frames 1160+), con fps de crucero 26-30. La Fase
+29 queda confirmada: el pool circular era el cuello real del steady-state.
+
+Pero el usuario reporta "en ocasiones el táctil deja de responder", y el log
+tiene un patrón nuevo que no estaba antes (antes todo era ruido parejo por el
+pool desbordado; ahora, con eso resuelto, un patrón periódico limpio queda
+expuesto):
+
+```
+frame 1160 | 28.7 fps | render  6.9 ms
+screenshot .../shot_01200.bmp -> 0
+frame 1201 |  2.4 fps | render  7.7 ms      <-- pozo, justo después de la captura
+frame 1351 | 30.0 fps | render  6.8 ms      <-- se recupera solo
+screenshot .../shot_01500.bmp -> 0
+frame 1501 |  8.7 fps | render  7.5 ms      <-- pozo otra vez
+```
+
+Las 17 líneas `screenshot shot_*.bmp` del log (cada 300 frames, Fase 25) tienen
+**una correspondencia 1:1** con un pozo de fps (0.6 a 2.7 fps) en el siguiente
+reporte de la ventana de 5 s: frames 151, 1201, 1801, 2101, 2401, 2701, 3001,
+4201 son ejemplos directos (los de 3301/3601/3901/4501/4801 son más leves,
+13.9-14.3 fps, probablemente porque cayeron más cerca del borde de la ventana
+de 5 s y el I/O compitió con menos frames "buenos" dentro de la muestra). En
+los 17/17 casos el `render` de ese mismo frame sigue en 7-10 ms normal -- el
+costo NO está en `nativeRender`, está en algo que corre después, en la misma
+vuelta del loop.
+
+### Causa raíz (confirmada leyendo `source/main.c` y `source/utils/glutil.c`, sin necesidad de dump)
+
+`source/main.c:232-237` (bloque `if (frame_no == 150 || frame_no % 300 == 0)`)
+llama `gl_shot()` (`source/utils/glutil.c:84-136`) cada 300 frames -- una
+sonda de triage de la Fase 25 para confirmar con capturas reales que el motor
+dibujaba algo (necesaria en su momento, cuando la pantalla se veía negra).
+`gl_shot()` vuelca el framebuffer completo (960x544x4 = ~2 MB) a un `.bmp` con
+**un `sceIoWrite()` síncrono por cada fila** (544 writes bloqueantes a
+`ux0:`/memory card por captura), llamado siempre desde el hilo principal,
+justo después de `gl_swap()`, antes de la pausa de frame-pacing. Esa sonda
+cumplió su misión en la Fase 26 (imagen real confirmada) pero quedó activa
+sin que hiciera falta más: cada captura bloquea el main loop ~1-2 s cada
+~10 s de juego (300 frames a 30 fps), que es exactamente el patrón de pozos
+de arriba.
+
+El vínculo con "el táctil deja de responder a veces": el polling de touch de
+este motor corre en el mismo hilo principal, una vez por vuelta del loop (no
+hay un hilo de input aparte ni una cola persistente del lado nuestro -- ver
+`source/main.c`, el bucle es estrictamente secuencial: render → swap →
+[captura] → pacing → siguiente vuelta). Si un toque llega mientras `gl_shot()`
+está bloqueado escribiendo al disco, el main loop no vuelve a leer el estado
+del touch hasta que termina esa escritura -- un toque corto que empieza y
+termina dentro de esa ventana de 1-2 s puede perderse por completo, no solo
+demorarse. Con una captura cada ~10 s, esto calza con "a veces", no siempre:
+depende de si el usuario toca justo en esa ventana.
+
+### Fix (`source/main.c`)
+
+Apagar la captura por default detrás de un flag de compilación, mismo patrón
+que `GMV_PROBE_SELFTEST` (Fase 25, `source/reimpl/gl.c:352`):
+
+```c
+#define GMV_SHOT_TRIAGE 0
+#if GMV_SHOT_TRIAGE
+    if (frame_no == 150 || (frame_no > 150 && frame_no % 300 == 0)) {
+        ...
+        int sr = gl_shot(shot);
+        l_note("[022] screenshot %s -> %d", shot, sr);
+    }
+#endif
+```
+
+Sin tocar vitaGL ni el motor, y sin borrar `gl_shot()` -- queda disponible
+para volver a prender la sonda (`GMV_SHOT_TRIAGE 1`) si hace falta ver el
+framebuffer de nuevo en una fase de triage futura.
+
+### Qué decide la próxima corrida
+
+- Si `debug_local_036.log` no tiene ningún pozo de fps periódico y el táctil
+  deja de "dormirse", confirma esta causa como la fuente real de ambos
+  síntomas.
+- Si el táctil sigue fallando ocasionalmente SIN los pozos de fps de antes,
+  la causa es otra (posible candidato: el propio motor descarta touch en
+  ciertos estados de UI/menú -- haría falta un log de touch dedicado, no
+  hay evidencia de esto todavía).
+- Si aparece algún otro pozo periódico nuevo tras sacar la sonda, buscar el
+  próximo I/O bloqueante en el loop (autosave, sync del logger cada 256
+  líneas -- ya debería ser rarísimo con el volumen de log actual mucho más
+  bajo sin las líneas de captura).
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-10).
+- **Desplegado:** **NO** -- la consola (`192.168.3.15:1337`) no respondió por
+  FTP (`Connection refused`; abrir VitaShell y activar FTP con SELECT).
+  `build/eboot.bin` queda listo para subir.
+- **Pendiente:** desplegar, correr 5-10 min de gameplay real con toques
+  frecuentes, traer `debug_local_036.log` y confirmar fps de crucero estable
+  (sin pozos periódicos) y que el táctil responde de forma consistente.
+
+## Fase 29: pool circular de vitaGL desbordado — cae a `sceKernelAllocMemBlock` por-reserva en gameplay real (2026-09-10, build verde, desplegado eboot, sin verificar en consola)
+
+### Punto de partida: `debug_local_034.log` — títulos y fixes de Fase 27/28 confirmados, pero ~9 fps sostenido
+
+Con el eboot de Fase 28 en consola, el juego pasa por el pico de compilación
+de shaders (frames 176-179, 4,6 s + 21,1 s + 16,1 s — más corto que el 34 s +
+47 s del 033: el cache de disco de Fase 27 ya está ayudando) y llega a
+gameplay real: `draws` sube de 285 (frame 138) a 50688 (frame 1501), `texUp`
+sube a 260+. El usuario reporta ~9 fps; las líneas `frame N | X fps` del log
+(frames 272 en adelante) promedian ~9,8 fps con variación enorme frame a
+frame: 15,8 / 3,6 / 11,9 / 16,2 / 16,2 / 6,6 / 20,7 / 8,1 / 7,3 / 8,2 / 12,7 /
+**0,6** / 15,7 / 19,4 / 13,2 / 5,6 / 11,7 / 11,4 / 11,5 / 4,5 / 4,7 / 9,7 / 3,4.
+El `render X ms` de esas mismas líneas casi nunca pasa de 100 ms — la
+varianza no está en el trabajo de un frame típico, está en algo intermitente
+que a veces sale carísimo.
+
+### Causa raíz (confirmada leyendo `lib/vitaGL/source/vgl.c`/`gxm.c`, sin necesidad de dump)
+
+`grep -c "Circular pool overrun" debug_local_034.log` → **299**, todas entre
+los frames 705 y 1500 (justo la ventana de gameplay real, nunca antes). Cada
+línea es `gxm.c:788`, escrita cuando `circular_data_pool_ptr[buf] >
+circular_data_pool_limit[buf]` al cerrar el frame — picos de hasta 956592
+bytes por encima del cupo.
+
+El pool circular (`vgl.c:111`, `CIRCULAR_POOL_SIZE_DEF = 32 MB`, repartido
+entre `gxm_display_buffer_count = 3` buffers → ~10,7 MB cada uno,
+`vgl.c:364,371`) es donde la FFP de vitaGL copia los arrays client-side de
+vértice/color/texcoord/normal que este motor pasa por
+`glVertexPointer`/`glColorPointer`/etc. antes de cada draw (confirmado en
+Fase 22: el motor no usa VBOs para esto). La pantalla de carga (Fase 26-28,
+quads simples) nunca se acerca al cupo; los modelos 3D reales del gameplay
+(~40-50 draws/frame con formatos de vertex array distintos, Fase 28) sí.
+
+Lo importante es qué pasa al llenarse — `vgl_reserve_data_pool()`
+(`vgl.c:127-149`):
+
+```c
+uint8_t *res = circular_data_pool_ptr[vgl_circular_idx];
+circular_data_pool_ptr[vgl_circular_idx] += size;
+if (circular_data_pool_ptr[vgl_circular_idx] > circular_data_pool_limit[vgl_circular_idx]) {
+    res = (uint8_t *)gpu_alloc_mapped_for_cpu(size);   // <-- alloc de kernel real
+    mark_as_dirty(res);
+}
+```
+
+Mientras hay lugar, la reserva es un bump-pointer (gratis). En cuanto el
+buffer del frame se llena, **cada reserva siguiente** (no solo la primera que
+desborda) cae a una alocación de memoria real vía `gpu_alloc_mapped_for_cpu`
+— con el costo de un alloc de kernel, por cada array de cada draw restante
+del frame, en cada frame donde el cupo no alcanza. Eso explica exactamente la
+firma del log: frames normales (render <100 ms, el pool alcanzó) mezclados al
+azar con picos de 588 ms a 21 s (el pool se llenó a mitad de frame y el resto
+de los draws pagó allocs de kernel) — muy distinto del costo constante y
+parejo del bug de Fase 28 (`l_note()` desbordado). El 37% de frames con
+overrun en esta ventana es coherente con un promedio de ~9-10 fps arrastrado
+hacia abajo por esa fracción de frames carísimos.
+
+### Fix (`source/utils/glutil.c`, `gl_init()`)
+
+`vglSetCircularPoolSize(64 * 1024 * 1024)` (duplica el default de 32 MB) justo
+antes de `vglInitExtended(...)` — el orden importa: los buffers del pool se
+reservan una sola vez dentro de `vglInitWithCustomThreshold` usando el valor
+de `circular_data_pool_size` en ese momento (`vgl.c:364`), no son
+redimensionables después del init. Con 64 MB / 3 buffers ≈ 21,3 MB cada uno,
+casi el doble del peor pico medido (~11,6 MB) — margen para escenas más
+densas más adelante sin adivinar un valor arbitrario. `gpu_alloc_mapped_for_cpu`
+reserva de memoria mapeada para CPU (no del pool de VRAM/CDRAM de texturas),
+así que este aumento no compite con el presupuesto de texturas ni con el
+heap de 256 MB de `_newlib_heap_size_user` (`source/main.c`). Sin tocar
+`lib/vitaGL` ni el motor — es una llamada de la API pública de vitaGL, no un
+flag de compilación especulativo (mismo criterio que Fase 24/28: solo métodos
+con evidencia).
+
+### Qué decide la próxima corrida
+
+- Si `debug_local_035.log` no tiene ninguna línea `Circular pool overrun` y el
+  fps reportado sube hacia el objetivo de 25+, confirma esta causa como el
+  cuello de botella real del steady-state de gameplay.
+- Si el overrun persiste (con menos frecuencia, ya que el cupo casi se
+  duplicó) pero el fps sigue bajo, subir `vglSetCircularPoolSize` de nuevo con
+  el pico real del log nuevo como guía, en vez de adivinar otro número.
+- Si el overrun desaparece pero el fps sigue por debajo de 25 SIN esa firma,
+  recién ahí es el momento de instrumentar CPU vs GPU real y evaluar
+  `HAVE_WVP_ON_GPU` (anotado como candidato en Fase 28, todavía sin evidencia
+  propia) u otros flags de "Misc Flags" del README de vitaGL.
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-10).
+- **Desplegado:** sí (`psvita-toolkit deploy --eboot --yes`, solo el
+  `eboot.bin`, 2026-09-10).
+- **Pendiente:** correr 5-10 min de gameplay real sin cortar, traer
+  `debug_local_035.log` y confirmar si desaparecen los `Circular pool overrun`
+  y si el fps reportado sube.
+
+## Fase 28: `gl_note_once()` desbordado — logging descontrolado por-draw durante la carga de gameplay, no vitaGL (2026-09-10, build verde, sin verificar en consola)
+
+### Punto de partida: `debug_local_033.log` — el fix de la Fase 27 funcionó, pero "extremadamente lento"
+
+El usuario reporta: el juego llega al título/menú y a la pantalla de carga del
+gameplay (progreso real, nunca llegó tan lejos antes) pero todo va muy lento.
+`grep -n "slow render" debug_local_033.log` separa el log en dos fenómenos:
+
+1. **Frames 176-187** (picos con huecos entre medio: 4,7 s / 34,0 s / 3,2 s /
+   47,3 s / 0,7-1,1 s / 5,4 s / 0,6-1,0 s): compilación real de shaders FFP
+   poblando el cache en disco por primera vez tras el fix de la Fase 27 (el
+   `texUp` casi no crece en esta ventana — 144→185 — mientras el patrón de
+   "picos con huecos" es justo la firma de "algunas decenas de variantes
+   nuevas se compilan, después se calma" — no un costo por-frame constante).
+2. **Frames 271-295, el resto del log capturado**: **CADA frame sin
+   excepción** tarda 700-1200 ms (`slow render` en frame 271, 272, 273, 274,
+   275, 276, 277... 295, sin un solo frame normal entre medio) — sin huecos,
+   sin variación grande. Esa firma NO es compilación de shaders (que es
+   esporádica por diseño: una vez que una combinación de shader está en el
+   cache RAM/disco no se vuelve a compilar) — apunta a un costo fijo pagado
+   en TODOS los frames por igual, coincidiendo con que la pantalla de carga
+   de gameplay está dibujando de a poco los primeros modelos 3D reales del
+   nivel (autos/edificios/personajes, muchos formatos de vertex array
+   distintos: 375 líneas `glVertexPointer:`/`glColorPointer:`/etc. en el log,
+   con al menos 7 strides distintos solo para posición: 12/16/20/24/28/32/36).
+
+### Causa raíz (confirmada leyendo `source/reimpl/gl.c`, sin necesidad de dump)
+
+`gl_note_once()` (agregada en la Fase 22 para anotar combinaciones de vertex
+array "solo cuando aparece una nueva, máx. 8 líneas") comparte UN SOLO array
+de 8 slots entre las 4 funciones (`glVertexPointer`/`glColorPointer`/
+`glTexCoordPointer`/`glNormalPointer`). El código tenía este bug:
+
+```c
+for (unsigned i = 0; i < n; i++) {
+    if (seen[i]... == tupla) return;      // ya vista: silencio, esto SI andaba
+}
+if (n < 8) { seen[n] = tupla; n++; }       // guarda si hay lugar
+l_note(...);                               // <-- esto corria SIEMPRE, haya o no lugar
+```
+
+Con un modelo 3D real (no la pantalla de carga simple del 20%) usando muchas
+más de 8 combinaciones distintas de tamaño/tipo/stride, el array de 8 slots
+se llena enseguida. Una vez lleno, cualquier tupla nueva NO se guarda (no hay
+lugar) pero el `l_note()` de la última línea se ejecuta de todos modos —
+para SIEMPRE, en cada llamada subsiguiente con una tupla no trackeada. Como
+el motor llama `glVertexPointer`/`glColorPointer`/etc. una vez por mesh antes
+de cada draw call (no una vez por pantalla como asumía el comentario
+original de la Fase 22), esto significaba pagar el costo completo de
+`l_note()` — `LwMutex` + 2 `snprintf` + `sceNetSendto` **bloqueante** +
+`sceIoWrite` (+ sync periódico, `source/utils/logger.c`) — varias veces por
+draw, en cada frame, durante toda la carga real de contenido 3D. Con
+~40-55 draws/frame según los contadores `[GL]` de esa ventana, y la mayoría
+de esos draws usando formatos de vertex array fuera de los primeros 8 vistos,
+el costo del propio logging por sí solo alcanza para explicar 700-1200 ms/frame
+sostenidos — el mismo mecanismo que ya causó las Fases 8/14/19 (regla 1 de
+`CLAUDE.md`: "el logging cambia el comportamiento bajo prueba"), esta vez en
+una función distinta que el propio Fase 22 pensó que estaba a salvo de esto.
+
+### Fix (`source/reimpl/gl.c`, `gl_note_once()`)
+
+Una vez el array de 8 slots está lleno, devolver en silencio en vez de caer
+al `l_note()`:
+
+```c
+if (n >= 8)
+    return;
+seen[n] = tupla; n++;
+l_note(...);
+```
+
+Sin tocar vitaGL ni el motor. `glClearColor_soloader` (la otra función
+log-on-change de la Fase 22, mismo archivo) se revisó y NO tiene este bug —
+usa un solo valor `static` comparado directo, no un array con capacidad fija.
+
+### Sobre el README de vitaGL (pedido explícito del usuario)
+
+Se revisó `README VITAGL.md` completo buscando flags de velocidad aplicables.
+Ninguno tiene evidencia que lo justifique todavía:
+
+- Los flags marcados "may cause crashes/glitches" (`DRAW_SPEEDHACK`,
+  `BUFFERS_SPEEDHACK`, `INDICES_SPEEDHACK`, `MATH_SPEEDHACK`,
+  `SAMPLERS_SPEEDHACK`, etc.) atacan costos de CPU en el pipeline de dibujo
+  normal en régimen estable — pero el log de esta corrida no muestra ese
+  régimen estable todavía (los dos problemas de arriba dominan por completo
+  el tiempo de frame). Activarlos ahora sería adivinar sin poder atribuirles
+  ninguna mejora real, y arriesgar los mismos crashes que costó tanto
+  descartar en las Fases 1-26. Mismo criterio que la Fase 24 ya aplicó con
+  `MATH_SPEEDHACK`.
+- `NO_TEX_COMBINER=1` desactivaría `GL_COMBINE` por completo — este motor sí
+  usa combiner (materiales diffuse+lightmap, Fase 18) — probablemente
+  rompería el material system, no es un ahorro seguro.
+- `HAVE_WVP_ON_GPU=1` (mueve el cálculo de WVP del FFP a la GPU) es un
+  candidato razonable SI el steady-state real (tras arreglar los dos bugs de
+  arriba) sigue siendo CPU-bound — pero sin ese steady-state medido todavía,
+  no hay base para decidir si ayuda o si la GPU ya está más ocupada que la
+  CPU. Queda anotado para la próxima corrida si el fix de este Fase 28 no
+  alcanza.
+- `SHADER_CACHE_SIZE` (256 slots, `lib/vitaGL/source/ffp.c`, compartido entre
+  RAM-cache de vertex/fragment FFP) podría desbordarse si el nivel usa más de
+  256 combinaciones únicas de luces/texturas simultáneas — no hay evidencia
+  de esto en el log (no hay forma de verlo sin instrumentar vitaGL) y subirlo
+  a ciegas es memoria gastada sin certeza de beneficio. Candidato de próxima
+  ronda si el steady-state post-fix sigue lento SIN picos de compilación.
+
+**Conclusión: la lentitud reportada tiene una causa propia, confirmada y ya
+arreglada (este Fase 28) — no hace falta ningún flag de vitaGL todavía.** Si
+la próxima corrida (con este fix + el cache de disco de la Fase 27 ya
+poblado) sigue lenta en régimen estable, ESE es el momento de instrumentar
+tiempo de CPU vs GPU y decidir con evidencia cuál flag de la lista de arriba
+aplica.
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-10).
+- **Desplegado:** **NO** — la consola (`192.168.3.15:1337`) sigue sin
+  responder por FTP (`Connection refused`; abrir VitaShell y activar FTP con
+  SELECT).
+- **Pendiente:** desplegar, correr, traer el log siguiente. Con los dos
+  bugs de Fase 27/28 corregidos, la SEGUNDA corrida (cache de shaders ya en
+  disco) debería mostrar: el pico de frames ~176-187 mucho más corto o
+  ausente, y el steady-state de gameplay-loading sin la degradación
+  sostenida vista en frames 271-295. Si el steady-state sigue lento pero SIN
+  esas dos firmas, recién ahí instrumentar CPU/GPU real y considerar
+  `HAVE_WVP_ON_GPU`/`SHADER_CACHE_SIZE`.
+
+## Fase 27: el cache de shaders FFP en disco nunca persistía — recompilaba todo en cada corrida (2026-09-10, build verde, sin verificar en consola)
+
+### Punto de partida: `debug_local_032.log` (Fase 26)
+
+`logs/debug_local_032.log` + la foto `screenshots/db/2026-09-10/2026-09-10-013317.jpg`
+confirmaron la primera imagen real del port: pantalla "Loading 20%" con el arte
+de Gangstar. El log se corta en frame 176, a mitad de una ráfaga de shaders de
+4,8 s (`frame 176 slow render (4839 ms)`) — el mismo tipo de frenón que aparece,
+en el mismo rango de frames (~172-190), en TODAS las corridas desde la Fase 17
+(`debug_local_024/025/028/030/032`), con duraciones que van de 4,8 s a 34,4 s
+según la corrida. Las Fases 18/19/21 ya habían descartado como causa el
+contenido de esos mensajes (diagnóstico de material del motor, inofensivo) y el
+costo del propio logging (demovido a `l_debug`, Fase 19) — pero el frenón real
+seguía ahí, sin explicar por qué no se achicaba corrida tras corrida si de verdad
+era "compilación real de shaders" como se veía asumiendo.
+
+### Causa raíz (confirmada leyendo `lib/vitaGL/source/ffp.c`, sin necesidad de dump)
+
+`ffp_apply_state` (la función que arma el shader fixed-function activo cada vez
+que cambia la combinación de luces/texturas/blend) intenta primero leer un
+`.gxp` precompilado de disco:
+
+```
+sprintf(fname, "ux0:data/shader_cache/v%d/v/...", FFP_SHADER_CACHE_MAGIC, ...);
+SceUID f = sceIoOpen(fname, SCE_O_RDONLY, 0777);
+if (f >= 0) { /* usar el .gxp cacheado */ }
+else { /* shark_compile_shader_extended(...) -- compilación real, cara */
+       f = sceIoOpen(fname, SCE_O_WRONLY | SCE_O_TRUNC | SCE_O_CREAT, 0777);
+       sceIoWrite(f, ...); }
+```
+
+(`lib/vitaGL/source/ffp.c:660-719` para el vertex shader, `:860-990` para el
+fragment shader — mismo patrón en los dos, magic de cache `28`, ver
+`shared.h:300`.) El problema: `sceIoOpen(..., O_CREAT)` **no crea directorios
+padre faltantes** — es equivalente a un `open()` de POSIX. Nada en este repo
+(ni en `dynlib.c`, ni en `init.c`, ni en `io.c`) creaba jamás
+`ux0:data/shader_cache/v28/v/` ni `.../f/`. Resultado: el `sceIoOpen` de guardado
+fallaba silenciosamente en cada corrida (retorna un FD negativo, y el código no
+chequea el resultado de esa segunda apertura) — el `.gxp` nunca tocaba el disco,
+así que la PRÓXIMA corrida volvía a fallar el `sceIoOpen(O_RDONLY)` de lectura y
+volvía a pagar un `shark_compile_shader_extended()` completo por cada variante
+de shader FFP nueva que el título usa (iluminación on/off, cantidad de texturas,
+modo de shading, etc.) — exactamente lo que se ve al llegar a la pantalla de
+carga real (con texto, blending y materiales con luz), que introduce las
+primeras combinaciones FFP nuevas del arranque. Esto explica por qué el frenón
+nunca se achicó de corrida en corrida pese a ser siempre "el mismo punto": no
+había ningún cache que pudiera acumularse.
+
+### Fix (`source/utils/glutil.c`, `gl_init()`)
+
+Crear el árbol `ux0:data/shader_cache/v28/{v,f}/` una sola vez al arrancar
+(`file_mkpath`, ya usado en el resto del loader, `source/utils/utils.c`) antes
+de `vglInitExtended`. Sin tocar `lib/vitaGL` ni el motor. Con el árbol
+existiendo, `sceIoOpen(O_CREAT)` sí puede crear el archivo `.gxp` dentro (crear
+*archivos* en un directorio existente funciona sin problema; lo que fallaba era
+crear el *directorio*), así que a partir de la primera corrida exitosa después
+de este fix, las corridas siguientes deberían reusar los `.gxp` ya compilados
+y saltarse la recompilación — el frenón de 15-34 s en frames ~172-190 debería
+reducirse a un costo de I/O (leer un `.gxp` chico) en vez de una compilación
+GPU completa.
+
+### Qué decide la próxima corrida
+
+- Si el frenón se achica notablemente en la SEGUNDA corrida (no en la primera:
+  esa todavía tiene que compilar y poblar el cache) y el juego avanza más allá
+  del 20% hacia el título/menú, confirma esta causa como el cuello de botella
+  real detrás del "atascado en carga".
+- Si el frenón persiste igual de largo en la segunda corrida, revisar si
+  `ux0:data/shader_cache/v28/` realmente quedó poblado con archivos `.gxp`
+  después de la primera corrida (por FTP/VitaShell) — de no ser así, el
+  problema está en otro `sceIoOpen`/permiso, no en la falta del directorio.
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-10).
+- **Desplegado:** **NO** — la consola (`192.168.3.15:1337`) no respondió por FTP
+  al intentar el deploy (`Connection refused`; hay que abrir VitaShell y activar
+  FTP con SELECT). `build/eboot.bin` queda listo para subir.
+- **Pendiente:** desplegar, correr una primera vez (paga el costo de poblar el
+  cache — no debería ser peor que antes), correr una SEGUNDA vez sin borrar
+  `ux0:data/shader_cache/`, y traer el log + captura de esa segunda corrida.
+
+## Fase 20: 4 entry points GL caídos a `ret0` (2026-09-10, sin verificar en consola)
+
+### Qué muestra `logs/debug_local_026.log` + `shot_00600.bmp` (build Fases 18-19)
+
+- El juego **corre a 30 fps** (frames 446/597 a 30,1 fps, draws ~10/frame,
+  `lastErr=0x0(x0)` limpio en todos los checkpoints `[GL]`) pero el BMP del
+  frame 600 es **100% negro verificado por píxel** (522240 px, avg 0,00,
+  0 px >8 brillo — no es "escena oscura", es framebuffer a cero).
+- `texUp=205` congelado desde el frame ~295 mientras los draws siguen
+  creciendo: la geometría se reutiliza sin texturas nuevas. ~10 draws/frame
+  = pinta de pantalla de carga/título simple, no de escena 3D.
+- `DeviceKeyInput:23` llega (el CROSS alcanza al motor) pero la imagen no cambia.
+
+### Causa candidata (confirmada a nivel de símbolos, no aún en hardware)
+
+`objdump -T` del `.so` real vs `source/dynlib.c`: el motor importa
+`glLightf`, `glLightModelf`, `glLightx` y `glMultiTexCoord4f`, que iban a
+`ret0` (no-op silencioso). vitaGL no implementa ninguno (solo expone
+`glLightfv`/`glLightModelfv`/`glLightxv` y `glMultiTexCoord2f`), así que el
+drop era "legítimo" pero con pérdida real: atenuaciones/cutoff por luz y las
+UV del segundo set de textura (materiales diffuse+lightmap del glitch engine)
+nunca llegaban al pipeline.
+
+### Cambios (solo loader, sin tocar motor/render)
+
+- `source/reimpl/gl.{c,h}`: `glLightf_soloader` (→ `glLightfv` con 1 elem.),
+  `glLightModelf_soloader` (→ `glLightModelfv`), `glLightx_soloader`
+  (fixed 16.16 → float → `glLightfv`), `glMultiTexCoord4f_soloader`
+  (→ `glMultiTexCoord2f` con s,t; r,q descartados — para quads 2D q=1 es
+  sin pérdida). Cero logging dentro (MultiTexCoord va por vértice).
+- `source/dynlib.c`: las 4 entradas re-apuntadas de `ret0` a los wrappers.
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-10,
+  `build/eboot.bin` + VPK regenerados en `build/`).
+- **Pendiente (requiere consola):** desplegar `eboot.bin` →
+  `/ux0:/app/PSVGMV002/`, correr 3-4 min, traer `debug_local_027.log` +
+  `shot_*.bmp`. Qué mirar: (a) ¿el BMP deja de ser 0,00 avg?; (b) si sigue
+  negro, el siguiente sospechoso es formato de textura comprimida
+  (`glCompressedTexSubImage2D_drop` sigue siendo drop — contar si su
+  one-time log aparece) o estado FFP, y tocará instrumentar clear-color /
+  textura bindeada por frame.
+
+## Fase 21: el 027 era un build debug a mitad de carga + 2 bugs reales (2026-09-10)
+
+### Qué muestra `logs/debug_local_027.log` (4260 líneas, build DEBUG)
+
+- **No es release:** trae `ctor[0..450]`, `FalsoJNI.c DBG`, `stat/fopen/fclose`
+  por línea — es preset debug. Termina a mitad de carga de assets
+  (`heli_police.bdae`, sin ningún `frame 2 returned`): **nunca llegó al loop
+  de render**. La pantalla negra aquí = carga a medio camino y encima ~10x
+  más lenta por el logging por-`fread` (regla 1 de CLAUDE.md). No invalida la
+  Fase 20; solo pide repetir con release y esperar 5-10 min.
+- **Bug real 1 — el filtro `Duplicate`/`unbound` nunca igualaba:**
+  `strncmp(text, "Duplicate parameter name : ", 28)` compara 28 bytes pero el
+  literal mide 27 (el byte 28 compara NUL contra 'd' y falla siempre); igual
+  `unbound` con 19 vs 18 reales. En el 027 los `Duplicate` salen como `ℹ info`
+  (líneas ~4225+) mientras los `finalizing renderer` sí salen como debug —
+  confirmación directa. En release esto dejaba decenas de `l_note` con
+  UDP+sync por frame. Corregido a 27/18 con nota en `source/reimpl/log.c`.
+- **Bug real 2 — nuestro wrapper reintrodujo un `GL_INVALID_ENUM`:**
+  línea 633: `ffp.c:3467: glLightModelfv set GL_INVALID_ENUM (pname: 0xB52)`.
+  0xB52 = `GL_LIGHT_MODEL_COLOR_CONTROL` (specular separado); la FFP de
+  vitaGL no lo soporta. Antes iba a `ret0` (silencio), ahora lo reenviamos.
+  `glLightModelf_soloader` ahora filtra 0xB52 (single-color por defecto,
+  solo pierde un poco de brillo especular, nada negro).
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-10).
+- **Pendiente:** desplegar `build/eboot.bin` (**release**, no debug), correr
+  **5-10 min sin cortar**, traer `debug_local_028.log` + `shot_*.bmp`.
+
+## Fase 22: instrumentación de tipos de array + clear color (2026-09-10, sin verificar)
+
+### Qué muestra `logs/debug_local_028.log` (103 líneas, release, cortado en frame 187)
+
+- Build release correcto esta vez (sin spam debug). `lastErr=0x0(x0)` en los
+  3 checkpoints `[GL]`, sin ningún `[vitaGL]` — los wrappers de Fase 20/21 no
+  rompen nada.
+- Pero termina en plena ráfaga de link de shaders (frames 185/186/187:
+  2,1 s + 12,6 s + 1,8 s) — el usuario cortó ahí otra vez. Esa ráfaga tarda
+  ~15 s incluso en release: es compilación real de shaders, no logging.
+- Lo que sigue sin explicar es el steady-state del 026 (600 frames a 30 fps,
+  negro total): draws vivos, sin error GL, texturas subidas.
+
+### Cambio (solo loader, log-on-change, costo cero en steady state)
+
+- `source/reimpl/gl.{c,h}` + 5 re-apuntados en `dynlib.c`:
+  `glVertex/Color/TexCoord/NormalPointer_soloader` (anotan size/type/stride
+  solo cuando aparece una combinación nueva, máx. 8 líneas) y
+  `glClearColor_soloader` (anota solo cuando cambia el color).
+- Qué decide: `type=0x140c` (FIXED) vs `0x1406` (FLOAT) — el motor es de la
+  era fixed-point (`glOrthox`/`glTexParameterx` importados) y si la geometría
+  del título va en fixed, esa es la pista que falta. El clear color dice si
+  el negro es el fondo del motor o draws encima.
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-10).
+- **Pendiente:** desplegar, correr **sin cortar 5-10 min** (los frames
+  185-187 solos suman ~17 s: es normal ver la pantalla negra un rato),
+  traer `debug_local_029.log`. Con 10-20 líneas basta: las `[GL]
+  gl*Pointer/clearColor` salen en los primeros frames con draws.
+
+## Fase 23: el 027 SÍ crasheó (dump) — el `.sav` es inocente (2026-09-10)
+
+### `debug_local_029.log` (102 líneas, release, sin dump asociado)
+
+- Geometría en **FLOAT** (`type=0x1406` en vertex/texcoord, `0x1401` UBYTE en
+  color): hipótesis fixed-point **descartada**. Clear negro puesto por el
+  propio motor (`0 0 0 1`).
+- Las líneas `fopen ... Gangstar2.preferences/.sav FAILED` son **conducta
+  normal de primer arranque**: el archivo no existe hasta que el juego guarda;
+  el motor sigue con defaults. Prueba: 026/028 muestran los mismos FAILED y
+  llegan a 187/600 frames. Además `io.c` ya crea `saves/` al arrancar
+  (`io.c:515-516`) y `_mkdir_parents` en cada escritura — no falta ningún
+  directorio por crear. **El `.sav` no rompe nada.**
+- El 029 no tiene `.psp2dmp` asociado = el juego **no crasheó**; el log se
+  corta en frame 10 (~30 s) tras dos inputs (`DeviceKeyInput:4` y `:23`).
+  Sin dump no hay crash: o se rebootó en la espera negra o hay freeze (sin
+  evidencia todavía).
+- Pista sin cerrar: el build del 029 ya dibuja las **barras selftest**
+  (`gl_probe_selftest`, overlay post-engine en `gl_swap`) y el usuario
+  reporta negro puro sin mencionarlas. Si las barras tampoco se ven, el
+  problema está en el path de presentación (swap/display), no en el
+  contenido del motor — **pendiente confirmar con el usuario**.
+
+### Dump `...-1789011830-0x0001e72dbd-...psp2dmp` (corrida 027, build DEBUG)
+
+- Data abort en `glf::IOStream::FilePosition::Skip(int)+8` (`ldr r2,[r3,#0]`,
+  hilo `PSVASAS01`) con LR en `libGangster2.so+0x6a1e98`: crash dentro del
+  streaming de assets, coherente con el final del log 027
+  (`heli_police.bdae` + spam de shaders). Análisis completo en
+  `logs/....analysis.txt` / `.triage_summary.md` (generados con
+  `psvita-toolkit analyze`).
+- Ocurrió en build DEBUG (heap layout + I/O distintos); los builds release
+  pasan por ese punto (026/028/029). Queda como crash debug-only hasta que
+  un release lo reproduzca — no se toca código por esto.
+
+### Fase 23b: el negro + freeze del 029 lo causó nuestra propia sonda (2026-09-10)
+
+- Respuestas del usuario: **negro puro sin barras** + **consola congelada**
+  (reboot manual, sin dump = el juego no crasheó, la GPU se colgó o hubo
+  deadlock silencioso).
+- Causa: `glPopAttrib()` de vitaGL (`lib/vitaGL/source/misc.c:983`) tenía un
+  off-by-one — `&attrib_stack[attrib_stack_counter--]` lee un slot POR ENCIMA
+  del tope (basura/ceros) en vez del guardado. Nuestra sonda selftest
+  (push → dibuja barras → pop, cada frame) restauraba viewport/matriz/blend/
+  scissor corruptos al contexto del motor en cada frame: negro total desde el
+  frame 1 y estado GXM basura capaz de colgar la consola. El negro del
+  026/028 es anterior a la sonda y sigue sin explicar; el del 029 queda
+  invalidado como evidencia.
+- Fix (vendor patch marcado, mismo patrón que SPOT/Fase 18):
+  `&attrib_stack[--attrib_stack_counter]` + `return` en underflow (el counter
+  es `uint8_t`: sin el return leería slot[255]).
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-10).
+- **Pendiente:** desplegar, correr, mirar **solo esto**: ¿se ven las 4 barras
+  + magenta? Sí = el path de presentación funciona y el negro es contenido
+  del motor (seguimos por texturas/cámara). No = swap/display roto.
+
+## Fase 24: causa raíz del negro + GPU hangs — faltaba HAVE_SOFTFP_ABI (2026-09-10)
+
+### `...-1789017158-GPUCRASH.psp2dmp` + `debug_local_030.log` (108 líneas, release con fix PopAttrib)
+
+- El dump GPU muestra el hilo principal parado en `SceGpuEs4User` con stop
+  reason 0x0 (ejecución "normal"): la CPU esperaba a una GPU colgada — el
+  freeze de consola, no un crash de código. El log se corta en frame ~143
+  (carga de ExtraFonts/splash, draws=295, `lastErr=0x0`).
+- El eboot del 030 **sí** llevaba el fix PopAttrib (build 01:09 < corrida
+  01:14), así que el hang es otra cosa.
+
+### Causa raíz (confirmada en código, precedente Asphalt-5-Vita)
+
+- El toolchain compila con `-mfloat-abi=softfp` pero SceGxm es hard-float.
+  En `lib/vitaGL/source/shared.h:482-486`, sin `HAVE_SOFTFP_ABI`,
+  `vglSetViewport` = `sceGxmSetViewport` directo: los floats llegan en
+  R-regs y la callee lee VFP s-regs → **cada viewport programado a la GPU
+  es basura**. Con el flag, usa el shim naked `sceGxmSetViewport_sfp`
+  (mueve R→s antes de saltar).
+- Explica TODO desde Fase 15 con un solo mecanismo: sin error GL (la
+  corrupción está bajo GL, en el borde GXM), draws contados, texturas OK,
+  screenshots a cero, barras selftest invisibles, hangs aleatorios según la
+  basura que caiga (región fuera de rango/NaN = GPU fault).
+- Asphalt-5-Vita (Gameloft funcional, misma era FFP) compila su vitaGL con
+  `SOFTFP_ABI=1` (`VITAGL_MAKE_FLAGS`). Nuestro `CMakeLists.txt` no lo tenía.
+
+### Cambios (solo métodos seguros — README VITAGL.md + precedente Asphalt)
+
+- `CMakeLists.txt` (`vitaGL_local`): **+`HAVE_SOFTFP_ABI`**, −`MATH_SPEEDHACK`
+  (README: "may cause glitches", Asphalt no lo usa), −`VITA3K_SUPPORT` (dead
+  flag: no existe en este vitaGL vendored). Se mantienen `LOG_ERRORS`
+  (triage activo) y `SKIP_SPLASHSCREEN`. A propósito NO: `NO_DEBUG` (quita
+  safety checks), ningún `*_SPEEDHACK` (`DRAW_SPEEDHACK=2` solo ante
+  evidencia de agotamiento del temp pool — sin evidencia aquí).
+- `source/reimpl/gl.{c,h}` + `dynlib.c`: `glViewport_soloader` ahora hace
+  clamp al panel 960x544 y nuevo `glScissor_soloader` con el mismo clamp
+  (lección de Asphalt: rect fuera de rango para GXM = GPU crash). Mínimo
+  1x1 para no degenerar el estado.
+
+### Estado
+
+- **Build:** verde release. Verificado que el shim quedó linkeado:
+  `sceGxmSetViewport_sfp` (T) presente en `build/gangstarmiamivindication.elf`.
+- **Pendiente:** desplegar y correr. Si las barras aparecen = viewport real
+  por primera vez; el negro del motor (si sigue) se re-triajea con la sonda
+  de estado del frame 400, ahora sí válida.
+
+## Fase 25: barras visibles — a por la imagen real (2026-09-10)
+
+### `debug_local_031.log` (77 líneas, cortado en frame 2)
+
+- El usuario confirma: **las 4 barras + magenta se ven**. El fix
+  `HAVE_SOFTFP_ABI` de Fase 24 funciona: la GPU recibe viewports reales por
+  primera vez en la historia del port. El path de presentación queda
+  descartado como causa.
+- El log se cortó a mitad del frame 2 (tras `preferences FAILED`, antes del
+  `frame 2 returned`): solo confirma las barras, nada del contenido.
+
+### Cambios
+
+- `GMV_PROBE_SELFTEST` 1 → 0 (`source/reimpl/gl.c`): el overlay cumplió su
+  misión; apagado para ver la imagen del juego. El dump de estado del frame
+  400 sigue activo (una vez, sin costo).
+- `source/main.c`: captura en frame **150** (ventana del splash: tras la
+  carga del frame 2, antes de la ráfaga de shaders ~185) y luego cada 300
+  (300/600/900…). El motor carga `splash.bmp`/`splash960.bmp` + `ExtraFonts`
+  en esa ventana: si el splash de Gameloft existe, sale en `shot_00150.bmp`.
+
+### Estado
+
+- **Build:** verde release.
+- **Pendiente:** desplegar, correr 5-10 min sin cortar, traer
+  `debug_local_032.log` + `shot_00150.bmp` + `shot_00300.bmp` (+ resto).
+
+## Fase 26: primera imagen real + stretch a pantalla completa (2026-09-10)
+
+### `debug_local_032.log` + foto `screenshots/db/2026-09-10/2026-09-10-013317.jpg`
+
+- **Primera imagen real del port:** pantalla de carga "Loading 20%" con el
+  arte de Gangstar y "© 2010 Gameloft". El motor renderiza bien (texturas,
+  texto, blending).
+- La foto muestra una **franja negra de 64px arriba**: el motor trabaja en
+  960x480 (`vp=0,0,960,480` en todos los logs) y el panel es 960x544.
+  544−480 = 64.
+- El log se cortó en frame 176 (ráfaga de shaders de 4,8 s): el 20% es solo
+  donde se tomó la foto, la carga sigue si se espera (el 026 llegó a 600
+  frames estables).
+
+### Cambios (solo loader)
+
+- `glViewport_soloader` / nuevo `glScissor_soloader` (`source/reimpl/gl.c`,
+  `dynlib.c`): todo rect en espacio del motor sobre el framebuffer default
+  se estira x544/480 en Y (scissor igual, para que el recorte coincida).
+  FBOs offscreen intactos. El clamp de Fase 24 sigue detrás como red.
+  Efecto: la imagen llena el panel (estirado vertical ~13%, práctica común
+  en estos ports); el touch no se toca (ya trabaja en espacio 960x544).
+
+### Estado
+
+- **Build:** verde release.
+- **Pendiente:** desplegar, correr 5-10 min, foto de la carga al 100% /
+  título + `shot_*.bmp`.
+
+## Fase 23: la sonda que faltaba — ¿algo que dibujemos NOSOTROS llega a la pantalla? (2026-09-10)
+
+### Por qué esta sonda y no otra hipótesis más
+
+De la Fase 15 a la 22 todas las hipótesis vivían **dentro** del estado GL que
+setea el motor (error pegajoso, spots, luces a `ret0`, tipos de array, clear
+color). Ninguna probó la capa de abajo. Y los hechos del `026` acorralan el
+problema justo ahí:
+
+- 30 fps estables, draws creciendo, `lastErr=0x0`, `texUp=205`, `fbo=0`.
+- `shot_00600.bmp` **verificado píxel por píxel**: 522240 px, todos
+  `0x00000000`. No es escena oscura ni geometría fuera de cámara — es un
+  framebuffer presentado en cero absoluto.
+
+Con el motor haciendo todo "bien" según GL y la pantalla en cero, la pregunta
+que decide el árbol entero es: **¿vitaGL + el camino de present + los vertex
+arrays funcionan?** Nunca se probó por separado.
+
+Descartado antes de escribir código (análisis estático de esta sesión):
+
+- **Doble swap:** `objdump -T` del `.so` → **cero imports de EGL**. El motor no
+  llama `eglSwapBuffers`; el único present es nuestro `vglSwapBuffers()`.
+- **Legacy pool en 0:** `vglInitExtended(0, ...)` solo afecta el pipeline
+  immediate-mode (`glBegin/glEnd`), que este motor no usa. Además `vgl_log`
+  avisaría ("Legacy pool outbounded") y no aparece.
+- **Entry points caídos:** de los 103 imports GL del `.so`, tras la Fase 20 los
+  únicos que siguen en `ret0` son `glMultiTexCoord4f`(ya wrappeado),
+  `glPointParameterf/fv` y `glSampleCoverage` — ninguno puede producir negro.
+- **`glGenerateMipmapOES`** está mapeado a `glGenerateMipmap` real (la
+  hipótesis de "texturas incompletas → sample negro" no aplica por ahí).
+
+### Cambio (`source/reimpl/gl.{c,h}` + `source/utils/glutil.c`)
+
+- `gl_probe_selftest()`, llamada desde `gl_swap()` **justo antes** de
+  `vglSwapBuffers()` (último en pintar, nada del motor puede taparlo): dibuja
+  4 barras (blanca/roja/verde/azul) arriba y una magenta abajo en `y=500..536`,
+  con estado propio conocido (luz/textura/blend/depth/alpha/cull off, ortho
+  960x544, `glDrawArrays` — el mismo camino que usa el motor).
+  Envuelta en `glPushAttrib`/`glPopAttrib` + push/pop de ambas matrices, y se
+  apaga sola después del frame 1200.
+- `gl_probe_dump_state()`, one-shot en el primer draw del frame 400: color
+  actual, textura bindeada, enables (lighting/tex2d/blend/alpha/depth/cull),
+  blend func, viewport y las matrices proyección + modelview completas.
+
+### Cómo leer el próximo `shot_*.bmp` (esto decide la fase siguiente)
+
+| Qué se ve | Qué significa | Siguiente paso |
+|---|---|---|
+| Las barras aparecen | vitaGL, present y vertex arrays están **bien**; el negro es el estado que setea el motor | El `draw-state @frame 400` del log dice qué perilla (color en cero, textura sin bindear, matriz que manda todo fuera) |
+| Sigue 100% negro | El problema está **debajo** del motor (surface/present/`vglInit`) y todas las hipótesis de estado desde la Fase 15 eran pistas falsas | Triage de `vglInit`/GXM/display, no del motor |
+| Solo las de arriba, falta la magenta | El panel es 544 pero solo llega la franja 960x480 que renderiza el motor | Ajustar surface/viewport |
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-10).
+- **Desplegado:** sí, `eboot.bin` → `/ux0:/app/PSVGMV002/` (2026-09-10).
+- **Pendiente de verificar en consola:** correr **5-10 min sin cortar** (los
+  frames ~185-190 del link de shaders solos suman ~17 s de pantalla negra: es
+  esperado, no es cuelgue) y traer `debug_local_030.log` + `shot_*.bmp`.
 
 ## Fase 14: acelerar la carga + achicar el log (2026-09-06)
 
@@ -194,6 +1129,155 @@ Rank de ofensores (`<GLES/gl.h>` para los valores):
 - **Pendiente:** desplegar, correr 3-4 min, traer `logs/debug_local_025.log` **+ los
   `logs/shot_*.bmp`**. Qué mirar: (a) si `lastErr` queda en 0x0 y el negro sigue →
   el spot no era (confirmado por eliminación); (b) qué muestran los BMP.
+
+## Fase 18: el resto del `GL_INVALID_ENUM` + descarte del material system como causa (2026-09-09)
+
+### Punto de partida
+
+`logs/debug_local_024.log` (398 líneas) es la corrida más reciente que hay, pero es
+**anterior** al fix de Fase 17 (el commit que pinea vitaGL con `GL_SPOT_*` es del
+2026-09-06 23:30, el log es de las 22:51 del mismo día) — o sea que documenta el
+problema que la Fase 17 ya arregla, no una regresión nueva. No hay ningún log
+posterior a ese fix.
+
+### Investigación en `decompiled/` (sin tocar motor/render)
+
+Un agente de exploración recorrió `decompiled/libGangster2_armeabi/ghidra/out_ghidra.c`
+(1,08M líneas, un solo archivo con cada función pseudo-C precedida por su firma
+demangled) buscando el código real detrás de cada mensaje `[ALOG]` que aparece en
+el log de Fase 17:
+
+| Mensaje | Función | Qué hace después de loguear |
+|---|---|---|
+| `parameter type mismatch when setting "%s/%s"` | `glitch::collada::createMaterial` | Salta ESE parámetro del `switch`, sigue con el resto del material. |
+| `unbound parameter %s for shader %s` | `CMaterialRendererManager::endMaterialRenderer` | Llama `autoAddAndBindParameter(...)` — se autorresuelve, no es un drop. |
+| `finalizing renderer %s: unused parameter: %s` | misma función, más adelante en el mismo loop | Diagnóstico de link-time, el parámetro simplemente no recibe índice. |
+| `%s/%s: invalid bind symbol: %s` | `createMaterialRendererForProfile<SProfileGLESTraits>` | `getParameterID` devuelve `0xffff`, el `if` no muta ningún estado, sigue el loop. |
+| `Duplicate parameter name : %s` | helper de registro de parámetros de `CMaterialRendererManager` | Devuelve `0` para esa registración puntual, el caller sigue. |
+| `creating %s: ... not a supported %s pixel format; using %s instead` | creación de textura GL (`createTextureImpl`, ~L848772) | Remapea a un formato GPU-nativo que preserva el flag alpha-vs-no-alpha (tabla `PFDTable`) — no es un fallback negro/transparente. |
+| `adding texture %s: slow path pixel format conversion...` | `CTextureManager::createTextureFromImage` | Info-level, seguido de una conversión de píxeles real (`operator_new` + copy), no un drop. |
+
+**Conclusión: ninguno de estos caminos anula alpha, saltea el bind de la textura
+diffuse, ni cae a un material negro por defecto.** Son diagnósticos de una sola vez
+(en el link del shader/material o al agregar la textura), no tocan el estado
+por-frame — quedan descartados como causa directa de la pantalla negra con draws>0.
+
+También se buscó (sin resultado) cualquier lógica de fade-to-black / quad
+fullscreen / vignette por nombre (`CFade`, `FadeToBlack`, `BlackQuad`,
+`PostProcess`, `vignette`) — no aparece en el pseudo-C. Si la pantalla negra
+resulta ser eso, va a ser contenido de datos (UI definida en asset, no C++ del
+motor), no algo que se arregle tocando el `.so`/wrapper.
+
+`CImageLoaderPVR::loadTextureHeader` tampoco tiene fallback negro: un formato PVR
+no soportado devuelve **0 (falla de carga)** y loguea `"pixel format %0x02u not
+supported"` — no hay textura negra sustituta a ese nivel.
+
+### Cambios (vitaGL, mismo patrón que el fix `GL_SPOT_*` de Fase 17)
+
+`lib/vitaGL/source/misc.c` y `source/textures.c` (commit `7dcf2de` en el submódulo,
+pineado en el repo padre): los 4 ofensores benignos que quedaban del rank de
+Fase 17 ahora son no-ops en vez de `GL_INVALID_ENUM`:
+
+- `glDisable(GL_DITHER)` — sin etapa de dithering en este pipeline GXM.
+- `glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE / GL_SAMPLE_COVERAGE)` — sin resolve de
+  multisample bajo `MULTISAMPLE_NONE` (Fase 14).
+- `glHint(GL_FOG_HINT, ...)` — hint de calidad sin implementación de niebla que
+  dirigir.
+- `glPixelStorei(GL_PACK_ALIGNMENT, ...)` — solo afecta `glReadPixels`, que el
+  camino de render del motor no usa (el `gl_shot()` de Fase 17 no pasa por
+  `glReadPixels`, lee el framebuffer directo).
+
+Ninguno de los cuatro tenía efecto de estado real en vitaGL de por sí (por eso son
+no-ops legítimos, no un "silenciar y esperar") — cambio esperado: cero, salvo que
+`glGetError()` ya no quede en ningún estado de error tras el arranque.
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-09).
+- **Desplegado:** **NO** — la consola (`192.168.3.15:1337`) dejó de responder por
+  FTP a mitad de esta sesión (`timed out` en 3 reintentos). El `eboot.bin` de esta
+  tanda quedó listo en `build/eboot.bin` pero no llegó a subirse.
+- **Pendiente (en el momento de escribir esto):** exactamente lo mismo que al
+  cierre de la Fase 17 — desplegar, correr 3-4 min, traer `debug_local_025.log`
+  + `shot_*.bmp`. Esta fase no cambió la hipótesis de fondo (sigue siendo "¿qué
+  hace `lastErr` tras el fix del spot?" + "¿qué muestran los BMP?"), solo
+  terminó de limpiar el ruido de `GL_INVALID_ENUM` que quedaba y descartó al
+  material system como sospechoso por lectura directa del pseudo-C en vez de
+  por inferencia. **Superado por la Fase 19**: mientras esta fase esperaba
+  despliegue, el usuario sí pudo correr el build de la Fase 17 sola y trajo
+  `debug_local_025.log` — ver el resumen de "Estado actual" arriba y la Fase 19.
+
+## Fase 19: el spam "inofensivo" de la Fase 18 es sospechoso de los frames de 34 s (2026-09-09)
+
+### Qué muestra `logs/debug_local_025.log` (235 líneas, primer build real con el fix `GL_SPOT_*` de Fase 17 corriendo en consola)
+
+- **Confirmado: el fix del spot funcionó.** Los 5 checkpoints `[GL]` de la
+  corrida (frames 2, 138, 172, 176, 177) muestran `lastErr=0x0(x0)` — cero
+  `GL_INVALID_ENUM` pegajoso, contra el `lastErr=0x500(x1482)` sostenido en
+  `debug_local_024.log` (que corría el build *sin* el fix). Primera
+  verificación en hardware real de la Fase 17, siete días después del commit.
+- La pantalla siguió negra. El usuario reportó "se quedó en pantalla negra" y
+  cortó ahí — el log termina en la línea 235, a mitad de una ráfaga de spam de
+  link de shaders del frame 178, sin línea "returned".
+- El patrón de esa ráfaga es MUCHO más lento que en `debug_local_024.log`:
+  `frame 177 slow render (34429 ms)` — 34,4 s para un solo frame, contra el
+  peor pico de la corrida anterior (`frame 188 slow render (18040 ms)`, 18 s).
+  Mismo tipo de contenido en ambos casos (decenas de `finalizing renderer %s:
+  unused parameter: %s` + `Duplicate parameter name : %s` intercalados) — no
+  es una ráfaga más grande, es la misma ráfaga tardando el doble o más.
+- La Fase 18 ya había leído el pseudo-C real (`out_ghidra.c`) y confirmado que
+  este spam es diagnóstico de un solo tiro en el link de shader/material, sin
+  efecto en el estado de render por-frame — pero seguía yendo por `l_note()`,
+  que **nunca se compila fuera** (tabla de niveles de logging, PORTING_PLAN.md
+  sección 6) y cuesta un `LwMutex` + 2 `snprintf` + `sceNetSendto` bloqueante +
+  `sceIoWrite` (+ sync periódico) **por línea** — el mismo mecanismo que ya
+  explicó los frames lentos de las Fases 8 y 14. Con 100+ líneas de este spam
+  dentro de uno o dos frames, ese costo por sí solo puede ser varios segundos
+  — la hipótesis más simple es que el propio logging es lo que hace que un
+  frame de carga real (probablemente de un segundo o dos) se vea como un
+  frame de 34 s que después nunca "vuelve".
+
+### Cambio (`source/reimpl/log.c`, sin tocar motor/render)
+
+`is_load_spam()` ahora también matchea (mismo mecanismo que la Fase 14 para
+`createTextureImpl`/`Loaded texture`/etc., pasan a `l_debug`, compilado fuera
+en release):
+
+- `finalizing renderer %s: unused parameter: %s` (match exacto — viene de
+  `logf()`, que pasa el formato crudo sin expandir, Fase 11).
+- `finalizing renderer %s: parameter %s array size deduction ambiguous`
+  (idem, no se vio en los logs capturados pero está en el mismo bloque de
+  `endMaterialRenderer` según la Fase 18).
+- `Duplicate parameter name : ` (prefijo — viene de `log()` con el string ya
+  armado, así que el valor varía: `diffuse-sampler`, `smoke_tga-sampler`, etc.).
+- `unbound parameter ` (prefijo, mismo motivo).
+- `%s/%s: invalid bind symbol: %s` (match exacto, crudo sin expandir).
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-09).
+- **Desplegado:** sí, junto con los no-ops de la Fase 18 (misma tanda de
+  build) — `eboot.bin` subido a `/ux0:/app/PSVGMV002/` el 2026-09-09 22:31.
+- **Pendiente de verificar en consola:** correr 3-4 min, traer
+  `debug_local_026.log` + `shot_*.bmp`. Si el pico que antes tardaba 18-34 s
+  ahora tarda milisegundos, confirma la hipótesis del logging y el juego
+  debería avanzar bastante más lejos en la misma ventana de espera real
+  (aunque la pantalla siga negra, sabremos que no es un cuelgue). Si el pico
+  sigue tardando decenas de segundos incluso con este spam fuera, el costo
+  real está en otro lado (el propio trabajo de compilar/linkear shaders, o
+  I/O) y hay que medirlo directamente en vez de inferirlo del volumen de log.
+
+### Nota aparte: C1-9654-4 (`SCE_KERNEL_ERROR_MODULEMGR_NOEXEC`)
+
+Apareció una vez al intentar lanzar el juego en algún punto de esta sesión con
+"Enable Unsafe Homebrew" ya activado en la consola. No se pudo profundizar (la
+consola no tenía FTP disponible en ese momento) y el usuario terminó pudiendo
+correr el juego de todos modos, así que queda sin causa confirmada — no se
+tocó código por esto. Si reaparece: revisar que `kubridge.skprx` esté
+registrado en `*KERNEL` dentro de `ur0:tai/config.txt` y presente en disco
+(este port depende de él en runtime, `source/utils/init.c:59`), y si eso no
+alcanza, reinstalar el `.vpk` completo (`psvita-toolkit deploy --vpk`) para
+descartar un `eboot.bin` corrupto por una subida FTP interrumpida.
 
 ---
 

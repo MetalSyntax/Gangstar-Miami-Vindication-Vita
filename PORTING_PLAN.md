@@ -181,11 +181,16 @@ jamás `sceClibPrintf(buf)`. El motor manda mensajes con `%s` adentro.
   `parameter type mismatch when setting "%s/%s"` del camino de material/shader (Fase 11),
   más la pista nueva: 69 `Loaded texture` del engine vs un puñado de uploads GL
   (posible textura negra vía PVR) o cámara fuera de vista (los BMP lo dirán).
-- [ ] **Audio**: sin portar (scopeado 2026-09-07: el `.so` no importa audio nativo —
-  todo es JNI `SoundPool` 5 streams + `MediaPlayer`; 1722 `.ogg` sin decoder vendored.
-  Requiere vendorizar vorbis + backend `SceAudioOut`; fase propia tras el render).
-  Los 23 métodos de `GLMediaPlayer` se aceptan y se ignoran; los dos
-  `isSoundLoaded*` responden "no cargado" para que el motor no espere.
+- [x] **Audio (Fase 31, 2026-09-11)**: backend real en `source/utils/audio.c`
+  (SceAudioOut 48 kHz stereo + libvorbisfile: SFX cortos decodificados y
+  cacheados, música/radio/voz en streaming con loop, hasta 8+4 voces,
+  ganancias music/sfx/vfx). Los 26 métodos de `GLMediaPlayer` en
+  `source/java.c` pasaron de stubs a manejar estado real; `isSoundLoaded*`
+  (0/-1) e `isMediaPlaying` (1/0) responden desde el backend. Causa raíz
+  del doble síntoma 10-13 fps + silencio: el motor reemitía
+  playRadio/playSound cada frame al leer siempre "not playing".
+- [x] **Salida limpia**: `Gangster2.Exit()` (`java.c`) termina el proceso
+  en vez de colgar en el loop `Native Exit Triggered` del log 036.
 - [ ] **Video**: sin portar. `loadMovie()` devuelve 1 y dispara
       `nativeSetOnVideoCompletion()` al instante, como si el clip terminara solo (Fase 6).
 - [ ] **Ciclo de vida incompleto**: `nativePause`/`nativeResume`/`nativeAccelerometer`/`nativeDone`/

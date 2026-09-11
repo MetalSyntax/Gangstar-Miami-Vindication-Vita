@@ -40,6 +40,46 @@ void gl_preload() {
 }
 
 void gl_init() {
+    // Fase 27 (2026-09-10): vitaGL's fixed-function pipeline (lib/vitaGL/source/ffp.c)
+    // persists every compiled shader variant to disk at
+    // ux0:data/shader_cache/v<FFP_SHADER_CACHE_MAGIC>/{v,f}/*.gxp (shared.h:300,
+    // magic=28 in our pinned vitaGL) so a later run can sceIoOpen() the .gxp
+    // instead of paying a real vitaShaRK compile again. But sceIoOpen(..., O_CREAT)
+    // does NOT create missing parent directories -- with nothing creating this tree,
+    // every save silently failed and EVERY run recompiled EVERY FFP shader variant
+    // from scratch. That's the real cost behind the repeated 15-34s "shader link
+    // burst" stalls at frames ~172-190 seen since Fase 17 (title screen's first
+    // unique lighting/texture-combiner masks): not log spam (already fixed, Fase 19)
+    // nor engine-side material diagnostics (ruled out, Fase 18) but vitaGL
+    // recompiling from zero every single boot. Creating the tree once here lets the
+    // cache actually persist: first run still compiles (unavoidable), every run
+    // after reuses the .gxp files and should reach the title/menu much faster.
+    if (!file_mkpath("ux0:data/shader_cache/v28/v/x", 0777) ||
+        !file_mkpath("ux0:data/shader_cache/v28/f/x", 0777)) {
+        l_warn("gl_init: could not create ux0:data/shader_cache/v28/{v,f} -- "
+               "FFP shader cache will keep recompiling every run.");
+    }
+
+    // Fase 29 (2026-09-10): debug_local_034.log shows "Circular pool overrun on
+    // frame N" (lib/vitaGL/source/gxm.c:788) on ~37% of frames in real gameplay
+    // (299 hits between frames 705-1500, peaks up to 956592 bytes over budget),
+    // exactly overlapping the region where the user-reported ~9 fps sits (this
+    // engine's FFP draws copy client-side vertex/color/texcoord arrays into
+    // vitaGL's circular pool per draw call, and real 3D meshes -- unlike the
+    // simple loading-screen quads seen through Fase 26-28 -- need far more of
+    // it). Once a frame's circular pool slot (default 32 MB / 3 buffers =
+    // ~10.7 MB each, lib/vitaGL/source/vgl.c:111,364) is exhausted,
+    // vgl_reserve_data_pool() (vgl.c:127-149) stops doing cheap bump-pointer
+    // allocation and falls back to a real gpu_alloc_mapped_for_cpu() kernel
+    // allocation *per over-budget reservation* -- which is exactly the kind of
+    // per-draw cost that produces the wildly uneven frame times in the log
+    // (588 ms-21 s "slow render" spikes mixed with normal ones), not a steady
+    // per-frame cost like Fase 28's logging bug. Doubling the pool to 64 MB
+    // (~21.3 MB/buffer) gives ~2x headroom over the worst peak seen so far.
+    // Must run before vglInitExtended(): the buffers are sized from
+    // circular_data_pool_size at init time (vgl.c:364), not resizable after.
+    vglSetCircularPoolSize(64 * 1024 * 1024);
+
     // MULTISAMPLE_NONE + 12 MB (2026-09-06): the Asphalt-5 recipe from
     // port_progress.md Fase 12. The old 4X MSAA made every vglSwapBuffers()
     // pay a multisample resolve -- pure overhead during the minutes-long
@@ -50,6 +90,9 @@ void gl_init() {
 
 void gl_swap() {
     gl_frame_tick();
+    // TEMP triage (2026-09-10): our own bars, drawn last so nothing the engine
+    // does can paint over them. See gl_probe_selftest() in reimpl/gl.c.
+    gl_probe_selftest();
     vglSwapBuffers(GL_FALSE);
 }
 

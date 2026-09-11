@@ -105,6 +105,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/reimpl/asset_manager.cpp
                source/utils/dialog.c
                source/utils/glutil.c
+               source/utils/audio.c
                source/utils/init.c
                source/utils/logger.c
                source/utils/settings.c
@@ -143,9 +144,22 @@ target_compile_definitions(vitaGL_local PRIVATE VGL_GIT_HASH="vendorized")
 target_compile_options(vitaGL_local PRIVATE -Wno-incompatible-pointer-types -Wno-stringop-overflow -mfp16-format=ieee)
 # Add some usual speedhacks for ports, if not needed they can be removed
 target_compile_definitions(vitaGL_local PRIVATE
-    MATH_SPEEDHACK
-    VITA3K_SUPPORT
+    # Fase 24 (pantalla negra + GPU hangs sin error GL): el toolchain compila
+    # con -mfloat-abi=softfp (ver CMAKE_C_FLAGS arriba) pero SceGxm es
+    # hard-float. Sin HAVE_SOFTFP_ABI, vitaGL llama a sceGxmSetViewport
+    # directo: los floats llegan en R-regs, la callee lee VFP s-regs =
+    # viewport basura programado a la GPU (negro total, screenshots a cero,
+    # GPUCRASH aleatorios). El flag activa el shim naked
+    # sceGxmSetViewport_sfp (shared.h/vgl.c) que mueve R->s antes de saltar.
+    # Precedente: Asphalt-5-Vita (port Gameloft funcional, misma era FFP)
+    # compila su vitaGL con SOFTFP_ABI=1.
+    HAVE_SOFTFP_ABI
     SKIP_SPLASHSCREEN
+    # A proposito NO: MATH_SPEEDHACK ("may cause glitches" segun README,
+    # Asphalt-5 no lo usa), VITA3K_SUPPORT (dead flag: no aparece en este
+    # vitaGL vendored), NO_DEBUG (quita los safety checks), *_SPEEDHACK
+    # (README advierte crashes; DRAW_SPEEDHACK=2 solo si aparece agotamiento
+    # del temp pool de vertices, sin evidencia aqui).
     # TEMP triage (black screen + sticky GL_INVALID_ENUM every frame,
     # 2026-09-06): enables vitaGL's vgl_log() error lines
     # ("file:line: func set GL_INVALID_ENUM (param: 0xVALUE)"), which our
@@ -164,6 +178,9 @@ target_link_libraries(vitaGL_local PUBLIC vitashark_local)
 target_link_libraries(${CMAKE_PROJECT_NAME}
                       -Wl,--whole-archive pthread -Wl,--no-whole-archive
                       stdc++
+                      vorbisfile
+                      vorbis
+                      ogg
                       vitaGL_local
                       vitashark_local
                       SceShaccCgExt
