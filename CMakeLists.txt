@@ -84,14 +84,21 @@ endif()
 # makes sincos, sincosf, etc. visible
 add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O3 -g -ffast-math -mfloat-abi=softfp -Wno-deprecated")
-set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=gnu++20 -Wno-write-strings -Wno-psabi")
+set(COMMON_C_FLAGS "-Wl,-q -mfloat-abi=softfp -mcpu=cortex-a9 -mfpu=neon -fno-strict-aliasing -Wno-deprecated")
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COMMON_C_FLAGS} -O1 -g3")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${COMMON_C_FLAGS} -O1 -g3 -std=gnu++20 -Wno-write-strings -Wno-psabi")
+else()
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COMMON_C_FLAGS} -O3 -g0 -fomit-frame-pointer -ffast-math")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${COMMON_C_FLAGS} -O3 -g0 -fomit-frame-pointer -ffast-math -std=gnu++20 -Wno-write-strings -Wno-psabi")
+endif()
 
 add_executable(${CMAKE_PROJECT_NAME}
                source/main.c
                source/dynlib.c
                source/java.c
                source/patch.c
+               source/video.cpp
                source/reimpl/bits/_ctype.c
                source/reimpl/errno.c
                source/reimpl/gl.c
@@ -142,32 +149,44 @@ add_library(vitaGL_local STATIC ${VITAGL_SRC})
 target_include_directories(vitaGL_local PUBLIC lib/vitaGL/source)
 target_compile_definitions(vitaGL_local PRIVATE VGL_GIT_HASH="vendorized")
 target_compile_options(vitaGL_local PRIVATE -Wno-incompatible-pointer-types -Wno-stringop-overflow -mfp16-format=ieee)
-# Add some usual speedhacks for ports, if not needed they can be removed
+# Speed and optimization flags for vitaGL
 target_compile_definitions(vitaGL_local PRIVATE
-    # Fase 24 (pantalla negra + GPU hangs sin error GL): el toolchain compila
-    # con -mfloat-abi=softfp (ver CMAKE_C_FLAGS arriba) pero SceGxm es
-    # hard-float. Sin HAVE_SOFTFP_ABI, vitaGL llama a sceGxmSetViewport
-    # directo: los floats llegan en R-regs, la callee lee VFP s-regs =
-    # viewport basura programado a la GPU (negro total, screenshots a cero,
-    # GPUCRASH aleatorios). El flag activa el shim naked
-    # sceGxmSetViewport_sfp (shared.h/vgl.c) que mueve R->s antes de saltar.
-    # Precedente: Asphalt-5-Vita (port Gameloft funcional, misma era FFP)
-    # compila su vitaGL con SOFTFP_ABI=1.
     HAVE_SOFTFP_ABI
     SKIP_SPLASHSCREEN
-    # A proposito NO: MATH_SPEEDHACK ("may cause glitches" segun README,
-    # Asphalt-5 no lo usa), VITA3K_SUPPORT (dead flag: no aparece en este
-    # vitaGL vendored), NO_DEBUG (quita los safety checks), *_SPEEDHACK
-    # (README advierte crashes; DRAW_SPEEDHACK=2 solo si aparece agotamiento
-    # del temp pool de vertices, sin evidencia aqui).
-    # TEMP triage (black screen + sticky GL_INVALID_ENUM every frame,
-    # 2026-09-06): enables vitaGL's vgl_log() error lines
-    # ("file:line: func set GL_INVALID_ENUM (param: 0xVALUE)"), which our
-    # loader forwards into the session log -- see vgl_log_capture() in
-    # source/reimpl/gl.c and lib/vitaGL/source/utils/debug_utils.h.
-    # Remove once the offender is fixed (it also costs a printf per error).
-    LOG_ERRORS
+    SKIP_ERROR_HANDLING
+    HAVE_WVP_ON_GPU
+    HAVE_SHADER_CACHE
+    TEXTURES_SPEEDHACK
+    DISABLE_TILE_CLIPPER
+    DISABLE_TEXTURE_COMBINER
+    SAMPLERS_SPEEDHACK
+    # Adoptado de Asphalt-6-Vita (mismo fork de vitaGL, confirmado en consola con
+    # una escena 3D mas pesada que la de este juego): matematica interna mas
+    # rapida para matrices. Deliberadamente NO se suma CIRCULAR_POOL_SPEEDHACK
+    # (tambien usado por Asphalt 6) -- este proyecto ya tuvo overruns reales del
+    # circular pool con triple buffer (Fase 29, corregido subiendo a 64MB); pasar
+    # a buffer unico revive ese riesgo sin evidencia de que ayude aca.
+    MATH_SPEEDHACK
 )
+# SAFER_DRAW_SPEEDHACK (Fase 37) DESACTIVADO de nuevo (Fase 39): en
+# lib/vitaGL/source/ffp.c (_glDrawArrays_FixedFunctionIMPL /
+# _glMultiDrawArrays_FixedFunctionIMPL), para streams de color/normal/generico
+# de un draw grande (>0x8000 bytes -- exactamente "mallas 3D de vehiculos,
+# edificios y personajes" segun el propio comentario que introdujo el flag),
+# activarlo hace que el puntero del vertex array del ENGINE se mande directo a
+# sceGxmSetVertexStream() sin el memcpy a un buffer temporal del circular pool.
+# Eso es una lectura de la GPU sobre memoria que la CPU puede seguir escribiendo/
+# reciclando en el frame siguiente -- exactamente la misma clase de carrera
+# CPU/GPU que Asphalt-6-Vita documenta y por la que excluye deliberadamente
+# BUFFERS_SPEEDHACK ("provoca condicion de carrera... sobre los VBOs de los
+# vehiculos -- ruedas, suspension, geometria animada -- causando el glitch
+# grafico", CMakeLists.txt de ese port). Encaja con el sintoma reportado en
+# consola real: personajes y vehiculos (mallas grandes) en negro, edificios
+# estaticos bien (mallas chicas, siguen por el camino con copia). Si el color
+# por-vertice llega en cero/basura por la carrera, el GL_MODULATE
+# textura*color final da negro. Reactivar (agregarlo de nuevo a la lista de
+# arriba) solo si se confirma en consola que NO era esto.
+# target_compile_definitions(vitaGL_local PRIVATE SAFER_DRAW_SPEEDHACK)
 
 add_library(vitashark_local STATIC lib/vitashark/source/vitashark.c)
 target_include_directories(vitashark_local PUBLIC lib/vitashark/source)
@@ -207,6 +226,8 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
                       SceNetCtl_stub
                       SceCtrl_stub
                       SceGxm_stub
+                      SceAvPlayer_stub
+                      SceSysmodule_stub
                       ScePower_stub
                       SceTouch_stub
                       SceVshBridge_stub

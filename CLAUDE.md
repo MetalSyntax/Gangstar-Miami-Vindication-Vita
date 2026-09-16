@@ -39,6 +39,12 @@ elegí "Continuar con un port existente" apuntando a esta carpeta.
    y el latido de frames. Preferir release para reproducir; debug solo para cazar un bug puntual.
 4. **La firma Java no dice en qué tabla JNI va un método** -- hay que mirar por qué offset de
    `JNINativeInterface` lo llama el `.so`.
+5. **`SceAvPlayer` solo decodifica H.264/AVC por hardware.** Los `.m4v`/`.mp4` de APKs viejos
+   (2011, como este) suelen ser MPEG-4 Part 2 (Simple Profile) -- se abren bien (contenedor MP4
+   válido) pero no producen ni un frame de video. Antes de asumir un bug en el código del
+   reproductor, correr `ffprobe` sobre el asset y confirmar `codec_name=h264`; si no lo es,
+   transcodificar (`ffmpeg -c:v libx264 -profile:v baseline -level 3.0 -pix_fmt yuv420p`) antes
+   de tocar una sola línea de C (ver Fase 38 en `port_progress.md`).
 
 ## Flujo de trabajo esperado
 

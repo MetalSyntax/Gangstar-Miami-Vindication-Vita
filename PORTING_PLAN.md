@@ -191,8 +191,21 @@ jamás `sceClibPrintf(buf)`. El motor manda mensajes con `%s` adentro.
   playRadio/playSound cada frame al leer siempre "not playing".
 - [x] **Salida limpia**: `Gangster2.Exit()` (`java.c`) termina el proceso
   en vez de colgar en el loop `Native Exit Triggered` del log 036.
-- [ ] **Video**: sin portar. `loadMovie()` devuelve 1 y dispara
-      `nativeSetOnVideoCompletion()` al instante, como si el clip terminara solo (Fase 6).
+- [x] **Video**: `intro.m4v` real vía SceAvPlayer (`source/video.cpp`, portado
+      de Shadow Guardian-vita). `Method_loadMovie` (`java.c`) llama a
+      `video_play(name)` -- decodifica NV12, convierte a RGB por GPU con un
+      shader GLES2 propio (vitaGL soporta esto aunque el motor solo vea GLES
+      1.1), letterbox a 960x544, audio por `sceAudioOut` en hilo dedicado,
+      saltable con Cruz/Start -- y solo entonces dispara
+      `nativeSetOnVideoCompletion()`. `video_play()` nunca cuelga (Fase 33).
+      **Importante (Fase 38):** el `.so`/APK trae `intro.m4v` en MPEG-4 Part 2
+      (Simple Profile) -- el decodificador por hardware de `SceAvPlayer` **solo
+      soporta H.264/AVC**, así que el asset original no se reproduce aunque el
+      código esté bien. El `intro.m4v` en `ux0_data/` ya está transcodificado a
+      H.264 Baseline L3.0 + AAC (original en `intro.m4v.orig`); si el APK se
+      re-extrae desde cero, hay que repetir la transcodificación antes de
+      copiar el asset a la consola:
+      `ffmpeg -i intro.m4v -c:v libx264 -profile:v baseline -level 3.0 -pix_fmt yuv420p -c:a aac -b:a 160k -ar 48000 -ac 2 -movflags +faststart <salida>`.
 - [ ] **Ciclo de vida incompleto**: `nativePause`/`nativeResume`/`nativeAccelerometer`/`nativeDone`/
       `nativeOpenIGM`/`nativeCanInterrupt` están exportados pero **no cableados** en `main.c`.
       Hacen falta para suspender/reanudar la consola y para el menú in-game.

@@ -33,6 +33,8 @@ int gl_shot(const char *path);
 
 void glCompileShader_soloader(GLuint shader);
 
+void glLinkProgram_soloader(GLuint program);
+
 void glShaderSource_soloader(GLuint shader, GLsizei count,
                              const GLchar **string, const GLint *_length);
 

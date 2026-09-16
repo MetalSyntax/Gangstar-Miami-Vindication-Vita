@@ -12,6 +12,7 @@
 
 #include "utils/audio.h"
 #include "utils/logger.h"
+#include "video.h"
 
 extern so_module so_mod;
 
@@ -450,20 +451,24 @@ jint Method_DisableLaunchGame(jmethodID id, va_list args) { return 0; }
 // isMediaPlaying(int) -> int: real backend version lives in the Audio
 // section above (Method_isMediaPlaying -> audio_is_media_playing).
 
-// loadMovie(String) -> int. Video playback isn't ported (no real Android
-// Activity/VideoView here) -- but the real Java side always returns 1 (see
-// GLMediaPlayer.java) and, whether the clip plays to completion or the user
-// hits skip, MyVideoView eventually calls the native
+// loadMovie(String) -> int. On Android, GLMediaPlayer.loadMovie() launches
+// the MyVideoView Activity, which plays the clip and, whether it finishes
+// normally or the user hits skip, calls the native
 // Java_..._MyVideoView_nativeSetOnVideoCompletion() export exactly once to
 // hand control back to the engine (that's what it was waiting for while the
 // screen stayed black -- confirmed against the log, the engine got stuck
 // polling GetDeviceSoundType right after this call with no completion ever
-// arriving). Standing in for the whole video system: return 1 and fire that
-// same completion callback immediately, as if every clip finishes instantly.
+// arriving). video_play() (source/video.cpp) is the real playback path --
+// SceAvPlayer decoding intro.m4v, letterboxed to the screen, skippable with
+// Cross/Start -- and it always returns (never hangs) even if the file is
+// missing or the decoder fails, so firing the completion callback right
+// after it is unconditionally safe.
 jint Method_loadMovie(jmethodID id, va_list args) {
     JavaString *js = va_arg(args, JavaString *);
     const char *name = (js && js->utf8) ? (const char *) js->utf8->array : "(null)";
-    fjni_logv_info("[JNI] loadMovie(\"%s\"): not implemented, skipping straight to completion", name);
+    fjni_logv_info("[JNI] loadMovie(\"%s\")", name);
+
+    video_play(name);
 
     static void (*nativeSetOnVideoCompletion)(JNIEnv *, jclass) = NULL;
     static int resolved = 0;

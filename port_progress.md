@@ -3,7 +3,261 @@
 > Bitácora cronológica, un bug confirmado a la vez. Para el estado **estructural** del port (motor,
 > mapa JNI, filesystem, niveles de logging, checklist) ver `PORTING_PLAN.md`.
 
-## Estado actual — 2026-09-11 (Fase 32: audio estridente = stride stereo aplicado a ogg mono + overdrive sin cota)
+## Estado actual — 2026-09-15 (Fase 39: rendimiento por fin jugable (20-30 fps) — personajes/vehículos en negro + freeze al subir a un auto, `logs/debug_local_043.log`)
+
+**Buena noticia primero:** con el fix de la Fase 38 el usuario confirma que el juego **va rápido y
+es casi jugable a 20-30 fps** -- primera vez que llega a ver gameplay real de 3ra persona con
+vehículos. Eso es lo que expone los dos síntomas nuevos de este log (antes eran invisibles: nunca
+se llegaba a correr lo bastante rápido para verlos).
+
+### Síntoma 1: personaje jugable y vehículos en negro (no todos los objetos)
+
+**Lo que dice el log:** líneas 63-71 -- `[ALOG][GameLoft Printer::logf] parameter type mismatch
+when setting "%s/%s": want %s, got %s` seguido de fallos de `fopen` sobre `dummy.tga` (que no
+existe, confirmado ya en la Fase 13). Esto **ya se investigó a fondo en la Fase 18** (tabla de
+mensajes `[ALOG]` cruzada con Ghidra) y se concluyó explícitamente: "ninguno de estos caminos
+anula alpha, saltea el bind de la textura diffuse, ni cae a un material negro por defecto" --
+o sea que este mensaje puntual **no es la causa** (lo vuelve a mostrar el log de ahora, pero es el
+mismo ruido de siempre, ya descartado).
+
+**Causa más probable (nueva, verificada en el código de vitaGL, no solo por el README):**
+`SAFER_DRAW_SPEEDHACK`, agregado en la Fase 37. En
+`lib/vitaGL/source/ffp.c` (`_glDrawArrays_FixedFunctionIMPL` /
+`_glMultiDrawArrays_FixedFunctionIMPL`, líneas ~1243-1275), para un draw con más de `0x8000` bytes
+de datos de color/normal/vértice -- **exactamente** "mallas 3D de vehículos, edificios y
+personajes" según el propio comentario que agregó el flag -- en vez de copiar el array a un buffer
+temporal del circular pool (`gpu_alloc_mapped_temp` + `vgl_fast_memcpy`), manda el puntero crudo
+del array cliente del motor directo a `sceGxmSetVertexStream()`. Eso es la GPU leyendo memoria que
+la CPU puede seguir escribiendo/reciclando en el frame siguiente (el motor recalcula el color
+por-vértice de la iluminación dinámica cada frame para actores animados, algo que edificios
+estáticos con solo textura/lightmap no necesitan -- coincide con "no todos").
+**Precedente directo:** `Asphalt-6-Vita` excluye deliberadamente el flag hermano
+`BUFFERS_SPEEDHACK` por la misma razón, documentado en su propio `CMakeLists.txt`: "provoca
+condición de carrera CPU/GPU... sobre los VBOs de los vehículos (ruedas, suspensión, geometría
+animada), causando el glitch gráfico". Mismo mecanismo, mismo tipo de objeto afectado.
+
+**Fix aplicado (a confirmar en consola):** `SAFER_DRAW_SPEEDHACK` sacado de
+`target_compile_definitions(vitaGL_local ...)` en `CMakeLists.txt` (queda comentado con la
+explicación completa, no borrado). Build verde. Costo: los draws grandes (autos/personajes)
+vuelven a pagar el memcpy a buffer temporal -- algo más de CPU en esas mallas, pero no debería
+tirar de vuelta a los ~9 fps de antes de la Fase 34-37 (esa mejora vino de otro lado: overclock,
+cachés de I/O/audio, bypass de shims).
+
+### Síntoma 2: freeze de varios segundos al subir a un vehículo
+
+**Evidencia exacta en el log:** frame 186 con `render 12714 ms` (¡12.7 segundos en un solo
+frame!) y frame 188 con `16241 ms` más -- el promedio de esa ventana cae a `0.1-0.3 fps`. Es
+la clase de estancamiento **ya documentada y entendida** desde las Fases 17-19 (ráfaga de
+compilación/link de shaders FFP + carga de assets nuevos la primera vez que aparece una
+combinación de material no vista todavía), aplicada ahora al vehículo en vez de al título. El
+caché en disco de shaders FFP (`ux0:data/shader_cache/v28/`, Fase 27) debería evitar que esto se
+repita para el MISMO modelo de vehículo en una sesión futura; la primera vez que aparece un
+vehículo nuevo (o el primero de la partida) sigue pagando este costo.
+**No se tocó código para esto** -- no hay evidencia de que sea un bug nuevo, y en Ghidra no
+aparece ninguna lógica de fade/pantalla de carga oculta para la entrada a vehículo que estemos
+rompiendo (buscado en la Fase 18, sin resultado). Si el freeze se repite en el MISMO vehículo en
+la MISMA sesión (no solo la primera vez), eso sí sería nueva evidencia de que el caché de shaders
+no está sirviendo y ahí habría que mirar de nuevo.
+
+### Pendiente
+
+- Repetir el intro (Fase 38) y esta build (`SAFER_DRAW_SPEEDHACK` fuera) en consola real y mandar
+  un log fresco. Si los personajes/vehículos siguen en negro, el siguiente sospechoso concreto es
+  `SKIP_ERROR_HANDLING` (global, deshabilita todos los chequeos de vitaGL) o `HAVE_WVP_ON_GPU`
+  (mueve el WVP a GPU -- no debería tocar color, pero es la única otra pieza nueva de la Fase 34
+  que toca el camino de vértices).
+
+## Estado previo — 2026-09-15 (Fase 38: video del intro seguía sin reproducirse — el .m4v original no es H.264 — + MATH_SPEEDHACK de Asphalt-6-Vita)
+
+**Punto de partida:** el usuario probó en consola real el fix de video de la Fase 35 y el
+rendimiento tras la Fase 37: el intro seguía sin verse, y el juego sigue "super lento".
+
+**Diagnóstico del video (confirmado con `ffprobe`, no era un bug de `video.cpp`):**
+- `ux0_data/gangstarmiamivindication/data/intro.m4v` original: video `mpeg4` (MPEG-4 Part 2,
+  Simple Profile, `mp4v`) + audio `aac`. El decodificador de video **por hardware** de la Vita
+  que usa `SceAvPlayer` solo soporta **H.264/AVC** -- MPEG-4 Part 2 (el "DivX/Xvid" de los
+  Android viejos de 2011) no es un formato que sepa decodificar, así que `sceAvPlayerAddSource`
+  nunca produce frames de video reales (de ahí que no se viera nada, aunque el código de
+  `video.cpp` esté bien: nunca tuvo un stream que decodificar).
+- Contraste que confirma el diagnóstico: `Shadow-Guardian-vita/ux0_data/shadowguardian/video/logo.m4v`
+  (de donde se portó `video.cpp`) es nativamente H.264+AAC -- por eso ese port nunca necesitó
+  transcodificar nada y el mismo código allá "simplemente funcionaba".
+
+**Fix (asset, no código):**
+- Transcodificado con `ffmpeg` a H.264 Constrained Baseline Level 3.0, `yuv420p`, mismo tamaño
+  800x500, audio AAC-LC 48kHz estéreo re-encodeado a 160kbps, `+faststart`:
+  `ffmpeg -i intro.m4v.orig -c:v libx264 -profile:v baseline -level 3.0 -pix_fmt yuv420p -preset slow -crf 20 -c:a aac -b:a 160k -ar 48000 -ac 2 -movflags +faststart intro.m4v`
+- Original preservado en `ux0_data/gangstarmiamivindication/data/intro.m4v.orig` (carpeta
+  gitignoreada, sin riesgo de commitear el asset con copyright). El `.m4v` transcodificado pesa
+  634 KB contra 1.19 MB del original (bitrate más eficiente, doble beneficio: decodificable y
+  más rápido de leer por FTP/UMD virtual).
+- **Pendiente:** subir el archivo nuevo a la consola real (mismo path,
+  `ux0:data/gangstarmiamivindication/data/intro.m4v`) y confirmar reproducción -- el FTP de
+  VitaShell (puerto 1337) no respondía durante esta sesión para subirlo directo.
+
+**Rendimiento -- MATH_SPEEDHACK adoptado de Asphalt-6-Vita (`CMakeLists.txt`):**
+- Comparación con `Asphalt-6-Vita` (mismo fork vendorizado de vitaGL, confirmado por
+  presencia/ausencia de los mismos nombres de macro en `lib/vitaGL/source`): usa
+  `CIRCULAR_POOL_SPEEDHACK`, `MATH_SPEEDHACK` y `NO_DMAC` además de las que ya tenía este
+  proyecto desde la Fase 37. `NO_DMAC` no existe en este vitaGL vendorizado (0 referencias en
+  `lib/vitaGL/source`, fork distinto al de Asphalt 6 en ese punto). Se suma **solo**
+  `MATH_SPEEDHACK` (matemática interna de matrices más rápida) -- confirmado funcionando en un
+  juego 3D más pesado que este con el mismo fork.
+- **Deliberadamente NO se suma `CIRCULAR_POOL_SPEEDHACK`**: este proyecto tuvo overruns reales
+  del circular pool con triple buffer (Fase 29, "Circular pool overrun on frame N", ~37% de los
+  frames, corregido subiendo el pool a 64 MB) -- pasar a un único buffer revive ese riesgo
+  concreto sin evidencia de que compense aquí.
+- Overclock de reloj (ARM 444/Bus 222/GPU 222/GpuXbar 166), los speedhacks de la Fase 37 y las
+  cachés de I/O/audio de la Fase 34 **ya igualan** la receta de Asphalt-6-Vita en esos puntos --
+  no hacía falta repetirlos.
+- Build verde con `psvita-toolkit build --preset release`.
+
+**Por qué no se tocó nada más de rendimiento:** ninguno de los logs locales
+(`logs/debug_local_0*.log`) es posterior a la Fase 34 -- las Fases 34-37 nunca se confirmaron
+con un log fresco de hardware, así que no hay telemetría real de qué sigue costando fps ahora.
+Seguir sumando flags de vitaGL a ciegas arriesga meter un glitch nuevo sin certeza de que ayude.
+**Siguiente paso real:** capturar un log fresco (`psvita-toolkit logs-live` mientras corre el
+juego, o `perf-telemetry`) para confirmar si el overrun del circular pool (Fase 29) sigue siendo
+la causa dominante o si cambió con los cambios de Fase 34-37.
+
+## Estado previo — 2026-09-15 (Fase 37: optimizaciones de rendimiento — vitaGL speedhacks, flags de compilador y bypass de shims en hotpaths)
+
+**Punto de partida:** Análisis comparativo de optimizaciones de rendimiento basado en `README VITAGL.md`, la implementación de referencia en `asphalt8-vita-main` y el código del motor descompilado (`out_ghidra.c`).
+
+**Diagnóstico y optimizaciones aplicadas:**
+1. **vitaGL Speedhacks (`CMakeLists.txt`):**
+   - `SAFER_DRAW_SPEEDHACK` (`DRAW_SPEEDHACK=2` en `README VITAGL.md` y `asphalt8-vita-main`): Para draws con más de 32 KB (`0x8000`) de datos de vértices (mallas 3D de vehículos, edificios y personajes de Gangstar), vitaGL omite la asignación temporal (`gpu_alloc_mapped_temp`) y el copiado en CPU (`vgl_fast_memcpy`), mapeando los punteros directamente.
+   - `DISABLE_TEXTURE_COMBINER` (`NO_TEX_COMBINER=1` en `README VITAGL.md`): Verificado en Ghidra y desensamblado que Gangstar nunca utiliza `GL_COMBINE` (0x8570), sino la tubería fija estándar de GLES 1.1 (`GL_MODULATE`, `GL_REPLACE`, etc.). Deshabilitar el combiner elimina la evaluación de estados complejos de texturas y genera shaders de tubería fija (FFP) más compactos y veloces.
+   - `SAMPLERS_SPEEDHACK` (`SAMPLERS_SPEEDHACK=1` en `README VITAGL.md`): Elimina bucles redundantes de resolución de samplers en vitaGL.
+2. **Flags de Compilación ARM Cortex-A9 (`CMakeLists.txt`):**
+   - Anteriormente se usaba `-O3 -g` de manera estática sin omitir el frame pointer. Se bifurcó la configuración entre `Debug` (`-O1 -g3`) y no-Debug/Release:
+   - Añadido `-O3 -g0 -fomit-frame-pointer -ffast-math`. En arquitectura ARM Cortex-A9 (ARMv7-A de 32 bits con pocos registros de propósito general), `-fomit-frame-pointer` libera el registro `r7`/`r11` para la optimización de registros del compilador en bucles matemáticos y de renderizado.
+3. **Bypass de Wrappers/Shims en Hotpaths (`source/dynlib.c`):**
+   - En `USE_SCELIBC_IO`, `fread` y `fseek` ahora se enlazan directamente a `&sceLibcBridge_fread` y `&sceLibcBridge_fseek` (salvo que `IO_TRACE_STREAMS` esté activado), eliminando una capa de llamada en los miles de accesos a archivos de streaming y modelos `.bdae`.
+   - `glClear` y `glClearColor` se enlazan directamente a las funciones de vitaGL (`&glClear` y `&glClearColor`), quitando la sobrecarga de `glClearColor_soloader` (que ejecutaba formateo y logging `l_note`).
+4. **Alivio del Bucle de Presentación (`source/utils/glutil.c`):**
+   - En `gl_swap()`, las llamadas diagnósticas `gl_frame_tick()` (que ejecuta `glGetError()` y temporizador cada frame) y `gl_probe_selftest()` se encerraron bajo `#ifdef DEBUG_SOLOADER`, dejando el intercambio de buffers directo en builds Release.
+5. **Verificación:** Build exitoso mediante `psvita-toolkit build` generando el VPK final sin errores.
+
+## Estado previo — 2026-09-15 (Fase 36: corrección del mapeo táctil — compensación del stretch vertical 544 vs 480)
+
+**Punto de partida:** El usuario reportó que para presionar los botones en pantalla había que tocar en una ubicación ligeramente desfasada, como si la UI estuviera a otra resolución ("debo tocar en una ubicacion ligeramente diferente como si tuviera otra resolucion para los botones").
+
+**Diagnóstico (cruce Ghidra + logs):**
+1. En `out_ghidra.c`, `Application::Init` (0x284f48) y `GameRenderer_nativeResize` (0x373798) tienen cableada la altura interna del motor a `480` (`0x1e0`), mientras el ancho se consulta mediante `nativegetDeviceWidth()` (`960`).
+2. En la Fase 26, para eliminar la barra negra superior de 64 px (`544 - 480 = 64`), `glViewport_soloader` y `glScissor_soloader` (`source/reimpl/gl.c`) escalan la geometría sobre el framebuffer por defecto verticalmente multiplicando por `544 / 480`.
+3. Por consiguiente, cualquier botón dibujado por el motor en `y` se muestra visualmente en la pantalla de la Vita en `y_screen = y * 544 / 480` (un ~13.3% más abajo).
+4. Sin embargo, `source/main.c` mapeaba el touch directamente a la resolución del panel físico (`GAME_H = 544`):
+   `int y = touch.report[r].y * GAME_H / 1088;`
+   enviando `y_screen` (0..544) directamente a `GameGLSurfaceView_nativeOnTouch`, en lugar de proyectarlo de vuelta al espacio interno del motor (0..480).
+5. Como resultado, las hitboxes de colisión del motor esperaban coordenadas en 0..480, provocando un desfase vertical acumulativo de hasta 64 píxeles hacia la parte inferior de la pantalla.
+
+**Fix (`source/main.c`):**
+- Definidas explícitamente `SCREEN_W = 960`, `SCREEN_H = 544` (panel Vita) y `ENGINE_W = 960`, `ENGINE_H = 480` (espacio interno del motor).
+- `Gangster2_nativeSetPhone` y `GameRenderer_nativeResize` ahora reciben `ENGINE_W` y `ENGINE_H`.
+- El mapeo táctil frontal ahora mapea correctamente de las coordenadas físicas del touchpad a las coordenadas esperadas por el motor:
+  `int x = (touch.report[r].x * ENGINE_W) / 1920;`
+  `int y = (touch.report[r].y * ENGINE_H) / 1088;`
+  con clamping a `[0, ENGINE_W - 1]` y `[0, ENGINE_H - 1]`.
+- Build verificado y generado exitosamente con `psvita-toolkit build`.
+
+## Estado previo — 2026-09-15 (Fase 35: video de intro real vía SceAvPlayer, portado de Shadow Guardian-vita)
+
+**Punto de partida:** desde la Fase 6, `Method_loadMovie` (`source/java.c`) no reproducía
+`intro.m4v` en absoluto -- solo devolvía 1 y disparaba
+`Java_..._MyVideoView_nativeSetOnVideoCompletion()` al instante para no colgar el motor, que
+espera esa señal antes de seguir hacia el título (ver `PORTING_PLAN.md` sección "Video", antes
+marcada como deuda sin portar).
+
+**Fix (adaptado de `Shadow-Guardian-vita/source/video.cpp`, mismo linaje de soloader):**
+- `source/video.cpp`/`video.h` (nuevos): `video_init()` carga `SCE_SYSMODULE_AVPLAYER`;
+  `video_play(name)` decodifica el `.m4v` con `SceAvPlayer` (NV12), convierte a RGB **en GPU**
+  con un programa GLES2 propio (`glCreateShader`/`glUseProgram` vía vitaGL directo -- el motor
+  del juego solo ve la tubería fija de GLES 1.1 spoofeada en `reimpl/gl.c`, pero nuestro código
+  nativo no pasa por esa capa, así que puede usar shaders sin contradecir el hallazgo confirmado
+  en `PORTING_PLAN.md`), letterboxea a 960x544 preservando aspecto, y reproduce el audio del clip
+  por un puerto `sceAudioOut` dedicado en su propio hilo. El allocator de texturas de video tiene
+  fallback en 3 niveles (CDRAM -> PHYCONT -> UNCACHE) por si vitaGL ya reservó la memoria
+  contigua típica en `gl_init()`. Saltable con Cruz o Start; nunca cuelga (timeout de espera de
+  decodificador + siempre retorna), así que el completion callback puede dispararse
+  incondicionalmente después.
+- `source/java.c`: `Method_loadMovie` ahora llama a `video_play(name)` antes de
+  `nativeSetOnVideoCompletion()`, en vez de saltarse la reproducción.
+- `source/main.c`: `video_init()` se llama una vez, justo después de `gl_init()` (el allocator de
+  texturas de video necesita el contexto GXM que `vglInitExtended()` deja levantado).
+- `source/utils/glutil.{c,h}`: agregado `glLinkProgram_soloader()` (link + chequeo de
+  `GL_LINK_STATUS` con log de error), mismo patrón que `glCompileShader_soloader`, para el
+  programa de conversión YUV->RGB del video.
+- `CMakeLists.txt`: `source/video.cpp` agregado al build; enlazadas `SceAvPlayer_stub` y
+  `SceSysmodule_stub`.
+- Resolución de ruta: `GLMediaPlayer.loadMovie()` en Android arma la ruta como
+  `"/sdcard/gameloft/games/Gangstar2//" + movieName` -- la misma raíz de assets externos que el
+  toolkit extrajo a `DATA_PATH "data/"` (igual que `res_open()` en `java.c`) -- así que
+  `video_play()` prueba `DATA_PATH "data/<name>"` primero; el archivo real vive en
+  `ux0_data/gangstarmiamivindication/data/intro.m4v`.
+
+**Build:** pendiente de compilar/desplegar y confirmar en consola real (Fase 34 quedó verde en
+release; este cambio no se probó todavía en hardware).
+
+## Estado previo — 2026-09-14 (Fase 34: optimización integral de velocidad — vitaGL speedhacks, cachés en memoria, búferes I/O y bypass de shims)
+
+**Punto de partida:** El port ya es funcional y estable en steady-state con audio y renderizado, pero requería mejoras sustanciales en rendimiento, velocidad de carga y fluidez general de gameplay mediante la aplicación de speedhacks de vitaGL y cachés de código.
+
+**Optimizaciones implementadas:**
+1. **Flags y optimizaciones de vitaGL (`README VITAGL.md` y `CMakeLists.txt`):**
+   - `SKIP_ERROR_HANDLING` (`NO_DEBUG=1`): Desactiva completamente las comprobaciones de error de OpenGL en cada llamada de API (glUniform, glVertexPointer, glBindTexture, etc.), reduciendo sustancialmente el coste de CPU en el Cortex-A9.
+   - `HAVE_WVP_ON_GPU` (`HAVE_WVP_ON_GPU=1`): Traslada la multiplicación de la matriz World-View-Projection de la CPU al vertex shader en la GPU SGX543 de la Vita, liberando la CPU en cada draw call con transformaciones sucias.
+   - `HAVE_SHADER_CACHE` (`HAVE_SHADER_CACHE=1`): Habilita el caché automático de shaders acelerado por xxHash3.
+   - `TEXTURES_SPEEDHACK` (`TEXTURES_SPEEDHACK=1`): Optimiza `glTexSubImage2D` evitando duplicaciones y reasignaciones de memoria de texturas y anulando el seguimiento `last_frame`.
+   - `DISABLE_TILE_CLIPPER` (`NO_TILE_CLIPPER=1`): Reduce la carga de CPU en la configuración del scissor test y tile clipping.
+   - Eliminado `LOG_ERRORS` para evitar el formateo y reenvío de logs internos de vitaGL.
+2. **Optimizaciones de compilador para ARM Cortex-A9 (`CMakeLists.txt`):**
+   - Inclusión de `-mcpu=cortex-a9 -mfpu=neon -fno-strict-aliasing -O3 -ffast-math` para aprovechar la unidad vectorial NEON y el pipeline del hardware de PS Vita.
+3. **Caché y aceleración de I/O (`source/reimpl/io.c`, `lib/fios/fios.c`, `source/main.c`):**
+   - `s_path_cache`: Caché hash en memoria de 512 ranuras para `_path_translate()`. Convierte la traducción repetitiva de rutas Android a Vita (ejecutada miles de veces por frame/carga para archivos como `.bdae`, `.bsprite`, `.gmap`) en una búsqueda O(1) inmediata en RAM sin recalcular prefijos ni duplicar cadenas.
+   - Búfer de flujo de 64 KB en `fopen_soloader`: `sceLibcBridge_setvbuf(ret, NULL, _IOFBF, 64 * 1024)` para todos los archivos abiertos en modo lectura. Convierte las miles de lecturas diminutas de 2-16 bytes de los contenedores 3D en lecturas en bloque desde RAM, reduciendo transiciones al kernel.
+   - Aumento de `sceLibcHeapSize` de 4 MB a 8 MB en `source/main.c` para alojar con holgura los búferes de flujo.
+   - Aumento del caché RAM de FIOS2 (`RAMCACHEBLOCKNUM`) de 64 (8 MB) a 128 (16 MB) en `lib/fios/fios.c`.
+4. **Bypass de shims y fast-path directo (`source/dynlib.c`):**
+   - `memcpy`, `__aeabi_memcpy`, `__aeabi_memcpy4`, `__aeabi_memcpy8` apuntan directamente a `sceClibMemcpy` en ensamblador nativo, eliminando la sobrecarga condicional de `memcpy_soloader`.
+   - `glVertexPointer`, `glColorPointer`, `glTexCoordPointer`, `glNormalPointer` se enlazan directamente a las funciones de vitaGL sin pasar por el bucle de `gl_note_once`.
+   - `glDrawArrays`, `glDrawElements`, `glTexImage2D`, `glTexSubImage2D`, `glCopyTexSubImage2D`, `glCompressedTexImage2D` se enlazan directamente a vitaGL sin capas intermedias de diagnóstico.
+5. **Cachés de Audio y afinidad de hilos (`source/utils/audio.c`):**
+   - `sound_exists_cache`: Array estático de 1737 entradas que guarda en memoria la existencia de cada archivo de sonido. Elimina cientos de llamadas a `fopen()`/`fclose()` en el disco durante las consultas de `audio_is_loaded` y `audio_is_loaded_big`.
+   - Ampliación de `SFX_CACHE_MAX` de 40 a 128 ranuras y sustitución del desalojo ciego del slot 0 por algoritmo LRU (Least Recently Used) real con marcas de tick. Los efectos comunes (disparos, motor, UI, pisadas) permanecen en memoria sin requerir relecturas ni descompresiones OGG.
+   - Afinidad del hilo de audio (`gmv_audio_mix`) fijada a `SCE_KERNEL_CPU_MASK_USER_2` (Core 2 de la Vita) para que la mezcla y descompresión no compitan con el hilo de render y lógica del Core 0.
+
+**Build:** Verde en release 2026-09-14 (`eboot.bin` y `gangstarmiamivindication.vpk` generados limpiamente con código de salida 0).
+
+## Estado previo — 2026-09-14 (Fase 33: música seguía estridente tras la Fase 32 -- skip periódico en el streaming + limiter añadido)
+
+**Causa (revisión de `source/utils/audio.c`, bug propio, no reportado antes en hardware porque la
+Fase 32 nunca se confirmó jugando):** el path streamed (`playSoundBig`, música/radio/voz)
+reconstruía `dec_scratch` desde cero en cada tick del mixer, decodificando `need` frames nuevos del
+`.ogg` pero solo consumiendo `~need - (OUT_FRAMES*step)` de ellos antes de tirar el resto y volver a
+decodificar desde la posición ya avanzada del stream. Con música a 44100 Hz eso descartaba ~7-8
+frames de cada ventana de 2048 muestras de salida -- un salto periódico a la frecuencia de buffer
+(48000/2048 ≈ 23.4 Hz), audible como un zumbido/chirrido constante encima de la música. El SFX
+cacheado (decodificado entero una sola vez) no tenía este bug.
+
+**Fix:**
+- `big_voice_t` ahora tiene un buffer de decodificación **persistente por voz** (`buf`,
+  `BIG_BUF_CAP = OUT_FRAMES + 64` frames) más una posición fraccionaria (`frac_pos`). Cada tick
+  del mixer completa el buffer (append, nunca lo reconstruye) y al final compacta: descarta solo
+  los frames enteros ya consumidos y conserva el resto + la fracción exacta para el próximo tick.
+  Cero frames descartados = sin el salto periódico.
+- `soft_clip16()` reemplaza el clamp duro final: por debajo de 24000 pasa la muestra sin tocar,
+  por encima comprime asintóticamente hacia ±32767 en vez de recortar en cuadrada -- si varias
+  voces se suman y pasan de escala, satura suave en lugar de la distorsión dura típica de
+  "estridente".
+- `dec_scratch` (scratch compartido, ahora innecesario) eliminado; `braw` (scratch de lectura
+  ogg) se mantiene igual, por voz y de forma secuencial.
+
+**Build:** verde release 2026-09-14 (`psvita-toolkit build --preset release`, cero warnings nuevos
+en `audio.c`). **Sin desplegar todavía** (requiere consola con FTP): al correr, esperar música/radio
+limpios sin zumbido de fondo, y SFX superpuestos sin crujido duro al pasar de escala.
+
+## Estado previo — 2026-09-11 (Fase 32: audio estridente = stride stereo aplicado a ogg mono + overdrive sin cota)
 
 **Causa (revisión de `source/utils/audio.c`, bug propio):** tanto el cache de SFX como el
 streaming calculaban offsets y contaban frames como si todo fuera stereo. La mayoría de los

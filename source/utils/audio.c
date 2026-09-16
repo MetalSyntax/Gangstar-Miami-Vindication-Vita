@@ -36,7 +36,7 @@
 #define OUT_FRAMES 2048
 #define MAX_SFX_VOICES 8
 #define MAX_BIG_VOICES 4
-#define SFX_CACHE_MAX 40
+#define SFX_CACHE_MAX 128
 #define SFX_DECODE_CAP (2 * 1024 * 1024)
 
 static int audio_port = -1;
@@ -85,6 +85,25 @@ static void snd_path(int index, char *out, size_t n) {
     snprintf(out, n, "%sdata/%s", DATA_PATH, gmv_sound_files[index]);
 }
 
+static int8_t sound_exists_cache[GMV_SOUND_COUNT];
+
+static int snd_exists(int index) {
+    if (index < 0 || index >= GMV_SOUND_COUNT)
+        return 0;
+    if (sound_exists_cache[index] == 0) {
+        char path[512];
+        snd_path(index, path, sizeof(path));
+        FILE *f = path[0] ? fopen(path, "rb") : NULL;
+        if (f) {
+            fclose(f);
+            sound_exists_cache[index] = 1;
+        } else {
+            sound_exists_cache[index] = -1;
+        }
+    }
+    return (sound_exists_cache[index] == 1);
+}
+
 /* ---------------- SFX cache (fully decoded) ---------------- */
 
 typedef struct {
@@ -92,9 +111,11 @@ typedef struct {
     int16_t *pcm;      /* stereo, OUT_RATE */
     uint32_t frames;
     int used;
+    uint32_t last_used;
 } sfx_entry_t;
 
 static sfx_entry_t sfx_cache[SFX_CACHE_MAX];
+static uint32_t sfx_tick = 0;
 
 typedef struct {
     int active;
@@ -109,8 +130,10 @@ static sfx_voice_t sfx_voices[MAX_SFX_VOICES];
 
 static sfx_entry_t *sfx_find(int index) {
     for (int i = 0; i < SFX_CACHE_MAX; i++)
-        if (sfx_cache[i].used && sfx_cache[i].index == index)
+        if (sfx_cache[i].used && sfx_cache[i].index == index) {
+            sfx_cache[i].last_used = ++sfx_tick;
             return &sfx_cache[i];
+        }
     return NULL;
 }
 
@@ -211,16 +234,25 @@ static sfx_entry_t *sfx_decode(int index) {
             break;
         }
     if (slot < 0) {
-        /* Evict slot 0 (oldest-best-effort); voices referencing it are
+        /* Evict least recently used slot; voices referencing it are
          * stopped first to avoid a dangling pointer. */
+        uint32_t min_tick = 0xFFFFFFFF;
+        int lru_slot = 0;
+        for (int i = 0; i < SFX_CACHE_MAX; i++) {
+            if (sfx_cache[i].last_used < min_tick) {
+                min_tick = sfx_cache[i].last_used;
+                lru_slot = i;
+            }
+        }
+        slot = lru_slot;
         for (int v = 0; v < MAX_SFX_VOICES; v++)
-            if (sfx_voices[v].active && sfx_voices[v].e == &sfx_cache[0])
+            if (sfx_voices[v].active && sfx_voices[v].e == &sfx_cache[slot])
                 sfx_voices[v].active = 0;
-        free(sfx_cache[0].pcm);
-        sfx_cache[0].used = 0;
-        slot = 0;
+        free(sfx_cache[slot].pcm);
+        sfx_cache[slot].used = 0;
     }
     sfx_cache[slot].used = 1;
+    sfx_cache[slot].last_used = ++sfx_tick;
     sfx_cache[slot].index = index;
     sfx_cache[slot].pcm = pcm;
     sfx_cache[slot].frames = out_frames;
@@ -228,6 +260,11 @@ static sfx_entry_t *sfx_decode(int index) {
 }
 
 /* ---------------- Big (streamed) voices ---------------- */
+
+/* Decode buffer per voice, in source frames. Must comfortably cover one
+ * mixer tick's worth of source audio (OUT_FRAMES * step) with slack for
+ * a source rate close to OUT_RATE; see the fill loop below. */
+#define BIG_BUF_CAP (OUT_FRAMES + 64)
 
 typedef struct {
     int active;
@@ -240,7 +277,10 @@ typedef struct {
     int opened;
     long src_rate;
     int src_ch;
-    double src_pos; /* fractional source frame */
+    int16_t buf[BIG_BUF_CAP * 2]; /* stereo, source rate, compacted each tick */
+    int buf_frames;               /* valid frames held in buf[0..buf_frames) */
+    double frac_pos;              /* fractional read position within buf */
+    int eof;                      /* stream exhausted, non-looping: drain then stop */
 } big_voice_t;
 
 static big_voice_t big_voices[MAX_BIG_VOICES];
@@ -253,6 +293,9 @@ static void big_close(big_voice_t *v) {
     v->f = NULL;
     v->active = 0;
     v->paused = 0;
+    v->buf_frames = 0;
+    v->frac_pos = 0.0;
+    v->eof = 0;
 }
 
 static int big_open(big_voice_t *v, int index) {
@@ -276,7 +319,9 @@ static int big_open(big_voice_t *v, int index) {
         v->src_ch = 1;
     v->f = f;
     v->opened = 1;
-    v->src_pos = 0.0;
+    v->buf_frames = 0;
+    v->frac_pos = 0.0;
+    v->eof = 0;
     v->index = index;
     return 0;
 }
@@ -284,7 +329,21 @@ static int big_open(big_voice_t *v, int index) {
 /* ---------------- Mixer thread ---------------- */
 
 static int16_t mix_buf[OUT_FRAMES * 2];
-static int16_t dec_scratch[OUT_FRAMES * 4]; /* up to 2x for rate differences */
+
+/* Soft-knee limiter: passes normal levels through untouched and only
+ * compresses (never hard-clips) once |s| goes past KNEE, so overlapping
+ * voices saturate smoothly instead of producing the harsh square-wave
+ * distortion a hard clamp gives. */
+static int16_t soft_clip16(int32_t s) {
+    const int32_t KNEE = 24000;
+    const int32_t HEAD = 32767 - KNEE;
+    int32_t a = s < 0 ? -s : s;
+    if (a <= KNEE)
+        return (int16_t)s;
+    int32_t over = a - KNEE;
+    int32_t comp = KNEE + (int32_t)((float)HEAD * (float)over / (float)(over + HEAD));
+    return (int16_t)(s < 0 ? -comp : comp);
+}
 
 static int audio_mix_thread(SceSize argc, void *argv) {
     (void)argc;
@@ -321,85 +380,97 @@ static int audio_mix_thread(SceSize argc, void *argv) {
                 float g = v->vol * cat_gain(v->index);
                 if (g > 1.5f) g = 1.5f;
                 double step = (double)v->src_rate / (double)OUT_RATE;
-                /* Decode enough source frames for this buffer, upmixing
-                 * mono to stereo so the mix below always sees pairs. */
-                uint32_t need = (uint32_t)(OUT_FRAMES * step) + 8;
-                if (need > OUT_FRAMES * 2)
-                    need = OUT_FRAMES * 2;
-                uint32_t got_frames = 0;
+
+                /* Top off the per-voice decode buffer, appending after
+                 * whatever is already held. Earlier this window was
+                 * rebuilt from scratch every tick and any source frames
+                 * decoded past the mixed position were thrown away --
+                 * ~7-8 frames per 2048-sample buffer, a periodic skip at
+                 * the ~23 Hz buffer rate that read back as a harsh buzz
+                 * riding on top of the music. Carrying the tail forward
+                 * (compacted below) makes the position sample-accurate
+                 * across ticks: nothing decoded is ever discarded. */
+                uint32_t target = (uint32_t)(v->frac_pos + (double)OUT_FRAMES * step) + 4;
+                if (target > BIG_BUF_CAP)
+                    target = BIG_BUF_CAP;
                 int bitstream = 0;
+                int loop_retries = 0;
                 static uint8_t braw[8192];
-                while (got_frames < need) {
-                    long want = (long)(need - got_frames) * 2L * (long)v->src_ch;
+                while (!v->eof && (uint32_t)v->buf_frames < target) {
+                    long want = (long)(target - v->buf_frames) * 2L * (long)v->src_ch;
                     if (want > (long)sizeof(braw))
                         want = sizeof(braw);
                     long got = ov_read(&v->vf, (char *)braw, (int)want,
                                        0, 2, 1, &bitstream);
-                    if (got <= 0)
+                    if (got <= 0) {
+                        if (v->loop && ++loop_retries <= 4) {
+                            ov_time_seek(&v->vf, 0.0);
+                            continue;
+                        }
+                        v->eof = 1;
                         break;
+                    }
                     long fr = got / (2L * (long)v->src_ch);
                     int16_t *s = (int16_t *)braw;
-                    for (long i = 0; i < fr && got_frames < OUT_FRAMES * 2; i++) {
+                    for (long f = 0; f < fr && (uint32_t)v->buf_frames < BIG_BUF_CAP; f++) {
                         if (v->src_ch == 1) {
-                            dec_scratch[(size_t)got_frames * 2 + 0] = s[0];
-                            dec_scratch[(size_t)got_frames * 2 + 1] = s[0];
+                            v->buf[(size_t)v->buf_frames * 2 + 0] = s[0];
+                            v->buf[(size_t)v->buf_frames * 2 + 1] = s[0];
                             s += 1;
                         } else {
-                            dec_scratch[(size_t)got_frames * 2 + 0] = s[0];
-                            dec_scratch[(size_t)got_frames * 2 + 1] = s[1];
+                            v->buf[(size_t)v->buf_frames * 2 + 0] = s[0];
+                            v->buf[(size_t)v->buf_frames * 2 + 1] = s[1];
                             s += v->src_ch;
                         }
-                        got_frames++;
+                        v->buf_frames++;
                     }
                 }
-                if (!got_frames) {
-                    if (v->loop) {
-                        ov_time_seek(&v->vf, 0.0);
-                        v->src_pos = 0.0;
-                        continue;
-                    }
-                    big_close(v);
+
+                if (v->buf_frames < 2) {
+                    if (v->eof && !v->loop)
+                        big_close(v);
                     continue;
                 }
-                double sp = v->src_pos;
+
+                double sp = v->frac_pos;
                 for (int n = 0; n < OUT_FRAMES; n++) {
                     uint32_t s0 = (uint32_t)sp;
+                    if (s0 + 1 >= (uint32_t)v->buf_frames)
+                        break; /* caught up with the decoder; resume next tick */
                     double fr = sp - s0;
-                    if (s0 >= got_frames) {
-                        /* Ran out mid-buffer: keep position relative to the
-                         * consumed window and refill next round. */
-                        v->src_pos = 0.0;
-                        if (v->loop) {
-                            ov_time_seek(&v->vf, 0.0);
-                        }
-                        break;
-                    }
-                    uint32_t s1 = (s0 + 1 < got_frames) ? s0 + 1 : s0;
                     for (int c = 0; c < 2; c++) {
-                        int a = dec_scratch[(size_t)s0 * 2 + c];
-                        int b = dec_scratch[(size_t)s1 * 2 + c];
+                        int a = v->buf[(size_t)s0 * 2 + c];
+                        int b = v->buf[(size_t)(s0 + 1) * 2 + c];
                         int s = (int)(a + (b - a) * fr);
                         acc[n * 2 + c] += (int32_t)(s * g);
                     }
                     sp += step;
                 }
-                if (sp < got_frames)
-                    v->src_pos = sp;
-                else
-                    v->src_pos = 0.0;
+
+                /* Compact: drop whole frames actually consumed, keep the
+                 * fractional remainder plus any decoded-but-unconsumed
+                 * tail for next tick. */
+                int consumed = (int)sp;
+                if (consumed > v->buf_frames)
+                    consumed = v->buf_frames;
+                if (consumed > 0) {
+                    memmove(v->buf, v->buf + (size_t)consumed * 2,
+                            (size_t)(v->buf_frames - consumed) * 2 * sizeof(int16_t));
+                    v->buf_frames -= consumed;
+                    v->frac_pos = sp - consumed;
+                } else {
+                    v->frac_pos = sp;
+                }
+
+                if (v->buf_frames == 0 && v->eof && !v->loop)
+                    big_close(v);
             }
         }
 
         sceKernelUnlockMutex(audio_mutex, 1);
 
-        for (int n = 0; n < OUT_FRAMES * 2; n++) {
-            int32_t s = acc[n];
-            if (s > 32767)
-                s = 32767;
-            else if (s < -32768)
-                s = -32768;
-            mix_buf[n] = (int16_t)s;
-        }
+        for (int n = 0; n < OUT_FRAMES * 2; n++)
+            mix_buf[n] = soft_clip16(acc[n]);
         if (audio_port >= 0)
             sceAudioOutOutput(audio_port, mix_buf);
     }
@@ -419,7 +490,7 @@ void audio_init(void) {
     }
     audio_running = 1;
     audio_thread = sceKernelCreateThread("gmv_audio_mix", audio_mix_thread,
-                                         0x10000100, 0x10000, 0, 0, NULL);
+                                         0x10000100, 0x10000, 0, SCE_KERNEL_CPU_MASK_USER_2, NULL);
     if (audio_thread < 0) {
         l_error("audio: mixer thread create failed, sound disabled");
         audio_running = 0;
@@ -547,15 +618,7 @@ int audio_is_loaded(int index) {
     int ok = sfx_find(index) ? 1 : 0;
     sceKernelUnlockMutex(audio_mutex, 1);
     if (!ok) {
-        /* Answer from the filesystem so the engine can proceed to
-         * play (which decodes). Missing files report not-loaded. */
-        char path[512];
-        snd_path(index, path, sizeof(path));
-        FILE *f = path[0] ? fopen(path, "rb") : NULL;
-        if (f) {
-            fclose(f);
-            ok = 1;
-        }
+        ok = snd_exists(index);
     }
     return ok;
 }
@@ -611,7 +674,9 @@ void audio_play_big(int index, float volume, int loop) {
     } else {
         if (v->opened)
             ov_time_seek(&v->vf, 0.0);
-        v->src_pos = 0.0;
+        v->buf_frames = 0;
+        v->frac_pos = 0.0;
+        v->eof = 0;
         v->vol = volume;
         v->loop = loop ? 1 : 0;
         v->paused = 0;
@@ -665,16 +730,7 @@ void audio_set_volume_big(int index, float vol) {
 }
 
 int audio_is_loaded_big(int index) {
-    if (index < 0 || index >= GMV_SOUND_COUNT)
-        return 0;
-    char path[512];
-    snd_path(index, path, sizeof(path));
-    FILE *f = path[0] ? fopen(path, "rb") : NULL;
-    if (f) {
-        fclose(f);
-        return 1;
-    }
-    return 0;
+    return snd_exists(index);
 }
 
 int audio_is_media_playing(int index) {

@@ -89,10 +89,12 @@ void gl_init() {
 }
 
 void gl_swap() {
+#ifdef DEBUG_SOLOADER
     gl_frame_tick();
     // TEMP triage (2026-09-10): our own bars, drawn last so nothing the engine
     // does can paint over them. See gl_probe_selftest() in reimpl/gl.c.
     gl_probe_selftest();
+#endif
     vglSwapBuffers(GL_FALSE);
 }
 
@@ -219,6 +221,21 @@ void glCompileShader_soloader(GLuint shader) {
     }
     skip_next_compile = GL_FALSE;
 #endif
+}
+
+void glLinkProgram_soloader(GLuint program) {
+#ifdef DEBUG_OPENGL
+    sceClibPrintf("[gl_dbg] glLinkProgram<%p>(program: %i)\n", __builtin_return_address(0), program);
+#endif
+    glLinkProgram(program);
+    GLint link_status = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &link_status);
+    if (link_status != GL_TRUE) {
+        char info_log[1024];
+        GLsizei info_len = 0;
+        glGetProgramInfoLog(program, sizeof(info_log), &info_len, info_log);
+        l_error("glLinkProgram(%u) FAILED: %s", program, info_len > 0 ? info_log : "(no info log)");
+    }
 }
 
 #if defined(USE_GLSL_SHADERS) && defined(DUMP_COMPILED_SHADERS)

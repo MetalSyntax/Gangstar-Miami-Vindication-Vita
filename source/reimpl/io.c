@@ -111,10 +111,44 @@ static void _mkdir_parents(const char * path) {
     }
 }
 
+#define PATH_CACHE_SIZE 512
+typedef struct {
+    char orig[256];
+    char trans[256];
+    int is_identity;
+} path_cache_entry_t;
+
+static path_cache_entry_t s_path_cache[PATH_CACHE_SIZE];
+
+static inline uint32_t _hash_path(const char *s) {
+    uint32_t h = 2166136261u;
+    while (*s) {
+        h ^= (uint8_t)*s++;
+        h *= 16777619u;
+    }
+    return h;
+}
+
 // Returns either `path` unchanged (not one of ours: ux0:/app0:, /proc/..., a
 // genuinely relative name) or `buf`, filled with the translated path.
 static const char * _path_translate(const char * path, char * buf, size_t cap) {
     if (!path || !*path) return path;
+
+    size_t plen = strlen(path);
+    int can_cache = (plen < 256 && cap >= 256);
+    uint32_t slot = 0;
+    if (can_cache) {
+        slot = _hash_path(path) % PATH_CACHE_SIZE;
+        if (s_path_cache[slot].orig[0] && strcmp(s_path_cache[slot].orig, path) == 0) {
+            if (s_path_cache[slot].is_identity)
+                return path;
+            size_t tlen = strlen(s_path_cache[slot].trans);
+            if (tlen < cap) {
+                memcpy(buf, s_path_cache[slot].trans, tlen + 1);
+                return buf;
+            }
+        }
+    }
 
     const char * p = path;
 
@@ -147,10 +181,24 @@ static const char * _path_translate(const char * path, char * buf, size_t cap) {
         rest = p + 7;
         repl = VITA_DATA_ROOT;
     } else {
+        if (can_cache) {
+            strncpy(s_path_cache[slot].orig, path, sizeof(s_path_cache[slot].orig) - 1);
+            s_path_cache[slot].orig[sizeof(s_path_cache[slot].orig) - 1] = '\0';
+            s_path_cache[slot].is_identity = 1;
+        }
         return path;
     }
 
     _path_clean_copy(buf, cap, repl, rest);
+
+    if (can_cache) {
+        strncpy(s_path_cache[slot].orig, path, sizeof(s_path_cache[slot].orig) - 1);
+        s_path_cache[slot].orig[sizeof(s_path_cache[slot].orig) - 1] = '\0';
+        strncpy(s_path_cache[slot].trans, buf, sizeof(s_path_cache[slot].trans) - 1);
+        s_path_cache[slot].trans[sizeof(s_path_cache[slot].trans) - 1] = '\0';
+        s_path_cache[slot].is_identity = 0;
+    }
+
     return buf;
 }
 
@@ -171,8 +219,14 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
 
 #ifdef USE_SCELIBC_IO
     FILE* ret = sceLibcBridge_fopen(path, mode);
+    if (ret && mode && !strchr(mode, 'w') && !strchr(mode, 'a') && !strchr(mode, '+')) {
+        sceLibcBridge_setvbuf(ret, NULL, _IOFBF, 64 * 1024);
+    }
 #else
     FILE* ret = fopen(path, mode);
+    if (ret && mode && !strchr(mode, 'w') && !strchr(mode, 'a') && !strchr(mode, '+')) {
+        setvbuf(ret, NULL, _IOFBF, 64 * 1024);
+    }
 #endif
 
     if (ret) {

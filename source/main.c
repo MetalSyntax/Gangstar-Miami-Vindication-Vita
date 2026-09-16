@@ -4,6 +4,7 @@
 #include "utils/dialog.h"
 #include "utils/audio.h"
 #include "reimpl/gl.h"
+#include "video.h"
 
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/processmgr.h>
@@ -17,7 +18,7 @@
 int _newlib_heap_size_user = 256 * 1024 * 1024;
 
 #ifdef USE_SCELIBC_IO
-int sceLibcHeapSize = 4 * 1024 * 1024;
+int sceLibcHeapSize = 8 * 1024 * 1024;
 #endif
 
 so_module so_mod;
@@ -53,8 +54,16 @@ static fn_void_int      Gangster2_nativeKeyUp;
     dst = (void *) so_symbol(&so_mod, sym); \
     if (!dst) fatal_error("Could not resolve required symbol: %s", sym);
 
-#define GAME_W 960
-#define GAME_H 544
+#define SCREEN_W 960
+#define SCREEN_H 544
+
+// The game engine operates internally at 960x480 (hardcoded height 480 in
+// Application::Init and GameRenderer_nativeResize). glViewport_soloader (gl.c)
+// scales the default framebuffer vertically from 480 to 544 to fill the Vita
+// panel. Touch inputs from the Vita panel (960x544) must therefore be mapped to
+// the engine's internal space (960x480) so touch hitboxes match visual buttons.
+#define ENGINE_W 960
+#define ENGINE_H 480
 #define MAX_TOUCH_SLOTS 5
 
 int main() {
@@ -77,8 +86,14 @@ int main() {
     gl_init();
     l_checkpoint(3, "main: gl_init() done");
 
+    // Loads SceAvPlayer so Method_loadMovie (java.c) can actually play
+    // intro.m4v instead of skipping straight to completion. Must come after
+    // gl_init(): video_play()'s texture allocator maps memory via
+    // sceGxmMapMemory, which needs the GXM context vitaGL's init brings up.
+    video_init();
+
     // onCreate(): nativeSetPhone(dm.widthPixels), before any GL/surface work.
-    Gangster2_nativeSetPhone(&jni, NULL, GAME_W);
+    Gangster2_nativeSetPhone(&jni, NULL, ENGINE_W);
     l_checkpoint(4, "main: Gangster2_nativeSetPhone() done");
 
     // onSurfaceCreated(), in the exact order the real Renderer calls them.
@@ -99,7 +114,7 @@ int main() {
     l_checkpoint(9, "main: GameRenderer_nativeInit() done");
 
     // onSurfaceChanged(w, h)
-    GameRenderer_nativeResize(&jni, NULL, GAME_W, GAME_H);
+    GameRenderer_nativeResize(&jni, NULL, ENGINE_W, ENGINE_H);
     l_checkpoint(10, "main: GameRenderer_nativeResize() done -- entering main loop");
 
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
@@ -140,8 +155,12 @@ int main() {
         int seen[MAX_TOUCH_SLOTS] = {0, 0, 0, 0, 0};
         for (int r = 0; r < touch.reportNum && r < MAX_TOUCH_SLOTS; r++) {
             int hwId = touch.report[r].id;
-            int x = touch.report[r].x * GAME_W / 1920;
-            int y = touch.report[r].y * GAME_H / 1088;
+            int x = (int)((touch.report[r].x * ENGINE_W) / 1920);
+            int y = (int)((touch.report[r].y * ENGINE_H) / 1088);
+            if (x < 0) x = 0;
+            else if (x >= ENGINE_W) x = ENGINE_W - 1;
+            if (y < 0) y = 0;
+            else if (y >= ENGINE_H) y = ENGINE_H - 1;
 
             int slot = -1;
             for (int s = 0; s < MAX_TOUCH_SLOTS; s++) {
@@ -220,12 +239,10 @@ int main() {
                 // GL draws/clears -- one line every 5 s answers "is anything
                 // happening?" without reading tea leaves from microsecond
                 // timings.
-                unsigned draws = 0, clears = 0;
-                gl_get_counters(&draws, &clears);
                 float fps = (float)(frame_no - last_beat_frame) * 1000000.0f /
                             (float)(now - last_beat);
-                l_note("[022] frame %d | %.1f fps | render %.1f ms | draws %u clears %u",
-                       frame_no, fps, (float)render_us / 1000.0f, draws, clears);
+                l_note("[022] frame %d | %.1f fps | render %.1f ms",
+                       frame_no, fps, (float)render_us / 1000.0f);
                 last_beat = now;
                 last_beat_frame = frame_no;
             }
