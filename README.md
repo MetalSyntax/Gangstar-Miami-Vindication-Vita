@@ -50,9 +50,9 @@ It is **not yet polished** — see "Known Issues" below.
   8+4 concurrent streamed voices for music/radio/voice with looping, independent music/SFX/VFX
   gain control.
 - **Intro cutscene**: Plays via `SceAvPlayer` (hardware H.264 decoder), letterboxed to the full
-  panel, skippable with Cross/Start. The original `intro.m4v` ships as MPEG-4 Part 2, which the
-  Vita's hardware decoder cannot play — it needs a one-time re-encode to H.264 (see
-  [Getting the game data](#-getting-the-game-data) below).
+  panel, skippable with Cross/Start. Note: the original `intro.m4v` ships as MPEG-4 Part 2, which
+  the Vita's hardware decoder cannot play — see "Known Issues" below. The original asset is never
+  altered by this project.
 - **Touch + physical input**: Front touchscreen mapped to the engine's multi-touch slots, D-Pad/
   Cross/Circle/Start mapped to the same Android keycodes the real device's keyboard would send.
 - **Overclocked + tuned for the Cortex-A9**: CPU/Bus/GPU/GPU-Xbar clocks at their ceiling, NEON
@@ -61,9 +61,13 @@ It is **not yet polished** — see "Known Issues" below.
 
 ### ⚠️ Known Issues
 
-- **Some characters/vehicles can render solid black.** Under investigation — the leading
-  suspect is a vitaGL vertex-data speedhack racing the GPU on large meshes (see
-  `port_progress.md`, latest phase).
+- **Some characters/vehicles can render solid black.** Under investigation — a vitaGL vertex-data
+  speedhack racing the GPU on large meshes was ruled out on real hardware (removing it only cost
+  performance); the current suspect is a matrix-math speedhack that can silently drop the active
+  matrix stack for `glOrtho`/`glFrustum` (see `port_progress.md`, latest phase).
+- **Intro cutscene shows no video** with the original `intro.m4v` (MPEG-4 Part 2 — the Vita's
+  hardware video decoder only supports H.264/AVC). This project does not transcode or otherwise
+  alter original game assets; audio and the rest of the boot sequence are unaffected.
 - **Multi-second freeze the first time a vehicle (or new area) loads.** Same class of one-time
   shader-compile/asset-load stall already seen at the title screen; the on-disk shader cache
   should make repeat loads of the same asset fast.
@@ -96,14 +100,9 @@ To run this port on your PS Vita, you will need:
 3. Use **psvita-port-toolkit** (the standalone tool this port is managed with) to prepare the
    asset files — open the toolkit and select "Continuar con un port existente" pointing at this
    folder.
-4. Re-encode `data/intro.m4v` to H.264 before copying it over (the original is MPEG-4 Part 2,
-   which the Vita's hardware video decoder cannot play):
-   ```bash
-   ffmpeg -i intro.m4v -c:v libx264 -profile:v baseline -level 3.0 -pix_fmt yuv420p \
-          -c:a aac -b:a 160k -ar 48000 -ac 2 -movflags +faststart intro.m4v.fixed
-   ```
-5. Transfer the resulting game data to `ux0:data/gangstarmiamivindication/` via FTP or USB using
-   VitaShell.
+4. Transfer the game data to `ux0:data/gangstarmiamivindication/` via FTP or USB using VitaShell,
+   as-is — this project does not modify original game assets (see "Known Issues" for what that
+   means for `intro.m4v` specifically).
 
 ### Final File Structure in `ux0:data/gangstarmiamivindication/`
 

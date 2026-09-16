@@ -3,7 +3,71 @@
 > Bitácora cronológica, un bug confirmado a la vez. Para el estado **estructural** del port (motor,
 > mapa JNI, filesystem, niveles de logging, checklist) ver `PORTING_PLAN.md`.
 
-## Estado actual — 2026-09-15 (Fase 39: rendimiento por fin jugable (20-30 fps) — personajes/vehículos en negro + freeze al subir a un auto, `logs/debug_local_043.log`)
+## Estado actual — 2026-09-16 (Fase 41: `SAFER_DRAW_SPEEDHACK` restaurado -- sacarlo no era el fix del negro, era la velocidad; sospechoso ahora es `MATH_SPEEDHACK`, `logs/debug_local_044.log`)
+
+**Punto de partida:** con el build de la Fase 39 (sin `SAFER_DRAW_SPEEDHACK`, con
+`MATH_SPEEDHACK` nuevo) el usuario reporta que el juego **volvió a ir muy lento** y las
+texturas de personajes/vehículos **siguen en negro**.
+
+### El log confirma que sacar `SAFER_DRAW_SPEEDHACK` fue el error de rendimiento
+
+`logs/debug_local_044.log`: tras la carga inicial el juego alcanza un piso sólido de **30 fps**
+(frames 301-1357, render 14-17 ms parejo) -- hasta ahí, todo bien. Pero desde el frame ~1414 en
+adelante la fps **se degrada progresivamente y no se recupera**: 13.8 -> 6.7 -> 5.3 -> 4.0 ->
+3.8 -> 4.5 fps. Ese patrón -- un piso bueno que se erosiona con el tiempo, no un techo bajo desde
+el arranque -- es **la firma exacta de la Fase 29** ("Circular pool overrun on frame N", ~37% de
+los frames, fallback a `gpu_alloc_mapped_temp()` por-draw). Tiene sentido: sacar
+`SAFER_DRAW_SPEEDHACK` hace que TODOS los draws grandes (mallas de personajes/vehículos) vuelvan
+a copiarse al circular pool en vez de mandar el puntero directo -- exactamente la carga que la
+Fase 29 ya había encontrado al límite (por eso se subió el pool a 64MB en su momento). Con más
+autos/peatones en escena la presión crece y el pool se queda corto de nuevo.
+
+**Conclusión: `SAFER_DRAW_SPEEDHACK` no era la causa del negro.** Sacarlo costó rendimiento real
+y no arregló nada -- se **restaura** en `CMakeLists.txt`.
+
+### Nuevo sospechoso para el negro: `MATH_SPEEDHACK`
+
+Revisando `lib/vitaGL/source/matrices.c` (no solo el README): `glOrthof`/`glFrustumf`/
+`glMatrixOrtho`/`glMatrixFrustum` con `MATH_SPEEDHACK` activo **reemplazan** la matriz activa por
+la nueva proyección (`matrix4x4_init_orthographic(*matrix, ...)`), en vez de **componerla** con
+lo que ya estaba cargado (`matrix4x4_multiply(res, *matrix, ortho_matrix)`, el camino normal).
+Eso es correcto SOLO si el motor siempre hace `glLoadIdentity()` justo antes de cada
+`glOrtho`/`glFrustum` -- no confirmado para este motor. Es el único cambio nuevo de la Fase 38-39
+que quedaba sin descartar por código (`DISABLE_TEXTURE_COMBINER` y `SAMPLERS_SPEEDHACK` ya se
+habían confirmado inertes para este juego en la Fase 39 -- el segundo ni siquiera toca el
+pipeline FFP, solo `custom_shaders.c`). Sacado de `CMakeLists.txt` (comentado, no borrado).
+
+### Estado
+
+- Build verde (`psvita-toolkit build --preset release`).
+- **Pendiente de confirmar en consola:** con `SAFER_DRAW_SPEEDHACK` restaurado y
+  `MATH_SPEEDHACK` afuera, ¿se recupera el piso de 30 fps sin degradación Y desaparece el negro
+  en personajes/vehículos? Si el negro persiste incluso sin `MATH_SPEEDHACK`, el siguiente
+  sospechoso es `SKIP_ERROR_HANDLING` (global, apaga todos los chequeos de vitaGL) -- pero sacar
+  ese tiene mayor costo de CPU que los otros, así que conviene confirmar antes de tocarlo.
+
+## Estado previo — 2026-09-16 (Fase 40: revertido el transcode de `intro.m4v` -- el asset original no se toca)
+
+**Instrucción explícita del usuario:** no alterar el video, usar el método de Shadow Guardian
+(SceAvPlayer, `source/video.cpp` sin cambios) y revertir el transcode de la Fase 38.
+
+**Revertido:**
+- `ux0_data/gangstarmiamivindication/data/intro.m4v` restaurado al original (MPEG-4 Part 2 +
+  AAC, 1223131 bytes, confirmado con `ffprobe`) desde el backup `intro.m4v.orig`; el backup se
+  eliminó (ya no hace falta, el archivo activo ES el original de nuevo).
+- **No se tocó código** (`source/video.cpp`, `java.c`, `main.c` quedan igual que la Fase 35/38 --
+  el método SceAvPlayer sigue siendo el correcto y es el que pidió el usuario).
+- `CLAUDE.md` (regla 5) y `PORTING_PLAN.md` (sección Video) actualizados: la lección que queda
+  es "SceAvPlayer no decodifica MPEG-4 Part 2 y el asset no se transcodifica para evitarlo" --
+  no "transcodificar antes de tocar código" como decía antes.
+
+**Consecuencia esperada:** con el asset original, `intro.m4v` vuelve a no producir frames de
+video vía `SceAvPlayer` (mismo síntoma que la Fase 6/35: `video_play()` corre, no cuelga, pero
+no hay imagen), porque el decodificador de hardware de la Vita solo soporta H.264/AVC y este
+asset puntual es MPEG-4 Part 2. Esto es una decisión de producto del usuario (no alterar assets
+originales), no una regresión de código.
+
+## Estado previo — 2026-09-15 (Fase 39: rendimiento por fin jugable (20-30 fps) — personajes/vehículos en negro + freeze al subir a un auto, `logs/debug_local_043.log`)
 
 **Buena noticia primero:** con el fix de la Fase 38 el usuario confirma que el juego **va rápido y
 es casi jugable a 20-30 fps** -- primera vez que llega a ver gameplay real de 3ra persona con

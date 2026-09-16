@@ -160,33 +160,30 @@ target_compile_definitions(vitaGL_local PRIVATE
     DISABLE_TILE_CLIPPER
     DISABLE_TEXTURE_COMBINER
     SAMPLERS_SPEEDHACK
-    # Adoptado de Asphalt-6-Vita (mismo fork de vitaGL, confirmado en consola con
-    # una escena 3D mas pesada que la de este juego): matematica interna mas
-    # rapida para matrices. Deliberadamente NO se suma CIRCULAR_POOL_SPEEDHACK
-    # (tambien usado por Asphalt 6) -- este proyecto ya tuvo overruns reales del
-    # circular pool con triple buffer (Fase 29, corregido subiendo a 64MB); pasar
-    # a buffer unico revive ese riesgo sin evidencia de que ayude aca.
-    MATH_SPEEDHACK
+    # SAFER_DRAW_SPEEDHACK (Fase 37): para streams de color/normal/vertice de un
+    # draw grande (>0x8000 bytes -- mallas de vehiculos/edificios/personajes),
+    # manda el puntero del vertex array del motor directo a
+    # sceGxmSetVertexStream() en vez de copiarlo al circular pool. Se habia
+    # sacado en la Fase 39 sospechando una carrera CPU/GPU como causa del negro
+    # en personajes/vehiculos, pero en consola real (Fase 41, debug_local_044.log)
+    # sacarlo NO arreglo el negro y en cambio devolvio el patron exacto de la
+    # Fase 29 (overrun del circular pool: fps cayendo en degradacion progresiva
+    # de 30 a 3-5 fps a medida que se acumulan mallas grandes en escena, no un
+    # piso parejo). Confirmado: esto es lo que daba la velocidad, se restaura.
+    SAFER_DRAW_SPEEDHACK
 )
-# SAFER_DRAW_SPEEDHACK (Fase 37) DESACTIVADO de nuevo (Fase 39): en
-# lib/vitaGL/source/ffp.c (_glDrawArrays_FixedFunctionIMPL /
-# _glMultiDrawArrays_FixedFunctionIMPL), para streams de color/normal/generico
-# de un draw grande (>0x8000 bytes -- exactamente "mallas 3D de vehiculos,
-# edificios y personajes" segun el propio comentario que introdujo el flag),
-# activarlo hace que el puntero del vertex array del ENGINE se mande directo a
-# sceGxmSetVertexStream() sin el memcpy a un buffer temporal del circular pool.
-# Eso es una lectura de la GPU sobre memoria que la CPU puede seguir escribiendo/
-# reciclando en el frame siguiente -- exactamente la misma clase de carrera
-# CPU/GPU que Asphalt-6-Vita documenta y por la que excluye deliberadamente
-# BUFFERS_SPEEDHACK ("provoca condicion de carrera... sobre los VBOs de los
-# vehiculos -- ruedas, suspension, geometria animada -- causando el glitch
-# grafico", CMakeLists.txt de ese port). Encaja con el sintoma reportado en
-# consola real: personajes y vehiculos (mallas grandes) en negro, edificios
-# estaticos bien (mallas chicas, siguen por el camino con copia). Si el color
-# por-vertice llega en cero/basura por la carrera, el GL_MODULATE
-# textura*color final da negro. Reactivar (agregarlo de nuevo a la lista de
-# arriba) solo si se confirma en consola que NO era esto.
-# target_compile_definitions(vitaGL_local PRIVATE SAFER_DRAW_SPEEDHACK)
+# MATH_SPEEDHACK (adoptado de Asphalt-6-Vita en la Fase 38) SACADO en la Fase 41:
+# revisando lib/vitaGL/source/matrices.c (glOrthof/glFrustumf/glMatrixOrtho/
+# glMatrixFrustum), la variante rapida REEMPLAZA la matriz activa por la nueva
+# proyeccion (`matrix4x4_init_orthographic(*matrix, ...)`) en vez de componerla
+# con la que ya estaba cargada (`matrix4x4_multiply(res, *matrix, ortho_matrix)`).
+# Eso es distinto del comportamiento real de glOrtho/glFrustum salvo que el
+# motor siempre llame glLoadIdentity() justo antes -- no verificado para este
+# motor. Sacado porque en consola real (Fase 41) las texturas de
+# personajes/vehiculos seguian en negro incluso con SAFER_DRAW_SPEEDHACK
+# restaurado, así que el sospechoso pasa a ser este flag (el otro cambio nuevo
+# de la misma tanda). Reactivar solo si se confirma que no es la causa.
+# target_compile_definitions(vitaGL_local PRIVATE MATH_SPEEDHACK)
 
 add_library(vitashark_local STATIC lib/vitashark/source/vitashark.c)
 target_include_directories(vitashark_local PUBLIC lib/vitashark/source)

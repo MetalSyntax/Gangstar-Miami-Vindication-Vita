@@ -198,14 +198,15 @@ jamás `sceClibPrintf(buf)`. El motor manda mensajes con `%s` adentro.
       1.1), letterbox a 960x544, audio por `sceAudioOut` en hilo dedicado,
       saltable con Cruz/Start -- y solo entonces dispara
       `nativeSetOnVideoCompletion()`. `video_play()` nunca cuelga (Fase 33).
-      **Importante (Fase 38):** el `.so`/APK trae `intro.m4v` en MPEG-4 Part 2
-      (Simple Profile) -- el decodificador por hardware de `SceAvPlayer` **solo
-      soporta H.264/AVC**, así que el asset original no se reproduce aunque el
-      código esté bien. El `intro.m4v` en `ux0_data/` ya está transcodificado a
-      H.264 Baseline L3.0 + AAC (original en `intro.m4v.orig`); si el APK se
-      re-extrae desde cero, hay que repetir la transcodificación antes de
-      copiar el asset a la consola:
-      `ffmpeg -i intro.m4v -c:v libx264 -profile:v baseline -level 3.0 -pix_fmt yuv420p -c:a aac -b:a 160k -ar 48000 -ac 2 -movflags +faststart <salida>`.
+      **Importante (Fase 38, revertido en Fase 40):** el `.so`/APK trae
+      `intro.m4v` en MPEG-4 Part 2 (Simple Profile) -- el decodificador por
+      hardware de `SceAvPlayer` **solo soporta H.264/AVC**, así que este asset
+      puntual no se reproduce aunque `video.cpp` (método Shadow Guardian-vita,
+      sin cambios) esté bien. **Decisión del proyecto: NO transcodificar ni
+      alterar el asset original** -- `intro.m4v` en `ux0_data/` se dejó tal
+      cual sale del APK. El intro queda sin reproducirse con este asset
+      puntual; es un límite conocido del formato de origen, no algo que el
+      loader deba "arreglar" tocando datos del juego.
 - [ ] **Ciclo de vida incompleto**: `nativePause`/`nativeResume`/`nativeAccelerometer`/`nativeDone`/
       `nativeOpenIGM`/`nativeCanInterrupt` están exportados pero **no cableados** en `main.c`.
       Hacen falta para suspender/reanudar la consola y para el menú in-game.
