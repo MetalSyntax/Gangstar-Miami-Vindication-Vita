@@ -109,19 +109,22 @@ struct pad_action {
     int y;
 };
 
-/* Physical mapping. Triangle covers both "enter/exit car" (type 2) and
- * "enter shop" (type 3) on two independent touch slots: each entry gates
- * on its own button's visibility (nearCar/nearShop hide the inapplicable
- * one), so pressing Triangle near a car enters it and near a shop enters
- * that -- same as tapping whichever on-screen button is actually shown. */
+/* Physical mapping.
+ * - On foot: Cross=attack, Triangle=enter-car/shop, Square=cover, Circle=sprint.
+ * - In vehicle: Cross=accelerate, Circle=brake, Triangle=exit-car.
+ *   (L/R triggers also act as brake/accelerate for driving convenience).
+ * Each entry gates on its button's visibility (e.g. attack is visible on foot
+ * and hidden in cars; accelerate is visible in cars and hidden on foot). */
 static struct pad_action s_actions[] = {
     { SCE_CTRL_CROSS,    "attack",     offs_attack,   4, GA_SLOT_BASE + 0, 0, 0, 0 },
-    { SCE_CTRL_TRIANGLE, "enter-car",  offs_entercar, 4, GA_SLOT_BASE + 1, 0, 0, 0 },
-    { SCE_CTRL_TRIANGLE, "enter-shop", offs_shop,     1, GA_SLOT_BASE + 2, 0, 0, 0 },
-    { SCE_CTRL_SQUARE,   "take-cover", offs_cover,    1, GA_SLOT_BASE + 3, 0, 0, 0 },
-    { SCE_CTRL_CIRCLE,   "sprint",     offs_sprint,   1, GA_SLOT_BASE + 4, 0, 0, 0 },
-    { SCE_CTRL_LTRIGGER, "vehicle-A",  offs_veh_a,    2, GA_SLOT_BASE + 5, 0, 0, 0 },
-    { SCE_CTRL_RTRIGGER, "vehicle-B",  offs_veh_b,    2, GA_SLOT_BASE + 6, 0, 0, 0 },
+    { SCE_CTRL_CROSS,    "accelerate", offs_veh_a,    2, GA_SLOT_BASE + 1, 0, 0, 0 },
+    { SCE_CTRL_CIRCLE,   "sprint",     offs_sprint,   1, GA_SLOT_BASE + 2, 0, 0, 0 },
+    { SCE_CTRL_CIRCLE,   "brake",      offs_veh_b,    2, GA_SLOT_BASE + 3, 0, 0, 0 },
+    { SCE_CTRL_TRIANGLE, "enter-car",  offs_entercar, 4, GA_SLOT_BASE + 4, 0, 0, 0 },
+    { SCE_CTRL_TRIANGLE, "enter-shop", offs_shop,     1, GA_SLOT_BASE + 5, 0, 0, 0 },
+    { SCE_CTRL_SQUARE,   "take-cover", offs_cover,    1, GA_SLOT_BASE + 6, 0, 0, 0 },
+    { SCE_CTRL_RTRIGGER, "accelerate", offs_veh_a,    2, GA_SLOT_BASE + 7, 0, 0, 0 },
+    { SCE_CTRL_LTRIGGER, "brake",      offs_veh_b,    2, GA_SLOT_BASE + 8, 0, 0, 0 },
 };
 
 #define GA_NACTIONS (sizeof(s_actions) / sizeof(s_actions[0]))
@@ -165,6 +168,8 @@ static struct pad_action s_actions[] = {
  * trail. Not wired up here -- there is no HUD element it could drive.
  */
 #define GA_OFF_ANALOGSTICK 0x28
+#define GA_OFF_WHEEL       0x2c
+#define GA_OFF_SLIDECONTROL 0x54
 
 /* Deadzone as a fraction of the raw analog range (SceCtrlData.lx/ly are
  * 0..255, 128 = centered) -- keeps a resting stick (which never sits at
@@ -179,7 +184,8 @@ struct stick_state {
     int last_x, last_y;
 };
 
-static struct stick_state s_moveStick = { GA_SLOT_BASE + 7, 0, 0, 0, 0.0f, 0.0f, 0, 0 };
+static struct stick_state s_moveStick  = { GA_SLOT_BASE + 9, 0, 0, 0, 0.0f, 0.0f, 0, 0 };
+static struct stick_state s_wheelStick = { GA_SLOT_BASE + 10, 0, 0, 0, 0.0f, 0.0f, 0, 0 };
 
 /*
  * Fase 52 (crash confirmed on hardware, debug_local_052.log +
@@ -315,6 +321,50 @@ static int stick_region(int *cx, int *cy, float *rx, float *ry) {
     return (*cx >= 0 && *cx < GA_ENGINE_W && *cy >= 0 && *cy < GA_ENGINE_H);
 }
 
+/* Locates CHudManager+GA_OFF_WHEEL (or GA_OFF_SLIDECONTROL if using slider steering),
+ * runs the interactable gate (+0x14), and fills *cx/*cy (region center) and
+ * *rx/*ry in engine touch pixels. Returns 1 if interactable, 0 if hidden (e.g. on foot). */
+static int wheel_region(int *cx, int *cy, float *rx, float *ry) {
+    if (!screen_scale_ready())
+        return 0;
+
+    CHudManagerPtr hud = *s_hudManagerAddr;
+    if (!hud)
+        return 0;
+
+    float fx = 0.0f, fy = 0.0f;
+    s_getScale(s_getInstance(), &fx, &fy);
+    if (!(fx > 0.0f && fy > 0.0f))
+        return 0;
+
+    const int offs[] = { GA_OFF_WHEEL, GA_OFF_SLIDECONTROL };
+    for (int i = 0; i < 2; i++) {
+        void *wheel = *(void **)((char *)hud + offs[i]);
+        if (!wheel)
+            continue;
+        void **vt = *(void ***)wheel;
+
+        gate_fn gate = (gate_fn)vt[GA_VT_GATE];
+        if (!gate || !gate(wheel))
+            continue;
+
+        float rect[4];
+        region_fn region = (region_fn)vt[GA_VT_REGION];
+        if (!region)
+            continue;
+        region(rect, wheel);
+        if (!(rect[2] > rect[0] && rect[3] > rect[1]))
+            continue;
+
+        *cx = (int)((rect[0] + rect[2]) * 0.5f * fx);
+        *cy = (int)((rect[1] + rect[3]) * 0.5f * fy);
+        *rx = (rect[2] - rect[0]) * 0.5f * fx;
+        *ry = (rect[3] - rect[1]) * 0.5f * fy;
+        return (*cx >= 0 && *cx < GA_ENGINE_W && *cy >= 0 && *cy < GA_ENGINE_H);
+    }
+    return 0;
+}
+
 static int clampi(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
@@ -339,44 +389,102 @@ void gamepad_stick_update(uint32_t dpad_buttons, uint8_t lx, uint8_t ly) {
 
     int want_active = (nx != 0.0f || ny != 0.0f);
 
-    if (!want_active) {
-        if (s_moveStick.active) {
-            s_touch(&jni, NULL, 0, s_moveStick.last_x, s_moveStick.last_y, (jlong)s_moveStick.slot, 0, 0);
-            l_note("[input] move-stick up (slot %d)", s_moveStick.slot);
-            s_moveStick.active = 0;
+    /* 1. On-foot / sniper: AnalogStick movement */
+    int cx, cy; float rx, ry;
+    if (stick_region(&cx, &cy, &rx, &ry)) {
+        if (s_wheelStick.active) {
+            s_touch(&jni, NULL, 0, s_wheelStick.last_x, s_wheelStick.last_y, (jlong)s_wheelStick.slot, 0, 0);
+            l_note("[input] wheel up (slot %d)", s_wheelStick.slot);
+            s_wheelStick.active = 0;
+        }
+
+        if (!want_active) {
+            if (s_moveStick.active) {
+                s_touch(&jni, NULL, 0, s_moveStick.last_x, s_moveStick.last_y, (jlong)s_moveStick.slot, 0, 0);
+                l_note("[input] move-stick up (slot %d)", s_moveStick.slot);
+                s_moveStick.active = 0;
+            }
+            return;
+        }
+
+        if (!s_moveStick.active) {
+            s_moveStick.cx = cx;
+            s_moveStick.cy = cy;
+            s_moveStick.rx = rx;
+            s_moveStick.ry = ry;
+            s_moveStick.last_x = cx;
+            s_moveStick.last_y = cy;
+            s_touch(&jni, NULL, 1, cx, cy, (jlong)s_moveStick.slot, 0, 0);
+            s_moveStick.active = 1;
+            l_note("[input] move-stick down @(%d,%d) r=(%.0f,%.0f) slot %d",
+                   cx, cy, rx, ry, s_moveStick.slot);
+        }
+
+        /* A bit past the widget's own drawn radius (1.25x) so a fully-deflected
+         * physical stick reliably reaches whatever internal max-drag clamp
+         * AnalogStick::processTouch applies, same margin a real thumb dragging
+         * past the base graphic would give it. */
+        int tx = clampi((int)(s_moveStick.cx + nx * s_moveStick.rx * 1.25f), 0, GA_ENGINE_W - 1);
+        int ty = clampi((int)(s_moveStick.cy - ny * s_moveStick.ry * 1.25f), 0, GA_ENGINE_H - 1);
+        if (tx != s_moveStick.last_x || ty != s_moveStick.last_y) {
+            s_touch(&jni, NULL, 2, tx, ty, (jlong)s_moveStick.slot, 0, 0);
+            s_moveStick.last_x = tx;
+            s_moveStick.last_y = ty;
+            l_debug("[input] move-stick move @(%d,%d)", tx, ty);
         }
         return;
     }
 
-    if (!s_moveStick.active) {
-        int cx, cy; float rx, ry;
-        if (!stick_region(&cx, &cy, &rx, &ry)) {
-            l_debug("[input] move-stick: AnalogStick not interactable right now");
-            return;
-        }
-        s_moveStick.cx = cx;
-        s_moveStick.cy = cy;
-        s_moveStick.rx = rx;
-        s_moveStick.ry = ry;
-        s_moveStick.last_x = cx;
-        s_moveStick.last_y = cy;
-        s_touch(&jni, NULL, 1, cx, cy, (jlong)s_moveStick.slot, 0, 0);
-        s_moveStick.active = 1;
-        l_note("[input] move-stick down @(%d,%d) r=(%.0f,%.0f) slot %d",
-               cx, cy, rx, ry, s_moveStick.slot);
+    /* Transitioning away from on-foot: release move-stick if active */
+    if (s_moveStick.active) {
+        s_touch(&jni, NULL, 0, s_moveStick.last_x, s_moveStick.last_y, (jlong)s_moveStick.slot, 0, 0);
+        l_note("[input] move-stick up (slot %d)", s_moveStick.slot);
+        s_moveStick.active = 0;
     }
 
-    /* A bit past the widget's own drawn radius (1.25x) so a fully-deflected
-     * physical stick reliably reaches whatever internal max-drag clamp
-     * AnalogStick::processTouch applies, same margin a real thumb dragging
-     * past the base graphic would give it. */
-    int tx = clampi((int)(s_moveStick.cx + nx * s_moveStick.rx * 1.25f), 0, GA_ENGINE_W - 1);
-    int ty = clampi((int)(s_moveStick.cy - ny * s_moveStick.ry * 1.25f), 0, GA_ENGINE_H - 1);
-    if (tx != s_moveStick.last_x || ty != s_moveStick.last_y) {
-        s_touch(&jni, NULL, 2, tx, ty, (jlong)s_moveStick.slot, 0, 0);
-        s_moveStick.last_x = tx;
-        s_moveStick.last_y = ty;
-        l_debug("[input] move-stick move @(%d,%d)", tx, ty);
+    /* 2. In vehicle: steering wheel / slide control */
+    if (wheel_region(&cx, &cy, &rx, &ry)) {
+        int want_steer = (nx != 0.0f);
+        if (!want_steer) {
+            if (s_wheelStick.active) {
+                s_touch(&jni, NULL, 0, s_wheelStick.last_x, s_wheelStick.last_y, (jlong)s_wheelStick.slot, 0, 0);
+                l_note("[input] wheel up (slot %d)", s_wheelStick.slot);
+                s_wheelStick.active = 0;
+            }
+            return;
+        }
+
+        if (!s_wheelStick.active) {
+            s_wheelStick.cx = cx;
+            s_wheelStick.cy = cy;
+            s_wheelStick.rx = rx;
+            s_wheelStick.ry = ry;
+            s_wheelStick.last_x = cx;
+            s_wheelStick.last_y = cy;
+            s_touch(&jni, NULL, 1, cx, cy, (jlong)s_wheelStick.slot, 0, 0);
+            s_wheelStick.active = 1;
+            l_note("[input] wheel down @(%d,%d) slot %d", cx, cy, s_wheelStick.slot);
+        }
+
+        /* 85px deflection reaches full lock (engine threshold is 70px in Wheel+0x68).
+         * nx > 0 (right) -> tx > cx -> first.x - current.x < 0 -> dir=0 (right)
+         * nx < 0 (left)  -> tx < cx -> first.x - current.x > 0 -> dir=1 (left) */
+        int tx = clampi((int)(s_wheelStick.cx + nx * 85.0f), 0, GA_ENGINE_W - 1);
+        int ty = s_wheelStick.cy;
+        if (tx != s_wheelStick.last_x || ty != s_wheelStick.last_y) {
+            s_touch(&jni, NULL, 2, tx, ty, (jlong)s_wheelStick.slot, 0, 0);
+            s_wheelStick.last_x = tx;
+            s_wheelStick.last_y = ty;
+            l_debug("[input] wheel move @(%d,%d) nx=%.2f", tx, ty, nx);
+        }
+        return;
+    }
+
+    /* 3. Neither stick nor wheel is interactable */
+    if (s_wheelStick.active) {
+        s_touch(&jni, NULL, 0, s_wheelStick.last_x, s_wheelStick.last_y, (jlong)s_wheelStick.slot, 0, 0);
+        l_note("[input] wheel up (slot %d)", s_wheelStick.slot);
+        s_wheelStick.active = 0;
     }
 }
 
