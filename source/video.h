@@ -5,9 +5,12 @@
 extern "C" {
 #endif
 
-// Loads the AVPLAYER sysmodule. Call once, after gl_init() (video_play()'s
-// texture allocator maps memory via sceGxmMapMemory, which needs the GXM
-// context vitaGL's init brings up).
+// Prepares the software (FFmpeg) video/audio decoder and mutexes. Call once,
+// after gl_init() -- video_play() creates a GL texture for frame output,
+// which needs the GXM context vitaGL's init brings up. No Vita sysmodule is
+// loaded here: cutscene decode is done entirely in software (see
+// video.cpp's file header for why -- the Vita's hardware decoder only
+// supports H.264, and this game's intro.m4v is MPEG-4 Part 2).
 void video_init(void);
 
 void video_shutdown(void);

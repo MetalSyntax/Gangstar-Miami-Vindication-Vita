@@ -1,342 +1,1055 @@
 /**
  * @file video.cpp
- * @brief Cutscene video playback using the SceAvPlayer hardware decoder.
- * @details Ported from the Shadow Guardian port's video.cpp (same soloader
- *          lineage). Decodes NV12 (Y + interleaved UV) frames and converts
- *          them to RGB on the GPU via a small GLES2 shader pair -- vitaGL
- *          supports this fine even though the game's own renderer only ever
- *          sees the spoofed "OpenGL ES 1.1" fixed-function pipeline
- *          (source/reimpl/gl.c); this code talks to vitaGL directly and
- *          never goes through the engine's GOT-patched GL entry points.
+ * @brief Cutscene video playback via software MPEG-4 Part2/AAC decode (FFmpeg).
+ *
+ * @details Fase 40/48 (port_progress.md) confirmed on real hardware that the
+ * Vita's hardware video decoder (`SceVideodec`, used internally by
+ * `SceAvPlayer`) only decodes H.264/AVC -- it has no hardware path for
+ * MPEG-4 Part 2, which is exactly what `intro.m4v` is (`mp4v` fourcc, Simple
+ * Profile, 800x500, confirmed via `ffprobe`; the file is a valid MP4
+ * container and opens fine, the decoder just never produces a single frame
+ * and the intro sits on black for its whole ~7.4s). Re-encoding the asset to
+ * H.264 was considered and rejected (CLAUDE.md rule #5): a port that needs
+ * to modify the original game's data files to work isn't a real port.
+ *
+ * So this file decodes the ORIGINAL MPEG-4 Part 2 / AAC file as shipped,
+ * entirely in software, via FFmpeg's `libavcodec`/`libswresample` (vitasdk
+ * already has these installed as vita-portlibs packages: `avformat`,
+ * `avcodec`, `avutil`, `swresample`, plus `mp3lame` as a hard link-time
+ * dependency of `avcodec.a` -- see the CMakeLists.txt comment next to those
+ * entries).
+ *
+ * ---------------------------------------------------------------------------
+ * Why libavformat is not used to open the file
+ * ---------------------------------------------------------------------------
+ * `av_find_input_format("mov")` returns NULL against this vitasdk build, and
+ * `avformat_open_input()`'s generic auto-probe never succeeds either:
+ *
+ *     $ ar t ~/vitasdk/arm-vita-eabi/lib/libavformat.a | grep -i mov
+ *     mov_chan.o/ mov_esds.o/ movenc.o/ movenc_ttml.o/ movenccenc.o/ movenchint.o/
+ *
+ * That is the MP4 *muxer* (`movenc.o`) plus two small shared helpers other
+ * formats use -- `mov.o`, the file containing `ff_mov_demuxer` itself, is
+ * simply not in the archive. This exact bug, and the fix below, were already
+ * found and hardware-verified in this workspace's Asphalt-5-Vita port (same
+ * vita-portlibs ffmpeg build, same missing demuxer, same Gameloft-era
+ * MPEG-4 Part 2 assets) -- this file is a direct port of that solution, not
+ * an independent reimplementation, so the same Vita-specific gotchas its
+ * comments document (frame-threading contention, `pthread_cond_t` being
+ * broken here, the GLES1.1-only rendering requirement) are reproduced rather
+ * than risking rediscovering them the hard way a second time.
+ *
+ * Fixed by not needing that demuxer at all: `mp4_open()`/`mp4_next_packet()`
+ * below parse the small slice of the ISO-BMFF box tree (`moov`/`trak`/
+ * `mdia`/`minf`/`stbl`) needed to hand libavcodec's MPEG-4 Part 2 and AAC
+ * decoders -- both present and working in this same build -- their two
+ * elementary streams directly, packet by packet, reading via plain
+ * `sceIoOpen`/`sceIoRead`/`sceIoLseek`. Scoped deliberately to what
+ * `intro.m4v` actually uses (one video + one audio track, one sample
+ * description each, no edit lists, no fragmentation) -- this is not a
+ * general-purpose MP4 parser.
+ *
+ * ---------------------------------------------------------------------------
+ * Architecture
+ * ---------------------------------------------------------------------------
+ *   - **Decode thread** (`video_decode_thread`, cores 1-2): demuxes, decodes
+ *     video, converts YUV420P -> RGB565 with NEON, and publishes finished
+ *     frames into a 3-slot ring with their presentation timestamps. Audio
+ *     packets are handed off to the audio thread still compressed.
+ *   - **Audio thread** (`cutscene_audio_thread`, core 2): decodes AAC,
+ *     resamples to interleaved S16 and feeds `sceAudioOut` in fixed
+ *     1024-frame blocks. `sceAudioOutOutput()` blocks until the hardware is
+ *     ready, so this thread paces itself against the real audio clock.
+ *   - **Render thread** (the caller: `Method_loadMovie` (java.c) ->
+ *     `video_play()`, i.e. the thread that owns the GXM context): only ever
+ *     uploads the frame that is due, draws it and swaps. No decoding, no
+ *     color conversion.
+ *
+ * Video is paced against the audio hardware clock (samples actually played
+ * back, not wall time); falls back to a wall clock when there is no usable
+ * audio stream, and a watchdog also falls back if the audio clock ever
+ * stalls for 2s. A second, coarser watchdog caps total playback at 30s
+ * (intro.m4v is ~7.4s) as a backstop in case a future asset swap ever hands
+ * this a file that can't reach a natural EOF -- same "always return, never
+ * hang" contract Fase 48 already established for the previous SceAvPlayer
+ * implementation.
+ *
+ * Nothing uses `pthread_cond_t`: every wait in this file is a mutex-guarded
+ * flag plus `sceKernelDelayThread()` polling (confirmed-broken on this port,
+ * see the Asphalt-5-Vita source this was ported from). Both worker threads
+ * are real pthreads (not `sceKernelCreateThread()`): FFmpeg's own internal
+ * frame-threading waits on condition variables on whichever thread calls
+ * `avcodec_receive_frame()`, which is only well-defined from a thread
+ * libpthread itself created.
+ *
+ * `draw_video_frame()` uses PLAIN GLES1.1 fixed-function texturing
+ * (glVertexPointer/glTexCoordPointer/glDrawArrays), never a custom GLSL
+ * program -- the previous SceAvPlayer-based version of this file used a
+ * small GLES2 shader pair to convert NV12 on the GPU, but per the
+ * Asphalt-5-Vita source this replaces, that exact pattern caused a
+ * confirmed-on-hardware regression there (every fixed-function draw for the
+ * rest of the program's life came out solid white the first time it ran).
+ * vitaGL implements the fixed-function pipeline via its own internally
+ * managed shader machinery, layered under the same glUseProgram/vertex
+ * attribute API surface a real custom shader uses -- mixing the two is the
+ * risk, not proven to be needed here since our old GLES2 path never actually
+ * got real decoded frames to prove or disprove it. NEON YUV420P->RGB565 on
+ * the CPU avoids the question entirely.
  */
 
 #include "video.h"
 #include "utils/logger.h"
 #include "utils/glutil.h"
 
-#include <psp2/avplayer.h>
-#include <psp2/sysmodule.h>
-#include <psp2/io/fcntl.h>
-#include <psp2/io/stat.h>
 #include <psp2/ctrl.h>
 #include <psp2/audioout.h>
+#include <psp2/kernel/cpu.h>
 #include <psp2/kernel/threadmgr.h>
-#include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/processmgr.h>
-#include <psp2/gxm.h>
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 
-#include <kubridge.h>
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/mathematics.h>
+#include <libswresample/swresample.h>
+}
+
+#include <arm_neon.h>
 #include <malloc.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
-
-static bool gModuleLoaded = false;
-static unsigned char *gYuvScratch = NULL;
-static unsigned gYuvScratchCap = 0;
-
-/**
- * @struct AvFileCtx
- * @brief Context structure for SceAvPlayer file replacement callbacks.
- */
-struct AvFileCtx {
-    SceUID fd;
-    uint64_t total_read;
-    unsigned read_calls;
-};
-static AvFileCtx gAvFileCtx = { -1, 0, 0 };
-
-static int av_file_open(void *p, const char *filename) {
-    AvFileCtx *ctx = (AvFileCtx *) p;
-    ctx->fd = sceIoOpen(filename, SCE_O_RDONLY, 0);
-    ctx->total_read = 0;
-    ctx->read_calls = 0;
-    l_info("video: file open(%s) -> fd=0x%08X", filename, (unsigned) ctx->fd);
-    return ctx->fd < 0 ? -1 : 0;
-}
-
-static int av_file_close(void *p) {
-    AvFileCtx *ctx = (AvFileCtx *) p;
-    l_info("video: file close (reads=%u, total_bytes=%llu)", ctx->read_calls,
-           (unsigned long long) ctx->total_read);
-    if (ctx->fd >= 0) sceIoClose(ctx->fd);
-    ctx->fd = -1;
-    return 0;
-}
-
-static int av_file_read(void *p, uint8_t *buffer, uint64_t position, uint32_t length) {
-    AvFileCtx *ctx = (AvFileCtx *) p;
-    int n = sceIoPread(ctx->fd, buffer, length, (SceOff) position);
-    ctx->read_calls++;
-    if (ctx->read_calls <= 5 || n < 0)
-        l_info("video: file read #%u pos=%llu len=%u -> %d", ctx->read_calls,
-               (unsigned long long) position, length, n);
-    if (n > 0) ctx->total_read += (uint64_t) n;
-    return n;
-}
-
-static uint64_t av_file_size(void *p) {
-    AvFileCtx *ctx = (AvFileCtx *) p;
-    SceOff end = sceIoLseek(ctx->fd, 0, SCE_SEEK_END);
-    l_info("video: file size -> %llu", (unsigned long long) end);
-    return (uint64_t) end;
-}
-
-/**
- * @brief Event and diagnostic callbacks for SceAvPlayer.
- */
-static const char *av_event_name(int32_t id) {
-    switch (id) {
-        case 0x01: return "STATE_STOP";
-        case 0x02: return "STATE_READY";
-        case 0x03: return "STATE_PLAY";
-        case 0x04: return "STATE_PAUSE";
-        case 0x05: return "STATE_BUFFERING";
-        case 0x10: return "TIMED_TEXT_DELIVERY";
-        case 0x20: return "WARNING_ID";
-        default:   return "?";
-    }
-}
-
-static void av_event_cb(void *p, int32_t eventId, int32_t sourceId, void *eventData) {
-    (void) p;
-    if (eventId == 0x20 && eventData) {
-        l_error("video: event WARNING_ID source=%d code=0x%08X", sourceId,
-                (unsigned) *(int32_t *) eventData);
-    } else {
-        l_info("video: event %s (0x%02X) source=%d data=%p", av_event_name(eventId),
-               (unsigned) eventId, sourceId, eventData);
-    }
-}
-
-#define AV_FB_ALIGNMENT 0x40000
-#define AV_ALIGN_MEM(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
-
-static void *av_alloc(void *arg, uint32_t alignment, uint32_t size) {
-    (void) arg;
-    void *p = memalign(alignment, size);
-    if (!p)
-        l_error("video: general alloc FAILED (align=%u size=%u)", alignment, size);
-    return p;
-}
-
-static void av_free(void *arg, void *ptr) {
-    (void) arg;
-    free(ptr);
-}
-
-#define AV_TEX_MAX_BLOCKS 8
-static struct { void *base; SceUID uid; } gAvTexBlocks[AV_TEX_MAX_BLOCKS];
-
-/**
- * @brief Texture memory allocator with tiered fallback so the intro actually starts.
- * @details Tier 1 is CDRAM with custom alignment (what SceAvPlayer normally
- *          uses). Tier 2 is physically-contiguous main RAM, which the kernel
- *          always aligns to 1MB itself and rejects a custom alignment opt for
- *          (SCE_KERNEL_ERROR_INVALID_ARGUMENT) -- hence NULL opt. Tier 3 is
- *          USER_RW_UNCACHE: uncached, GXM-mappable, and not drawn from either
- *          contiguous pool, so it still succeeds when both CDRAM and PHYCONT
- *          report NO_FREE_PHYSICAL_PAGE -- a real possibility here since
- *          vitaGL's circular pool (gl_init(), 64 MB) and shader cache already
- *          compete for the same physically-contiguous memory. Our playback
- *          path only memcpys the decoded frame out and uploads it via
- *          glTexSubImage2D, so any CPU-writable mapping works; the
- *          sceGxmMapMemory call keeps the pointer valid for AvPlayer.
- */
-static void *av_alloc_texture(void *arg, uint32_t alignment, uint32_t size) {
-    (void) arg;
-    uint32_t req_align = alignment, req_size = size;
-    if (alignment < AV_FB_ALIGNMENT)
-        alignment = AV_FB_ALIGNMENT;
-    size = AV_ALIGN_MEM(size, alignment);
-
-    SceKernelAllocMemBlockOpt opt;
-    memset(&opt, 0, sizeof(opt));
-    opt.size = sizeof(opt);
-    opt.attr = 0x00000004U; // SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT
-    opt.alignment = alignment;
-    SceUID blk = sceKernelAllocMemBlock("av_tex", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, size, &opt);
-    const char *usedType = "CDRAM";
-    if (blk < 0) {
-        SceUID cdram_err = blk;
-        // PHYCONT blocks are always naturally aligned to 1MB by the kernel and
-        // reject a custom alignment attribute with SCE_KERNEL_ERROR_INVALID_ARGUMENT
-        // (0x80020005) -- pass no opt at all for this fallback allocation.
-        uint32_t phy_size = AV_ALIGN_MEM(size, 0x100000);
-        SceUID blk2 = sceKernelAllocMemBlock("av_tex_phycont", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, phy_size, NULL);
-        if (blk2 < 0) {
-            SceUID phy_err = blk2;
-            // Last resort: uncached RAM (SDL Vita GXM pattern). Accepts an alignment
-            // opt like CDRAM and is GXM-mappable, but comes from neither contiguous
-            // pool, so it survives both being exhausted.
-            SceUID blk3 = sceKernelAllocMemBlock("av_tex_uncache", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, size, &opt);
-            if (blk3 < 0) {
-                l_error("video: texture memblock alloc FAILED on CDRAM (0x%08X), PHYCONT (0x%08X) and UNCACHE (0x%08X) (req align=%u size=%u -> size=%u)",
-                        (unsigned) cdram_err, (unsigned) phy_err, (unsigned) blk3, req_align, req_size, size);
-                return NULL;
-            }
-            l_warn("video: CDRAM (0x%08X) and PHYCONT (0x%08X) exhausted -- fell back to UNCACHE for this frame buffer",
-                   (unsigned) cdram_err, (unsigned) phy_err);
-            blk = blk3;
-            usedType = "UNCACHE";
-        } else {
-            l_warn("video: CDRAM alloc failed (0x%08X) -- fell back to PHYCONT for this frame buffer", (unsigned) cdram_err);
-            blk = blk2;
-            usedType = "PHYCONT";
-            size = phy_size;
-        }
-    }
-    void *base = NULL;
-    sceKernelGetMemBlockBase(blk, &base);
-    int map = sceGxmMapMemory(base, size, (SceGxmMemoryAttribFlags)(SCE_GXM_MEMORY_ATTRIB_READ | SCE_GXM_MEMORY_ATTRIB_WRITE));
-
-    int slot = -1;
-    for (int i = 0; i < AV_TEX_MAX_BLOCKS; i++) {
-        if (!gAvTexBlocks[i].base) { slot = i; break; }
-    }
-    if (slot < 0) {
-        l_error("video: no free texture block slots (max %d) -- releasing uid=0x%08X", AV_TEX_MAX_BLOCKS, (unsigned) blk);
-        sceGxmUnmapMemory(base);
-        sceKernelFreeMemBlock(blk);
-        return NULL;
-    }
-    gAvTexBlocks[slot].base = base;
-    gAvTexBlocks[slot].uid = blk;
-    l_info("video: texture memblock ok (%s) (req align=%u size=%u -> size=%u) base=%p uid=0x%08X gxm_map=0x%08X",
-           usedType, req_align, req_size, size, base, (unsigned) blk, (unsigned) map);
-    return base;
-}
-
-static void av_free_texture(void *arg, void *ptr) {
-    (void) arg;
-    if (!ptr) return;
-    glFinish();
-    for (int i = 0; i < AV_TEX_MAX_BLOCKS; i++) {
-        if (gAvTexBlocks[i].base == ptr) {
-            l_info("video: texture memblock free %p uid=0x%08X", ptr, (unsigned) gAvTexBlocks[i].uid);
-            sceGxmUnmapMemory(ptr);
-            sceKernelFreeMemBlock(gAvTexBlocks[i].uid);
-            gAvTexBlocks[i].base = NULL;
-            gAvTexBlocks[i].uid = -1;
-            return;
-        }
-    }
-    l_warn("video: texture free for unknown ptr %p (leaking it)", ptr);
-}
-
-/**
- * @brief GLES2 program that converts NV12 (Y plane + interleaved UV plane) to
- *        RGB on the GPU, sampling both planes as plain luminance/luminance-alpha
- *        textures -- no CPU-side color conversion needed.
- */
-static GLuint gVideoProgram = 0;
-static GLint gVideoPosLoc = -1;
-static GLint gVideoUvLoc = -1;
-static GLint gVideoYTexLoc = -1;
-static GLint gVideoUVTexLoc = -1;
-static GLuint gVideoYTex = 0;
-static GLuint gVideoUVTex = 0;
-static unsigned gVideoTexW = 0;
-static unsigned gVideoTexH = 0;
-
-static void ensure_video_program() {
-    if (gVideoProgram) return;
-
-    static const char *kVideoVS =
-        "attribute vec2 aPos;\n"
-        "attribute vec2 aUV;\n"
-        "varying vec2 vUV;\n"
-        "void main() {\n"
-        "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
-        "    vUV = aUV;\n"
-        "}\n";
-    static const char *kVideoFS =
-        "precision mediump float;\n"
-        "varying vec2 vUV;\n"
-        "uniform sampler2D uYTex;\n"
-        "uniform sampler2D uUVTex;\n"
-        "void main() {\n"
-        "    float y = texture2D(uYTex, vUV).r;\n"
-        "    vec2 uv = texture2D(uUVTex, vUV).ra - vec2(0.5, 0.5);\n"
-        "    float r = y + 1.401993 * uv.y;\n"
-        "    float g = y - 0.344136 * uv.x - 0.714136 * uv.y;\n"
-        "    float b = y + 1.772000 * uv.x;\n"
-        "    gl_FragColor = vec4(r, g, b, 1.0);\n"
-        "}\n";
-
-    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource_soloader(vs, 1, &kVideoVS, NULL);
-    glCompileShader_soloader(vs);
-
-    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource_soloader(fs, 1, &kVideoFS, NULL);
-    glCompileShader_soloader(fs);
-
-    gVideoProgram = glCreateProgram();
-    glAttachShader(gVideoProgram, vs);
-    glAttachShader(gVideoProgram, fs);
-    glBindAttribLocation(gVideoProgram, 0, "aPos");
-    glBindAttribLocation(gVideoProgram, 1, "aUV");
-    glLinkProgram_soloader(gVideoProgram);
-
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-
-    gVideoPosLoc = 0;
-    gVideoUvLoc = 1;
-    gVideoYTexLoc = glGetUniformLocation(gVideoProgram, "uYTex");
-    gVideoUVTexLoc = glGetUniformLocation(gVideoProgram, "uUVTex");
-    l_info("video: GLES2 YUV program ready (program=%u posLoc=%d uvLoc=%d yTexLoc=%d uvTexLoc=%d)",
-           gVideoProgram, gVideoPosLoc, gVideoUvLoc, gVideoYTexLoc, gVideoUVTexLoc);
-}
 
 #define REAL_SCREEN_W 960
 #define REAL_SCREEN_H 544
 
+/*
+ * Ring of finished (already color-converted) frames between the decode
+ * thread and the render thread. 3 slots is a frame being displayed, a frame
+ * ready to go, and a frame being converted.
+ */
+#define VIDEO_FRAME_SLOTS 3
+
+// One AAC packet is 1024 samples (~23ms at 44.1kHz); 64 packets is ~1.5s of
+// slack so a frame-ring stall never starves audio output and clicks.
+#define AUDIO_PKT_QUEUE_CAP 64
+
+// Frames per channel handed to sceAudioOutOutput() per call, fixed at open
+// time. Resampled output is accumulated and emitted in whole blocks instead
+// of one decoded AAC frame at a time (swr_convert() can return any count).
+// Must be a multiple of 64.
+#define AUDIO_GRAIN 1024
+
+// Fixed presentation period: every frame ring, drop-to-latest and audio-sync
+// decision below runs against this tick regardless of the source's own
+// frame rate, exactly like the Asphalt-5-Vita port this was adapted from.
+#define VIDEO_FRAME_PERIOD_US 33333
+
+/*
+ * Frame-level threading for the video decoder -- OFF. Asphalt-5-Vita's own
+ * Bug #25 (confirmed on identical hardware, this same CPU/scheduler) found
+ * that VIDEO_DECODE_THREADS=3 made the NEON conversion measure 3x SLOWER,
+ * not faster: libavcodec's frame-thread pool is plain pthread_create() with
+ * no Vita affinity call reaching it, so it roams cores 0-2 freely and
+ * contends with this file's own affinitized decode/audio threads (and the
+ * render thread). A single decode thread also keeps
+ * handle_decoded_frame()'s `P.vctx->skip_frame` mutation well-defined --
+ * frames are decoded one at a time in order.
+ */
+#define VIDEO_DECODE_THREADS 1
+
+static const AVRational kUsTimeBase = { 1, 1000000 };
+
+static inline int64_t now_us(void) {
+    return (int64_t) sceKernelGetProcessTimeWide();
+}
+
+// ---------------------------------------------------------------------------
+// Minimal MP4 (ISO-BMFF) demuxer
+// ---------------------------------------------------------------------------
+//
+// Stands in for libavformat's "mov" demuxer, which this vita-portlibs
+// FFmpeg build does not actually contain (see the file header). Parses just
+// enough of the box tree (moov/trak/mdia/minf/stbl) to hand libavcodec's
+// MPEG-4 Part 2 / AAC decoders their two elementary streams directly,
+// packet by packet, in the same interleaved order they already sit in the
+// file -- no seeking backwards, no re-muxing, intro.m4v read completely
+// unmodified.
+
+struct Mp4Sample {
+    uint64_t offset;     // absolute file offset
+    uint32_t size;
+    int64_t  dts;        // decode timestamp, in the track's own timescale
+    int32_t  cts_delta;  // composition offset (ctts), same timescale; 0 if none
+};
+
+struct Mp4Track {
+    bool       present;
+    uint32_t   timescale;
+    AVCodecID  codec_id;
+    int        width, height;          // video only
+    int        channels, sample_rate;  // audio only
+    uint8_t   *extradata;
+    int        extradata_size;
+    Mp4Sample *samples;
+    uint32_t   sample_count;
+    uint32_t   next;                   // read cursor, playback only
+};
+
+#define MP4_STREAM_VIDEO 0
+#define MP4_STREAM_AUDIO 1
+
+struct Mp4File {
+    SceUID   fd;
+    Mp4Track track[2];  // indexed by MP4_STREAM_VIDEO / MP4_STREAM_AUDIO
+};
+
+static inline uint32_t mp4_be32(const uint8_t *p) {
+    return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16) | ((uint32_t) p[2] << 8) | p[3];
+}
+static inline uint64_t mp4_be64(const uint8_t *p) {
+    return ((uint64_t) mp4_be32(p) << 32) | mp4_be32(p + 4);
+}
+#define MP4_FOURCC(a, b, c, d) \
+    (((uint32_t) (a) << 24) | ((uint32_t) (b) << 16) | ((uint32_t) (c) << 8) | (uint32_t) (d))
+
+struct Mp4Box {
+    uint32_t type;
+    uint64_t body_off, body_end;
+};
+
+static bool mp4_read_box(SceUID fd, uint64_t pos, uint64_t limit, Mp4Box *b) {
+    if (pos + 8 > limit)
+        return false;
+    uint8_t hdr[8];
+    if (sceIoLseek(fd, (SceOff) pos, SCE_SEEK_SET) < 0 || sceIoRead(fd, hdr, 8) != 8)
+        return false;
+    uint64_t size = mp4_be32(hdr);
+    uint32_t type = mp4_be32(hdr + 4);
+    uint64_t hdr_size = 8;
+    if (size == 1) {
+        uint8_t ext[8];
+        if (sceIoRead(fd, ext, 8) != 8)
+            return false;
+        size = mp4_be64(ext);
+        hdr_size = 16;
+    } else if (size == 0) {
+        size = limit - pos;
+    }
+    if (size < hdr_size || pos + size > limit)
+        return false;
+    b->type = type;
+    b->body_off = pos + hdr_size;
+    b->body_end = pos + size;
+    return true;
+}
+
+// Every box body this parser reads in full (stsd/stts/ctts/stsc/stsz/stco)
+// is at most a few tens of KB for this asset, so there is no need to stream
+// them -- read the whole thing and parse in memory. Caller av_frees it.
+static uint8_t *mp4_read_range(SceUID fd, uint64_t off, uint64_t end, uint32_t *out_len) {
+    uint64_t len = end - off;
+    if (len == 0 || len > (16u << 20))  // sanity cap; real boxes here are tiny
+        return NULL;
+    uint8_t *buf = (uint8_t *) av_malloc((size_t) len);
+    if (!buf)
+        return NULL;
+    if (sceIoLseek(fd, (SceOff) off, SCE_SEEK_SET) < 0 ||
+        sceIoRead(fd, buf, (SceSize) len) != (int) len) {
+        av_free(buf);
+        return NULL;
+    }
+    *out_len = (uint32_t) len;
+    return buf;
+}
+
+/*
+ * Walks an MPEG-4 descriptor tree (ISO/IEC 14496-1) inside an `esds` box
+ * looking for tag 0x05, DecoderSpecificInfo -- the raw codec config (an
+ * MPEG-4 VOL header for video, AudioSpecificConfig for AAC) libavcodec
+ * needs as `extradata`. Recurses into ES_Descr (0x03) and
+ * DecoderConfigDescr (0x04), the only two tags that can contain it here.
+ */
+static bool mp4_find_dec_specific_info(const uint8_t *buf, uint32_t len,
+                                        const uint8_t **out, uint32_t *out_len) {
+    uint32_t pos = 0;
+    while (pos + 2 <= len) {
+        uint8_t tag = buf[pos++];
+        uint32_t dlen = 0;
+        bool cont = true;
+        for (int i = 0; i < 4 && cont; i++) {
+            if (pos >= len) return false;
+            uint8_t b = buf[pos++];
+            dlen = (dlen << 7) | (b & 0x7f);
+            cont = (b & 0x80) != 0;
+        }
+        if (pos + dlen > len)
+            return false;
+        if (tag == 0x05) {
+            *out = buf + pos;
+            *out_len = dlen;
+            return true;
+        }
+        if (tag == 0x03 || tag == 0x04) {
+            uint32_t skip;
+            if (tag == 0x03) {
+                if (dlen < 3) return false;
+                uint8_t flags = buf[pos + 2];
+                skip = 3;
+                if (flags & 0x80) skip += 2;
+                if (flags & 0x40) { if (skip >= dlen) return false; skip += 1 + buf[pos + skip]; }
+                if (flags & 0x20) skip += 2;
+            } else {
+                skip = 1 + 1 + 3 + 4 + 4;  // objectType, streamType/flags, bufferSizeDB, max/avgBitrate
+            }
+            if (skip <= dlen && mp4_find_dec_specific_info(buf + pos + skip, dlen - skip, out, out_len))
+                return true;
+        }
+        pos += dlen;
+    }
+    return false;
+}
+
+// stsd: reads the track's first (only) sample entry -- codec fourcc,
+// width/height or channels/rate -- and pulls DecoderSpecificInfo out of its
+// nested `esds` box for extradata.
+static void mp4_parse_stsd(SceUID fd, uint64_t off, uint64_t end, Mp4Track *trk, bool is_audio) {
+    uint32_t len;
+    uint8_t *body = mp4_read_range(fd, off, end, &len);
+    if (!body) return;
+    if (len < 16) { av_free(body); return; }
+
+    uint32_t entry_off = 8;  // past version/flags(4)+entry_count(4); first SampleEntry starts here
+    uint32_t entry_size = mp4_be32(body + entry_off);
+    uint32_t format = mp4_be32(body + entry_off + 4);
+    // SampleEntry box header(8) + reserved[6]+data_reference_index(2) + the
+    // Audio/VisualSampleEntry's own fixed fields (20 / 70 bytes).
+    uint32_t fixed_size = is_audio ? (8 + 8 + 20) : (8 + 8 + 70);
+    if (entry_off + fixed_size > len) { av_free(body); return; }
+
+    if (is_audio) {
+        trk->codec_id = (format == MP4_FOURCC('m', 'p', '4', 'a')) ? AV_CODEC_ID_AAC : AV_CODEC_ID_NONE;
+        trk->channels = (int) (mp4_be32(body + entry_off + 24) >> 16);
+        trk->sample_rate = (int) (mp4_be32(body + entry_off + 32) >> 16);
+    } else {
+        trk->codec_id = (format == MP4_FOURCC('m', 'p', '4', 'v')) ? AV_CODEC_ID_MPEG4 : AV_CODEC_ID_NONE;
+        uint32_t wh = mp4_be32(body + entry_off + 32);
+        trk->width = (int) (wh >> 16);
+        trk->height = (int) (wh & 0xFFFF);
+    }
+
+    uint32_t child_off = entry_off + fixed_size;
+    uint32_t child_end = (entry_size >= fixed_size && entry_off + entry_size <= len) ? entry_off + entry_size : len;
+    while (child_off + 8 <= child_end) {
+        uint32_t bsize = mp4_be32(body + child_off);
+        uint32_t btype = mp4_be32(body + child_off + 4);
+        if (bsize < 8 || child_off + bsize > child_end) break;
+        if (btype == MP4_FOURCC('e', 's', 'd', 's') && bsize > 12) {
+            const uint8_t *desc = body + child_off + 12;  // box header(8) + FullBox version/flags(4)
+            uint32_t desc_len = bsize - 12;
+            const uint8_t *info; uint32_t info_len;
+            if (mp4_find_dec_specific_info(desc, desc_len, &info, &info_len) && info_len > 0) {
+                trk->extradata = (uint8_t *) av_mallocz(info_len + AV_INPUT_BUFFER_PADDING_SIZE);
+                if (trk->extradata) {
+                    memcpy(trk->extradata, info, info_len);
+                    trk->extradata_size = (int) info_len;
+                }
+            }
+            break;
+        }
+        child_off += bsize;
+    }
+    av_free(body);
+}
+
+// stbl: locates stsd/stts/ctts/stsc/stsz/stco (or co64), then builds the
+// track's flat, chunk-ordered sample list (offset/size/dts/cts per sample).
+static bool mp4_parse_stbl(SceUID fd, uint64_t off, uint64_t end, Mp4Track *trk, bool is_audio) {
+    uint64_t stsd_off = 0, stsd_end = 0, stts_off = 0, stts_end = 0;
+    uint64_t ctts_off = 0, ctts_end = 0, stsc_off = 0, stsc_end = 0;
+    uint64_t stsz_off = 0, stsz_end = 0, stco_off = 0, stco_end = 0;
+    bool have_stsd = false, have_stts = false, have_ctts = false;
+    bool have_stsc = false, have_stsz = false, have_stco = false, stco_is64 = false;
+
+    for (uint64_t pos = off; pos < end; ) {
+        Mp4Box b;
+        if (!mp4_read_box(fd, pos, end, &b)) break;
+        if (b.type == MP4_FOURCC('s', 't', 's', 'd')) { stsd_off = b.body_off; stsd_end = b.body_end; have_stsd = true; }
+        else if (b.type == MP4_FOURCC('s', 't', 't', 's')) { stts_off = b.body_off; stts_end = b.body_end; have_stts = true; }
+        else if (b.type == MP4_FOURCC('c', 't', 't', 's')) { ctts_off = b.body_off; ctts_end = b.body_end; have_ctts = true; }
+        else if (b.type == MP4_FOURCC('s', 't', 's', 'c')) { stsc_off = b.body_off; stsc_end = b.body_end; have_stsc = true; }
+        else if (b.type == MP4_FOURCC('s', 't', 's', 'z')) { stsz_off = b.body_off; stsz_end = b.body_end; have_stsz = true; }
+        else if (b.type == MP4_FOURCC('s', 't', 'c', 'o')) { stco_off = b.body_off; stco_end = b.body_end; have_stco = true; stco_is64 = false; }
+        else if (b.type == MP4_FOURCC('c', 'o', '6', '4')) { stco_off = b.body_off; stco_end = b.body_end; have_stco = true; stco_is64 = true; }
+        pos = b.body_end;
+    }
+    if (!have_stsd || !have_stts || !have_stsc || !have_stsz || !have_stco)
+        return false;
+
+    mp4_parse_stsd(fd, stsd_off, stsd_end, trk, is_audio);
+    if (trk->codec_id == AV_CODEC_ID_NONE)
+        return false;
+
+    // ---- stsz: sample count + per-sample size (or one constant size) ----
+    uint32_t stsz_len;
+    uint8_t *stsz_body = mp4_read_range(fd, stsz_off, stsz_end, &stsz_len);
+    if (!stsz_body || stsz_len < 12) { av_free(stsz_body); return false; }
+    uint32_t const_size = mp4_be32(stsz_body + 4);
+    uint32_t sample_count = mp4_be32(stsz_body + 8);
+    if (sample_count == 0 || (const_size == 0 && stsz_len < 12 + (uint64_t) sample_count * 4)) {
+        av_free(stsz_body);
+        return false;
+    }
+
+    Mp4Sample *samples = (Mp4Sample *) av_mallocz(sample_count * sizeof(Mp4Sample));
+    if (!samples) { av_free(stsz_body); return false; }
+    for (uint32_t i = 0; i < sample_count; i++)
+        samples[i].size = const_size ? const_size : mp4_be32(stsz_body + 12 + i * 4);
+    av_free(stsz_body);
+
+    // ---- stts: expand (count,delta) runs into a per-sample dts ----
+    uint32_t stts_len;
+    uint8_t *stts_body = mp4_read_range(fd, stts_off, stts_end, &stts_len);
+    if (!stts_body || stts_len < 4) { av_free(stts_body); av_free(samples); return false; }
+    uint32_t stts_entries = mp4_be32(stts_body + 4);
+    int64_t dts = 0;
+    uint32_t si = 0;
+    for (uint32_t e = 0; e < stts_entries && si < sample_count; e++) {
+        uint64_t eoff = 8 + (uint64_t) e * 8;
+        if (eoff + 8 > stts_len) break;
+        uint32_t count = mp4_be32(stts_body + eoff);
+        uint32_t delta = mp4_be32(stts_body + eoff + 4);
+        for (uint32_t k = 0; k < count && si < sample_count; k++, si++) {
+            samples[si].dts = dts;
+            dts += delta;
+        }
+    }
+    av_free(stts_body);
+
+    // ---- ctts (optional): same run-length shape, signed offsets ----
+    if (have_ctts) {
+        uint32_t ctts_len;
+        uint8_t *ctts_body = mp4_read_range(fd, ctts_off, ctts_end, &ctts_len);
+        if (ctts_body && ctts_len >= 4) {
+            uint32_t ctts_entries = mp4_be32(ctts_body + 4);
+            si = 0;
+            for (uint32_t e = 0; e < ctts_entries && si < sample_count; e++) {
+                uint64_t eoff = 8 + (uint64_t) e * 8;
+                if (eoff + 8 > ctts_len) break;
+                uint32_t count = mp4_be32(ctts_body + eoff);
+                int32_t coff = (int32_t) mp4_be32(ctts_body + eoff + 4);
+                for (uint32_t k = 0; k < count && si < sample_count; k++, si++)
+                    samples[si].cts_delta = coff;
+            }
+        }
+        av_free(ctts_body);
+    }
+
+    // ---- stsc + stco/co64: chunk layout -> absolute per-sample offset ----
+    uint32_t stsc_len = 0;
+    uint8_t *stsc_body = mp4_read_range(fd, stsc_off, stsc_end, &stsc_len);
+    uint32_t stco_len = 0;
+    uint8_t *stco_body = mp4_read_range(fd, stco_off, stco_end, &stco_len);
+    bool ok = stsc_body && stco_body && stsc_len >= 4 && stco_len >= 4;
+    if (ok) {
+        uint32_t stsc_entries = mp4_be32(stsc_body + 4);
+        uint32_t stride = stco_is64 ? 8 : 4;
+        uint32_t num_chunks = mp4_be32(stco_body + 4);
+        ok = stsc_entries > 0 && num_chunks > 0 &&
+             stsc_len >= 8 + (uint64_t) stsc_entries * 12 &&
+             stco_len >= 8 + (uint64_t) num_chunks * stride;
+        if (ok) {
+            uint32_t stsc_idx = 0;
+            si = 0;
+            for (uint32_t chunk = 0; chunk < num_chunks && si < sample_count; chunk++) {
+                uint32_t chunk1 = chunk + 1;
+                while (stsc_idx + 1 < stsc_entries &&
+                       mp4_be32(stsc_body + 8 + (stsc_idx + 1) * 12) <= chunk1)
+                    stsc_idx++;
+                uint32_t spc = mp4_be32(stsc_body + 8 + stsc_idx * 12 + 4);
+                uint64_t coff = stco_is64 ? mp4_be64(stco_body + 8 + (uint64_t) chunk * 8)
+                                          : mp4_be32(stco_body + 8 + (uint64_t) chunk * 4);
+                for (uint32_t s = 0; s < spc && si < sample_count; s++, si++) {
+                    samples[si].offset = coff;
+                    coff += samples[si].size;
+                }
+            }
+            ok = (si == sample_count);
+        }
+    }
+    av_free(stsc_body);
+    av_free(stco_body);
+    if (!ok) { av_free(samples); return false; }
+
+    trk->samples = samples;
+    trk->sample_count = sample_count;
+    trk->present = true;
+    return true;
+}
+
+// Recurses moov -> trak -> mdia -> minf -> stbl, and reads mdia's own mdhd
+// (timescale) and hdlr (handler_type: 'vide'/'soun') along the way.
+static void mp4_parse_trak(SceUID fd, uint64_t off, uint64_t end, Mp4Track *video, Mp4Track *audio) {
+    uint32_t timescale = 0;
+    bool is_video = false, is_audio = false;
+    uint64_t stbl_off = 0, stbl_end = 0;
+    bool have_stbl = false;
+
+    for (uint64_t pos = off; pos < end; ) {
+        Mp4Box b;
+        if (!mp4_read_box(fd, pos, end, &b)) break;
+        if (b.type == MP4_FOURCC('m', 'd', 'i', 'a')) {
+            for (uint64_t p2 = b.body_off; p2 < b.body_end; ) {
+                Mp4Box c;
+                if (!mp4_read_box(fd, p2, b.body_end, &c)) break;
+                if (c.type == MP4_FOURCC('m', 'd', 'h', 'd')) {
+                    uint32_t len;
+                    uint8_t *body = mp4_read_range(fd, c.body_off, c.body_end, &len);
+                    if (body) {
+                        uint8_t version = body[0];
+                        timescale = version == 1 ? mp4_be32(body + 20) : mp4_be32(body + 12);
+                        av_free(body);
+                    }
+                } else if (c.type == MP4_FOURCC('h', 'd', 'l', 'r')) {
+                    uint32_t len;
+                    uint8_t *body = mp4_read_range(fd, c.body_off, c.body_end, &len);
+                    if (body && len >= 12) {
+                        uint32_t handler = mp4_be32(body + 8);
+                        is_video = (handler == MP4_FOURCC('v', 'i', 'd', 'e'));
+                        is_audio = (handler == MP4_FOURCC('s', 'o', 'u', 'n'));
+                    }
+                    av_free(body);
+                } else if (c.type == MP4_FOURCC('m', 'i', 'n', 'f')) {
+                    for (uint64_t p3 = c.body_off; p3 < c.body_end; ) {
+                        Mp4Box d;
+                        if (!mp4_read_box(fd, p3, c.body_end, &d)) break;
+                        if (d.type == MP4_FOURCC('s', 't', 'b', 'l')) {
+                            stbl_off = d.body_off; stbl_end = d.body_end; have_stbl = true;
+                        }
+                        p3 = d.body_end;
+                    }
+                }
+                p2 = c.body_end;
+            }
+        }
+        pos = b.body_end;
+    }
+
+    if (!have_stbl || timescale == 0 || (!is_video && !is_audio))
+        return;
+
+    Mp4Track *trk = is_video ? video : audio;
+    if (trk->present)
+        return;  // one video + one audio track expected; ignore any extra
+    trk->timescale = timescale;
+    mp4_parse_stbl(fd, stbl_off, stbl_end, trk, is_audio);
+    if (!trk->present)
+        memset(trk, 0, sizeof(*trk));  // parse failed partway through; leave it absent
+}
+
+static bool mp4_open(const char *path, Mp4File *mp4) {
+    memset(mp4, 0, sizeof(*mp4));
+    mp4->fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (mp4->fd < 0) {
+        l_error("video: sceIoOpen failed for %s (0x%08X)", path, (unsigned) mp4->fd);
+        return false;
+    }
+    int64_t size = (int64_t) sceIoLseek(mp4->fd, 0, SCE_SEEK_END);
+    l_note("video: opened %s (%lld bytes)", path, (long long) size);
+
+    uint64_t moov_off = 0, moov_end = 0;
+    bool have_moov = false;
+    for (uint64_t pos = 0; pos < (uint64_t) size; ) {
+        Mp4Box b;
+        if (!mp4_read_box(mp4->fd, pos, (uint64_t) size, &b)) break;
+        if (b.type == MP4_FOURCC('m', 'o', 'o', 'v')) { moov_off = b.body_off; moov_end = b.body_end; have_moov = true; break; }
+        pos = b.body_end;
+    }
+    if (!have_moov) {
+        l_error("video: no moov box found in %s", path);
+        sceIoClose(mp4->fd);
+        mp4->fd = -1;
+        return false;
+    }
+
+    for (uint64_t pos = moov_off; pos < moov_end; ) {
+        Mp4Box b;
+        if (!mp4_read_box(mp4->fd, pos, moov_end, &b)) break;
+        if (b.type == MP4_FOURCC('t', 'r', 'a', 'k'))
+            mp4_parse_trak(mp4->fd, b.body_off, b.body_end, &mp4->track[MP4_STREAM_VIDEO], &mp4->track[MP4_STREAM_AUDIO]);
+        pos = b.body_end;
+    }
+
+    Mp4Track *v = &mp4->track[MP4_STREAM_VIDEO];
+    Mp4Track *a = &mp4->track[MP4_STREAM_AUDIO];
+    // Release-visible on purpose (l_note): this is the single most useful
+    // line for verifying the fix on real hardware -- confirms the demuxer
+    // actually found real tracks with the expected codec ids/dimensions,
+    // as opposed to silently falling through to "no usable video track".
+    l_note("video: demux: video track %s (codec_id=%d %dx%d, timescale=%u, %u samples), "
+           "audio track %s (codec_id=%d %dch %dHz, timescale=%u, %u samples)",
+           v->present ? "FOUND" : "absent", (int) v->codec_id, v->width, v->height,
+           v->timescale, v->sample_count,
+           a->present ? "FOUND" : "absent", (int) a->codec_id, a->channels, a->sample_rate,
+           a->timescale, a->sample_count);
+
+    if (!v->present) {
+        l_error("video: no usable video track parsed from %s", path);
+        sceIoClose(mp4->fd);
+        mp4->fd = -1;
+        return false;
+    }
+    return true;
+}
+
+// Next packet in file order across both tracks (whichever track's next
+// sample sits at the lower file offset), matching how the file is actually
+// interleaved. Returns false at EOF on both.
+static bool mp4_next_packet(Mp4File *mp4, AVPacket *pkt, int *stream_index) {
+    Mp4Track *v = &mp4->track[MP4_STREAM_VIDEO];
+    Mp4Track *a = &mp4->track[MP4_STREAM_AUDIO];
+    bool v_left = v->present && v->next < v->sample_count;
+    bool a_left = a->present && a->next < a->sample_count;
+    if (!v_left && !a_left)
+        return false;
+
+    bool take_video = (v_left && a_left) ? (v->samples[v->next].offset <= a->samples[a->next].offset) : v_left;
+
+    Mp4Track *t = take_video ? v : a;
+    Mp4Sample *s = &t->samples[t->next++];
+
+    if (av_new_packet(pkt, (int) s->size) < 0)
+        return false;
+    if (sceIoLseek(mp4->fd, (SceOff) s->offset, SCE_SEEK_SET) < 0 ||
+        sceIoRead(mp4->fd, pkt->data, (SceSize) s->size) != (int) s->size) {
+        l_error("video: sceIoRead failed for a %u-byte sample at offset %llu",
+                s->size, (unsigned long long) s->offset);
+        av_packet_unref(pkt);
+        return false;
+    }
+    pkt->pts = s->dts + s->cts_delta;
+    pkt->dts = s->dts;
+    *stream_index = take_video ? MP4_STREAM_VIDEO : MP4_STREAM_AUDIO;
+    return true;
+}
+
+static void mp4_close(Mp4File *mp4) {
+    if (mp4->track[MP4_STREAM_VIDEO].extradata) { av_free(mp4->track[MP4_STREAM_VIDEO].extradata); mp4->track[MP4_STREAM_VIDEO].extradata = NULL; }
+    if (mp4->track[MP4_STREAM_AUDIO].extradata) { av_free(mp4->track[MP4_STREAM_AUDIO].extradata); mp4->track[MP4_STREAM_AUDIO].extradata = NULL; }
+    if (mp4->track[MP4_STREAM_VIDEO].samples) { av_free(mp4->track[MP4_STREAM_VIDEO].samples); mp4->track[MP4_STREAM_VIDEO].samples = NULL; }
+    if (mp4->track[MP4_STREAM_AUDIO].samples) { av_free(mp4->track[MP4_STREAM_AUDIO].samples); mp4->track[MP4_STREAM_AUDIO].samples = NULL; }
+    if (mp4->fd >= 0) {
+        sceIoClose(mp4->fd);
+        mp4->fd = -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEON YUV420P -> RGB565
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Planar YUV420P (FFmpeg's native decode output for this codec) to
+ * RGB565, using ARM NEON intrinsics. Ported verbatim from Asphalt-5-Vita's
+ * Bug #25 fix (Q7 int16 chroma math -- see that project's port_progress.md
+ * for the derivation; output is within 1 RGB565 LSB of the naive Q16 int32
+ * version, invisible once quantized).
+ *
+ * Takes a stride (`AVFrame::linesize`) per plane, separate from the visible
+ * width -- FFmpeg decode buffers are commonly padded/aligned wider than the
+ * actual frame. Assumes even `w`/`h` (walks two rows/columns at a time);
+ * callers round both down to even.
+ */
+static int CV_R[256];
+static int CV_G[256];
+static int CU_G[256];
+static int CU_B[256];
+static unsigned char clip_table[768];
+static bool tables_init = false;
+
+static void init_yuv_tables() {
+    if (tables_init) return;
+    for (int i = 0; i < 256; i++) {
+        int V = i - 128;
+        int U = i - 128;
+        CV_R[i] = (91881 * V) >> 16;
+        CV_G[i] = (46802 * V) >> 16;
+        CU_G[i] = (22554 * U) >> 16;
+        CU_B[i] = (116130 * U) >> 16;
+    }
+    for (int i = 0; i < 768; i++) {
+        int v = i - 256;
+        clip_table[i] = (v < 0) ? 0 : ((v > 255) ? 255 : v);
+    }
+    tables_init = true;
+}
+
+#define CLIP(X) (clip_table[(X) + 256])
+
+static inline void store_rgb565_8(unsigned short *dst, uint8x8_t r, uint8x8_t g, uint8x8_t b) {
+    uint16x8_t rw = vmovl_u8(r);
+    uint16x8_t gw = vmovl_u8(g);
+    uint16x8_t bw = vmovl_u8(b);
+    uint16x8_t rr = vshlq_n_u16(vandq_u16(rw, vdupq_n_u16(0xF8)), 8);
+    uint16x8_t gg = vshlq_n_u16(vandq_u16(gw, vdupq_n_u16(0xFC)), 3);
+    uint16x8_t bb = vshrq_n_u16(bw, 3);
+    vst1q_u16((uint16_t *) dst, vorrq_u16(vorrq_u16(rr, gg), bb));
+}
+
+static void yuv420p_planar_to_rgb565(const unsigned char *yPlane, int yStride,
+                                      const unsigned char *uPlane, int uStride,
+                                      const unsigned char *vPlane, int vStride,
+                                      unsigned w, unsigned h, unsigned short *dst) {
+    init_yuv_tables();
+    for (unsigned y = 0; y < h; y += 2) {
+        const unsigned char *yrow0 = yPlane + (size_t) y * yStride;
+        const unsigned char *yrow1 = yrow0 + yStride;
+        const unsigned char *urow = uPlane + (size_t) (y / 2) * uStride;
+        const unsigned char *vrow = vPlane + (size_t) (y / 2) * vStride;
+        unsigned short *drow0 = dst + (size_t) y * w;
+        unsigned short *drow1 = drow0 + w;
+
+        unsigned x = 0;
+        // R = Y + 1.402*V -> (179*Vc+64)>>7, G = Y - 0.344*U - 0.714*V,
+        // B = Y + 1.772*U -> (227*Uc+64)>>7. Each channel is one vmul + one
+        // rounding shift (vrshrq_n_s16 folds the +64 into the shift).
+        for (; x + 16 <= w; x += 16) {
+            uint8x8_t u8 = vld1_u8(urow + x / 2);
+            uint8x8_t v8 = vld1_u8(vrow + x / 2);
+            int16x8_t Uc = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u8)), vdupq_n_s16(128));
+            int16x8_t Vc = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v8)), vdupq_n_s16(128));
+
+            int16x8_t r_add8 = vrshrq_n_s16(vmulq_n_s16(Vc, 179), 7);
+            int16x8_t g_add8 = vnegq_s16(vaddq_s16(vrshrq_n_s16(vmulq_n_s16(Uc, 44), 7),
+                                                  vrshrq_n_s16(vmulq_n_s16(Vc, 91), 7)));
+            int16x8_t b_add8 = vrshrq_n_s16(vmulq_n_s16(Uc, 227), 7);
+
+            int16x8x2_t r_dup = vzipq_s16(r_add8, r_add8);
+            int16x8x2_t g_dup = vzipq_s16(g_add8, g_add8);
+            int16x8x2_t b_dup = vzipq_s16(b_add8, b_add8);
+
+            for (int half = 0; half < 2; half++) {
+                const unsigned char *yr0 = yrow0 + x + half * 8;
+                const unsigned char *yr1 = yrow1 + x + half * 8;
+                int16x8_t r_add = half == 0 ? r_dup.val[0] : r_dup.val[1];
+                int16x8_t g_add = half == 0 ? g_dup.val[0] : g_dup.val[1];
+                int16x8_t b_add = half == 0 ? b_dup.val[0] : b_dup.val[1];
+
+                int16x8_t Y0 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(yr0)));
+                int16x8_t Y1 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(yr1)));
+
+                uint8x8_t r0 = vqmovun_s16(vaddq_s16(Y0, r_add));
+                uint8x8_t g0 = vqmovun_s16(vaddq_s16(Y0, g_add));
+                uint8x8_t b0 = vqmovun_s16(vaddq_s16(Y0, b_add));
+                uint8x8_t r1 = vqmovun_s16(vaddq_s16(Y1, r_add));
+                uint8x8_t g1 = vqmovun_s16(vaddq_s16(Y1, g_add));
+                uint8x8_t b1 = vqmovun_s16(vaddq_s16(Y1, b_add));
+
+                store_rgb565_8(drow0 + x + half * 8, r0, g0, b0);
+                store_rgb565_8(drow1 + x + half * 8, r1, g1, b1);
+            }
+        }
+
+        for (; x < w; x += 2) {
+            unsigned char U = urow[x / 2];
+            unsigned char V = vrow[x / 2];
+
+            int r_add = CV_R[V];
+            int g_add = -(CU_G[U] + CV_G[V]);
+            int b_add = CU_B[U];
+
+            int Y00 = yrow0[x];
+            unsigned char r00 = CLIP(Y00 + r_add), g00 = CLIP(Y00 + g_add), b00 = CLIP(Y00 + b_add);
+            drow0[x] = (unsigned short) (((r00 & 0xF8) << 8) | ((g00 & 0xFC) << 3) | (b00 >> 3));
+
+            int Y01 = yrow0[x + 1];
+            unsigned char r01 = CLIP(Y01 + r_add), g01 = CLIP(Y01 + g_add), b01 = CLIP(Y01 + b_add);
+            drow0[x + 1] = (unsigned short) (((r01 & 0xF8) << 8) | ((g01 & 0xFC) << 3) | (b01 >> 3));
+
+            int Y10 = yrow1[x];
+            unsigned char r10 = CLIP(Y10 + r_add), g10 = CLIP(Y10 + g_add), b10 = CLIP(Y10 + b_add);
+            drow1[x] = (unsigned short) (((r10 & 0xF8) << 8) | ((g10 & 0xFC) << 3) | (b10 >> 3));
+
+            int Y11 = yrow1[x + 1];
+            unsigned char r11 = CLIP(Y11 + r_add), g11 = CLIP(Y11 + g_add), b11 = CLIP(Y11 + b_add);
+            drow1[x + 1] = (unsigned short) (((r11 & 0xF8) << 8) | ((g11 & 0xFC) << 3) | (b11 >> 3));
+        }
+    }
+}
+
+/*
+ * One-time startup microbenchmark (ported from Asphalt-5-Vita's Bug #25
+ * triage). Release-visible: this is the number to compare against if a real
+ * log ever shows video playback dragging fps down -- isolates the NEON
+ * conversion completely from decode/ring/GL, with a plain memcpy over the
+ * same byte count logged alongside as a hardware bandwidth reference.
+ */
+static void video_bench_convert(unsigned w, unsigned h, int runs) {
+    const unsigned ySize = w * h, cSize = (w / 2) * (h / 2);
+    const unsigned dstSize = w * h * (unsigned) sizeof(unsigned short);
+
+    unsigned char *y = (unsigned char *) malloc(ySize);
+    unsigned char *u = (unsigned char *) malloc(cSize);
+    unsigned char *v = (unsigned char *) malloc(cSize);
+    unsigned short *dst = (unsigned short *) malloc(dstSize);
+    unsigned char *copySrc = (unsigned char *) malloc(dstSize);
+    unsigned char *copyDst = (unsigned char *) malloc(dstSize);
+    if (!y || !u || !v || !dst || !copySrc || !copyDst) {
+        l_warn("video: startup benchmark skipped (out of memory)");
+        goto out;
+    }
+    memset(y, 0x55, ySize);
+    memset(u, 0x66, cSize);
+    memset(v, 0x77, cSize);
+    memset(copySrc, 0x88, dstSize);
+
+    {
+        uint64_t t0 = (uint64_t) now_us();
+        for (int i = 0; i < runs; i++)
+            yuv420p_planar_to_rgb565(y, (int) w, u, (int) (w / 2), v, (int) (w / 2), w, h, dst);
+        uint64_t convert_us = (uint64_t) now_us() - t0;
+
+        t0 = (uint64_t) now_us();
+        for (int i = 0; i < runs; i++)
+            memcpy(copyDst, copySrc, dstSize);
+        uint64_t memcpy_us = (uint64_t) now_us() - t0;
+
+        l_note("video: startup benchmark (%ux%u, %d runs): yuv420p_planar_to_rgb565=%.1fms/call, "
+               "memcpy(%u bytes)=%.1fms/call (%.0f MB/s)",
+               w, h, runs,
+               (double) convert_us / 1000.0 / runs,
+               dstSize, (double) memcpy_us / 1000.0 / runs,
+               (double) dstSize * runs / ((double) memcpy_us / 1000000.0) / (1024.0 * 1024.0));
+    }
+
+out:
+    free(y); free(u); free(v); free(dst); free(copySrc); free(copyDst);
+}
+
+static void video_log_startup_benchmark(void) {
+    // Full container resolution (800x500) and half (400x250, what lowres=1
+    // actually decodes -- see video_play()) so a real log shows both.
+    video_bench_convert(800, 500, 8);
+    video_bench_convert(400, 250, 8);
+}
+
+// ---------------------------------------------------------------------------
+// Playback state shared by the three threads
+// ---------------------------------------------------------------------------
+
+struct FrameSlot {
+    unsigned short *rgb;
+    unsigned        cap;      // bytes actually allocated
+    unsigned        w, h;
+    int64_t         pts_us;
+};
+
+static struct Playback {
+    Mp4File          mp4;
+    AVCodecContext  *vctx;
+    AVCodecContext  *actx;
+    SwrContext      *swr;
+    AVRational       vtb;
+    AVRational       atb;
+    int64_t          frame_period_us;
+
+    /* Finished frames: written only by the decode thread at `tail`, read
+     * only by the render thread at `head`; `count` is the only field both
+     * touch, so it is the only one the mutex has to cover. */
+    FrameSlot        slots[VIDEO_FRAME_SLOTS];
+    int              nslots;
+    int              head, tail, count;
+    pthread_mutex_t  ring_lock;
+
+    /* Compressed audio packets: decode thread -> audio thread. */
+    AVPacket        *aq[AUDIO_PKT_QUEUE_CAP];
+    int              aq_head, aq_tail, aq_count;
+    volatile bool    aq_eof;
+    pthread_mutex_t  aq_lock;
+
+    /* Audio output and the clock derived from it. */
+    int               aport;
+    int               arate;
+    int               achannels;
+    volatile uint32_t aplayed;      // frames the hardware has finished playing
+    int64_t           abase_us;     // pts of the very first sample submitted
+    volatile bool     aclock_valid;
+
+    /* Lifecycle flags. Single-writer, aligned 32-bit -- no lock needed. */
+    volatile bool    quit;          // skip/teardown requested
+    volatile bool    decode_done;   // decode thread pushed its last frame
+    volatile bool    audio_done;    // audio thread drained everything
+    volatile bool    presenting;    // render thread has started its clock
+    int64_t          wall_base_us;
+
+    /* Stats, for the one summary line at the end. */
+    int              decoded, presented, dropped_late;
+    uint64_t         decode_us, convert_us, upload_us, draw_us;
+} P;
+
+/**
+ * @brief Current playback position, in microseconds from the start of the file.
+ *
+ * Audio-mastered whenever there is audio: `aplayed` counts frames the audio
+ * hardware has actually finished, so this clock runs at exactly the rate the
+ * sound is coming out of the speakers -- video pinned to it cannot drift.
+ * Falls back to wall time when there is no audio stream, the audio port
+ * could not be opened, or the watchdog below finds the audio clock stalled.
+ */
+static int64_t playback_clock_us(void) {
+    if (P.aclock_valid) {
+        uint32_t played = P.aplayed;
+        return P.abase_us + (int64_t) played * 1000000LL / (int64_t) P.arate;
+    }
+    return now_us() - P.wall_base_us;
+}
+
+// ---------------------------------------------------------------------------
+// Frame ring (decode thread -> render thread)
+// ---------------------------------------------------------------------------
+
+static int ring_count(void) {
+    pthread_mutex_lock(&P.ring_lock);
+    int c = P.count;
+    pthread_mutex_unlock(&P.ring_lock);
+    return c;
+}
+
+/**
+ * @brief Converts one decoded frame into the next free ring slot.
+ *
+ * Blocks -- polling, never a `pthread_cond_t` -- while the ring is full,
+ * which is what paces decode to real time. Returns false if playback is
+ * being torn down.
+ */
+static bool ring_push(const AVFrame *f, int64_t pts_us) {
+    // The NEON converter walks 2 rows / 2 columns at a time.
+    unsigned w = ((unsigned) f->width) & ~1u;
+    unsigned h = ((unsigned) f->height) & ~1u;
+    if (!w || !h)
+        return false;
+    unsigned need = w * h * (unsigned) sizeof(unsigned short);
+
+    while (ring_count() >= P.nslots) {
+        if (P.quit)
+            return false;
+        sceKernelDelayThread(1000);
+    }
+    if (P.quit)
+        return false;
+
+    FrameSlot *s = &P.slots[P.tail];
+    if (s->cap < need) {
+        free(s->rgb);
+        s->rgb = (unsigned short *) malloc(need);
+        s->cap = s->rgb ? need : 0;
+    }
+    if (!s->rgb) {
+        l_error("video: out of memory for a %ux%u RGB565 frame slot", w, h);
+        return false;
+    }
+
+    uint64_t t0 = (uint64_t) now_us();
+    yuv420p_planar_to_rgb565(f->data[0], f->linesize[0],
+                              f->data[1], f->linesize[1],
+                              f->data[2], f->linesize[2],
+                              w, h, s->rgb);
+    P.convert_us += (uint64_t) now_us() - t0;
+
+    s->w = w;
+    s->h = h;
+    s->pts_us = pts_us;
+
+    pthread_mutex_lock(&P.ring_lock);
+    P.tail = (P.tail + 1) % P.nslots;
+    P.count++;
+    pthread_mutex_unlock(&P.ring_lock);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Compressed audio packet queue (decode thread -> audio thread)
+// ---------------------------------------------------------------------------
+
+static bool aq_push(AVPacket *pkt) {
+    for (;;) {
+        pthread_mutex_lock(&P.aq_lock);
+        bool full = (P.aq_count >= AUDIO_PKT_QUEUE_CAP);
+        if (!full) {
+            P.aq[P.aq_tail] = pkt;
+            P.aq_tail = (P.aq_tail + 1) % AUDIO_PKT_QUEUE_CAP;
+            P.aq_count++;
+        }
+        pthread_mutex_unlock(&P.aq_lock);
+        if (!full)
+            return true;
+        if (P.quit)
+            return false;
+        sceKernelDelayThread(1000);
+    }
+}
+
+static AVPacket *aq_pop(void) {
+    AVPacket *pkt = NULL;
+    pthread_mutex_lock(&P.aq_lock);
+    if (P.aq_count > 0) {
+        pkt = P.aq[P.aq_head];
+        P.aq_head = (P.aq_head + 1) % AUDIO_PKT_QUEUE_CAP;
+        P.aq_count--;
+    }
+    pthread_mutex_unlock(&P.aq_lock);
+    return pkt;
+}
+
+static void aq_drain_and_free(void) {
+    AVPacket *pkt;
+    while ((pkt = aq_pop()) != NULL)
+        av_packet_free(&pkt);
+}
+
+// ---------------------------------------------------------------------------
+// GL: draw one frame
+// ---------------------------------------------------------------------------
+
+static GLuint gVideoTex = 0;
+static unsigned gVideoTexW = 0;
+static unsigned gVideoTexH = 0;
+
 static bool gFirstDrawLogged = false;
 #define FIRST_DRAW_LOG(...) do { if (!gFirstDrawLogged) l_info(__VA_ARGS__); } while (0)
 
-/**
- * @brief Uploads one decoded NV12 frame and draws it letterboxed to fill the
- *        screen, saving/restoring every bit of GL state the engine cares
- *        about around it (this runs mid-frame, borrowed from the engine's own
- *        render loop timing -- see video_play()'s caller in java.c).
+/*
+ * Draws one decoded video frame (already CPU-converted to RGB565) as a
+ * letterboxed quad at native screen resolution, using PLAIN GLES1.1
+ * fixed-function texturing -- see the file header for why this is
+ * deliberately NOT a custom GLSL program.
  */
-static void draw_video_frame(const unsigned char *yuvData, unsigned w, unsigned h) {
+static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned h) {
     FIRST_DRAW_LOG("video: draw_video_frame ENTER (%ux%u)", w, h);
-    ensure_video_program();
 
-    const unsigned char *yPlane = yuvData;
-    const unsigned char *uvPlane = yuvData + (size_t) w * h;
-    unsigned uvW = w / 2, uvH = h / 2;
+    uint64_t t_upload0 = (uint64_t) now_us();
 
-    if (!gVideoYTex || gVideoTexW != w || gVideoTexH != h) {
-        FIRST_DRAW_LOG("video: creating Y/UV texture storage...");
-        if (!gVideoYTex) glGenTextures(1, &gVideoYTex);
-        if (!gVideoUVTex) glGenTextures(1, &gVideoUVTex);
-
-        glBindTexture(GL_TEXTURE_2D, gVideoYTex);
+    if (!gVideoTex || gVideoTexW != w || gVideoTexH != h) {
+        FIRST_DRAW_LOG("video: creating texture storage...");
+        if (!gVideoTex) glGenTextures(1, &gVideoTex);
+        glBindTexture(GL_TEXTURE_2D, gVideoTex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, (GLsizei) w, (GLsizei) h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
-
-        glBindTexture(GL_TEXTURE_2D, gVideoUVTex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, (GLsizei) uvW, (GLsizei) uvH, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, NULL);
-
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, (GLsizei) w, (GLsizei) h, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, NULL);
+        FIRST_DRAW_LOG("video: glTexImage2D returned (err=0x%04x)", glGetError());
         gVideoTexW = w;
         gVideoTexH = h;
     }
+    glBindTexture(GL_TEXTURE_2D, gVideoTex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) w, (GLsizei) h, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, rgb565);
 
-    glBindTexture(GL_TEXTURE_2D, gVideoYTex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) w, (GLsizei) h, GL_LUMINANCE, GL_UNSIGNED_BYTE, yPlane);
-    glBindTexture(GL_TEXTURE_2D, gVideoUVTex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) uvW, (GLsizei) uvH, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uvPlane);
+    uint64_t t_draw0 = (uint64_t) now_us();
+    P.upload_us += t_draw0 - t_upload0;
 
     float srcAspect = (float) w / (float) h;
     float dstAspect = (float) REAL_SCREEN_W / (float) REAL_SCREEN_H;
@@ -356,10 +1069,14 @@ static void draw_video_frame(const unsigned char *yuvData, unsigned w, unsigned 
     float ny0 = 1.0f - qy0 / REAL_SCREEN_H * 2.0f;
     float ny1 = 1.0f - qy1 / REAL_SCREEN_H * 2.0f;
 
-    const GLfloat verts[8] = {
-        nx0, ny0,  nx1, ny0,  nx0, ny1,  nx1, ny1,
-    };
-    const GLfloat uvs[8] = {
+    // Static storage: client-side vertex pointers are only guaranteed read
+    // AT glDrawArrays; contents vary per call (aspect depends on the video).
+    static GLfloat verts[8];
+    verts[0] = nx0; verts[1] = ny0;
+    verts[2] = nx1; verts[3] = ny0;
+    verts[4] = nx0; verts[5] = ny1;
+    verts[6] = nx1; verts[7] = ny1;
+    static const GLfloat uvs[8] = {
         0.0f, 0.0f,  1.0f, 0.0f,  0.0f, 1.0f,  1.0f, 1.0f,
     };
 
@@ -367,364 +1084,764 @@ static void draw_video_frame(const unsigned char *yuvData, unsigned w, unsigned 
     GLboolean savedDepthTest = glIsEnabled(GL_DEPTH_TEST);
     GLboolean savedScissor = glIsEnabled(GL_SCISSOR_TEST);
     GLboolean savedCull = glIsEnabled(GL_CULL_FACE);
+    GLboolean savedTex2D = glIsEnabled(GL_TEXTURE_2D);
+    GLboolean savedVertexArray = glIsEnabled(GL_VERTEX_ARRAY);
+    GLboolean savedTexCoordArray = glIsEnabled(GL_TEXTURE_COORD_ARRAY);
     GLint savedViewport[4];
     glGetIntegerv(GL_VIEWPORT, savedViewport);
-    GLint savedProgram = 0;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &savedProgram);
-    GLint savedActiveTexture = 0;
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &savedActiveTexture);
-    glActiveTexture(GL_TEXTURE0);
-    GLint savedTex0 = 0;
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &savedTex0);
-    glActiveTexture(GL_TEXTURE1);
-    GLint savedTex1 = 0;
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &savedTex1);
-    glActiveTexture((GLenum) savedActiveTexture);
-    GLint savedArrayBuffer = 0;
-    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &savedArrayBuffer);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    GLint savedTex = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &savedTex);
 
-    // Native resolution, matching gl_init()'s vglInitExtended(0, 960, 544, ...)
-    // -- no intermediate downsample FBO in this port, so the quad's clip-space
-    // coordinates (computed above from REAL_SCREEN_W/H) map straight to the
-    // real framebuffer.
     glViewport(0, 0, REAL_SCREEN_W, REAL_SCREEN_H);
     glDisable(GL_BLEND);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_CULL_FACE);
 
-    glUseProgram(gVideoProgram);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, gVideoYTex);
-    glUniform1i(gVideoYTexLoc, 0);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, gVideoUVTex);
-    glUniform1i(gVideoUVTexLoc, 1);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, gVideoTex);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
 
-    glVertexAttribPointer(gVideoPosLoc, 2, GL_FLOAT, GL_FALSE, 0, verts);
-    glVertexAttribPointer(gVideoUvLoc, 2, GL_FLOAT, GL_FALSE, 0, uvs);
-    glEnableVertexAttribArray(gVideoPosLoc);
-    glEnableVertexAttribArray(gVideoUvLoc);
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glVertexPointer(2, GL_FLOAT, 0, verts);
+    glTexCoordPointer(2, GL_FLOAT, 0, uvs);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glDisableVertexAttribArray(gVideoPosLoc);
-    glDisableVertexAttribArray(gVideoUvLoc);
+    FIRST_DRAW_LOG("video: glDrawArrays returned (err=0x%04x)", glGetError());
+    glDisableClientState(GL_VERTEX_ARRAY);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glDisable(GL_TEXTURE_2D);
 
-    glBindBuffer(GL_ARRAY_BUFFER, (GLuint) savedArrayBuffer);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, (GLuint) savedTex1);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, (GLuint) savedTex0);
-    glActiveTexture((GLenum) savedActiveTexture);
-    glUseProgram((GLuint) savedProgram);
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+
+    if (!gFirstDrawLogged) {
+        unsigned char pixel[4] = {0, 0, 0, 0};
+        glReadPixels(REAL_SCREEN_W / 2, REAL_SCREEN_H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+        // Release-visible (l_note): the definitive on-console proof that
+        // real decoded pixels reached the screen, not just that the decode
+        // pipeline ran -- a black readback here with a non-black source
+        // frame would point at the draw/GL side, not the decoder.
+        l_note("[video_diag] framebuffer readback at center, right after glDrawArrays: rgba=%u,%u,%u,%u (err=0x%04x)",
+               pixel[0], pixel[1], pixel[2], pixel[3], glGetError());
+    }
+
+    gl_swap();
+    FIRST_DRAW_LOG("video: gl_swap() returned -- first frame fully presented");
+
+    glBindTexture(GL_TEXTURE_2D, (GLuint) savedTex);
     if (savedBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
     if (savedDepthTest) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
     if (savedScissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
     if (savedCull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
     glViewport(savedViewport[0], savedViewport[1], savedViewport[2], savedViewport[3]);
+    if (savedVertexArray) glEnableClientState(GL_VERTEX_ARRAY); else glDisableClientState(GL_VERTEX_ARRAY);
+    if (savedTexCoordArray) glEnableClientState(GL_TEXTURE_COORD_ARRAY); else glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    // Engine expects texture env mode to be MODULATE by default (we forced REPLACE).
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    if (savedTex2D) glEnable(GL_TEXTURE_2D); else glDisable(GL_TEXTURE_2D);
 
-    gl_swap();
-    FIRST_DRAW_LOG("video: gl_swap() returned -- first frame fully presented");
     gFirstDrawLogged = true;
+    P.draw_us += (uint64_t) now_us() - t_draw0;
+}
+
+// ---------------------------------------------------------------------------
+// Audio thread
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Decodes, resamples and plays the cutscene's AAC audio track.
+ *
+ * Owns the whole audio path end to end: `sceAudioOutOutput()` returning is
+ * what advances `P.aplayed`, which is the clock the video side paces
+ * against. Two output blocks alternate: a Vita audio port consumes the
+ * buffer handed to it while the call for the *next* block is what blocks, so
+ * the buffer passed last must stay untouched until then.
+ */
+static void *cutscene_audio_thread(void *arg) {
+    (void) arg;
+    sceKernelChangeThreadPriority(0, 0x40);
+    sceKernelChangeThreadCpuAffinityMask(0, SCE_KERNEL_CPU_MASK_USER_2);
+
+    const int      ch         = P.achannels;
+    const unsigned blockBytes = AUDIO_GRAIN * (unsigned) ch * sizeof(int16_t);
+
+    int16_t *blocks[2] = { (int16_t *) memalign(64, blockBytes),
+                           (int16_t *) memalign(64, blockBytes) };
+    unsigned accCapFrames = AUDIO_GRAIN * 4;
+    int16_t *acc = (int16_t *) malloc((size_t) accCapFrames * ch * sizeof(int16_t));
+    AVFrame *frame = av_frame_alloc();
+
+    if (!blocks[0] || !blocks[1] || !acc || !frame) {
+        l_error("video: out of memory for cutscene audio buffers -- cutscene will be silent");
+        goto done;
+    }
+
+    {
+        unsigned accFrames = 0;
+        int      blk = 0;
+        unsigned blocksOut = 0;
+        bool     eof = false;
+        int      frames = 0;
+
+        auto flush_blocks = [&](void) {
+            while (accFrames >= AUDIO_GRAIN) {
+                memcpy(blocks[blk], acc, blockBytes);
+                accFrames -= AUDIO_GRAIN;
+                if (accFrames)
+                    memmove(acc, acc + (size_t) AUDIO_GRAIN * ch,
+                            (size_t) accFrames * ch * sizeof(int16_t));
+                sceAudioOutOutput(P.aport, blocks[blk]);
+                if (blocksOut > 0)
+                    P.aplayed += AUDIO_GRAIN;
+                blocksOut++;
+                blk ^= 1;
+                if (P.quit)
+                    return;
+            }
+        };
+
+        auto resample_into_acc = [&](AVFrame *f) {
+            int outMax = swr_get_out_samples(P.swr, f->nb_samples);
+            if (outMax < 0)
+                outMax = f->nb_samples;
+            if (accFrames + (unsigned) outMax > accCapFrames) {
+                unsigned newCap = accFrames + (unsigned) outMax + AUDIO_GRAIN;
+                int16_t *bigger = (int16_t *) realloc(acc, (size_t) newCap * ch * sizeof(int16_t));
+                if (!bigger)
+                    return;
+                acc = bigger;
+                accCapFrames = newCap;
+            }
+            uint8_t *dst[1] = { (uint8_t *) (acc + (size_t) accFrames * ch) };
+            int got = swr_convert(P.swr, dst, outMax,
+                                   (const uint8_t **) f->extended_data, f->nb_samples);
+            if (got > 0)
+                accFrames += (unsigned) got;
+        };
+
+        while (!P.quit) {
+            AVPacket *pkt = aq_pop();
+            if (!pkt) {
+                if (P.aq_eof) {
+                    avcodec_send_packet(P.actx, NULL);
+                    eof = true;
+                } else {
+                    sceKernelDelayThread(1000);
+                    continue;
+                }
+            } else {
+                avcodec_send_packet(P.actx, pkt);
+                av_packet_free(&pkt);
+            }
+
+            for (;;) {
+                int rc = avcodec_receive_frame(P.actx, frame);
+                if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF)
+                    break;
+                if (rc < 0) {
+                    l_warn("video: avcodec_receive_frame(audio) error 0x%08x", rc);
+                    break;
+                }
+                if (++frames == 1) {
+                    P.abase_us = (frame->pts != AV_NOPTS_VALUE)
+                                     ? av_rescale_q(frame->pts, P.atb, kUsTimeBase) : 0;
+                    __sync_synchronize();
+                    P.aclock_valid = true;
+                    l_note("video: first audio frame decoded (out %d Hz, %d ch, base=%lldus)",
+                           P.arate, ch, (long long) P.abase_us);
+                }
+                resample_into_acc(frame);
+                av_frame_unref(frame);
+                flush_blocks();
+                if (P.quit)
+                    break;
+            }
+
+            if (eof)
+                break;
+        }
+
+        if (!P.quit) {
+            if (accFrames > 0 && accFrames < AUDIO_GRAIN) {
+                memset(acc + (size_t) accFrames * ch, 0,
+                       (size_t) (AUDIO_GRAIN - accFrames) * ch * sizeof(int16_t));
+                accFrames = AUDIO_GRAIN;
+            }
+            flush_blocks();
+            if (blocksOut > 0) {
+                memset(blocks[blk], 0, blockBytes);
+                sceAudioOutOutput(P.aport, blocks[blk]);
+                P.aplayed += AUDIO_GRAIN;
+            }
+        }
+    }
+
+done:
+    if (frame) av_frame_free(&frame);
+    free(acc);
+    free(blocks[0]);
+    free(blocks[1]);
+    P.audio_done = true;
+    return NULL;
+}
+
+// ---------------------------------------------------------------------------
+// Decode thread
+// ---------------------------------------------------------------------------
+
+static void handle_decoded_frame(AVFrame *f, int64_t *last_pts_us) {
+    if (f->format != AV_PIX_FMT_YUV420P) {
+        l_warn("video: decoded frame has unexpected pix_fmt %d (expected YUV420P/%d) -- dropping frame",
+               (int) f->format, (int) AV_PIX_FMT_YUV420P);
+        return;
+    }
+
+    int64_t ts = (f->best_effort_timestamp != AV_NOPTS_VALUE) ? f->best_effort_timestamp : f->pts;
+    int64_t pts_us;
+    if (ts != AV_NOPTS_VALUE)
+        pts_us = av_rescale_q(ts, P.vtb, kUsTimeBase);
+    else
+        pts_us = (*last_pts_us >= 0) ? *last_pts_us + P.frame_period_us : 0;
+    *last_pts_us = pts_us;
+
+    if (++P.decoded == 1)
+        l_note("video: first video frame decoded (%dx%d)", f->width, f->height);
+
+    if (P.presenting) {
+        int64_t late = playback_clock_us() - pts_us;
+        P.vctx->skip_frame = (late > 400000) ? AVDISCARD_NONREF
+                             : (late < 100000 ? AVDISCARD_DEFAULT : P.vctx->skip_frame);
+        if (late > P.frame_period_us + P.frame_period_us / 2) {
+            P.dropped_late++;
+            return;
+        }
+    }
+
+    ring_push(f, pts_us);
 }
 
 /**
- * @brief Dedicated cutscene audio output thread using sceAudioOut (VOICE port).
+ * @brief Demuxes the file, decodes video, and routes audio packets onward.
+ *
+ * Canonical send/receive loop: drain every frame the decoder can produce
+ * first, and only feed it another packet once it says it needs one.
  */
-static pthread_mutex_t gCutAudioLock = PTHREAD_MUTEX_INITIALIZER;
-static unsigned char *gCutAudioBuf[2] = { NULL, NULL };
-static unsigned gCutAudioBufCap = 0;
-static unsigned gCutAudioLen[2] = { 0, 0 };
-static int gCutAudioWriteSlot = 0;
-static int gCutAudioPort = -1;
-static volatile bool gCutAudioQuit = false;
+static void *video_decode_thread(void *arg) {
+    (void) arg;
+    // Cores 1 and 2: keep the render thread's core to itself. Priority
+    // below the audio thread's on purpose -- video may stutter, audio must
+    // not. Set from inside the thread (has to be a real pthread; see the
+    // file header), not at creation.
+    sceKernelChangeThreadPriority(0, 0x60);
+    sceKernelChangeThreadCpuAffinityMask(0, SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2);
 
-static int cutscene_audio_thread(SceSize args, void *argp) {
-    (void) args; (void) argp;
-    int slot = 0;
-    for (;;) {
-        pthread_mutex_lock(&gCutAudioLock);
-        unsigned len = gCutAudioLen[slot];
-        bool quit = gCutAudioQuit;
-        pthread_mutex_unlock(&gCutAudioLock);
+    AVPacket *pkt = av_packet_alloc();
+    AVFrame  *frame = av_frame_alloc();
+    int64_t   last_pts_us = -1;
+    bool      eof = false;
 
-        if (len == 0) {
-            if (quit)
-                break;
-            sceKernelDelayThread(500);
+    if (!pkt || !frame) {
+        l_error("video: out of memory for decode thread packet/frame");
+        goto done;
+    }
+
+    while (!P.quit) {
+        uint64_t td0 = (uint64_t) now_us();
+        int rc = avcodec_receive_frame(P.vctx, frame);
+        P.decode_us += (uint64_t) now_us() - td0;
+        if (rc == 0) {
+            handle_decoded_frame(frame, &last_pts_us);
+            av_frame_unref(frame);
+            continue;
+        }
+        if (rc == AVERROR_EOF)
+            break;  // flushed and fully drained: playback ended naturally
+        if (rc != AVERROR(EAGAIN)) {
+            l_warn("video: avcodec_receive_frame(video) error 0x%08x", rc);
+            break;
+        }
+        if (eof)
+            break;  // decoder wants input after a flush; nothing left to give
+
+        int stream_index;
+        if (!mp4_next_packet(&P.mp4, pkt, &stream_index)) {
+            eof = true;
+            td0 = (uint64_t) now_us();
+            avcodec_send_packet(P.vctx, NULL);
+            P.decode_us += (uint64_t) now_us() - td0;
+            P.aq_eof = true;
             continue;
         }
 
-        if (gCutAudioPort >= 0)
-            sceAudioOutOutput(gCutAudioPort, gCutAudioBuf[slot]);
-        pthread_mutex_lock(&gCutAudioLock);
-        gCutAudioLen[slot] = 0;
-        pthread_mutex_unlock(&gCutAudioLock);
-        slot ^= 1;
-    }
-    return 0;
-}
-
-static void cutscene_audio_submit(const void *pData, unsigned bytes) {
-    if (bytes > gCutAudioBufCap) {
-        free(gCutAudioBuf[0]);
-        free(gCutAudioBuf[1]);
-        gCutAudioBuf[0] = (unsigned char *) malloc(bytes);
-        gCutAudioBuf[1] = (unsigned char *) malloc(bytes);
-        gCutAudioBufCap = (gCutAudioBuf[0] && gCutAudioBuf[1]) ? bytes : 0;
-    }
-    if (!gCutAudioBuf[0] || !gCutAudioBuf[1] || gCutAudioBufCap < bytes)
-        return;
-
-    for (;;) {
-        pthread_mutex_lock(&gCutAudioLock);
-        bool free_slot = gCutAudioLen[gCutAudioWriteSlot] == 0;
-        if (free_slot) {
-            memcpy(gCutAudioBuf[gCutAudioWriteSlot], pData, bytes);
-            gCutAudioLen[gCutAudioWriteSlot] = bytes;
+        if (stream_index == MP4_STREAM_VIDEO) {
+            td0 = (uint64_t) now_us();
+            avcodec_send_packet(P.vctx, pkt);
+            P.decode_us += (uint64_t) now_us() - td0;
+            av_packet_unref(pkt);
+        } else if (P.actx) {
+            AVPacket *ap = av_packet_alloc();
+            if (ap) {
+                av_packet_move_ref(ap, pkt);
+                if (!aq_push(ap))
+                    av_packet_free(&ap);
+            }
+            av_packet_unref(pkt);
+        } else {
+            av_packet_unref(pkt);
         }
-        pthread_mutex_unlock(&gCutAudioLock);
-        if (free_slot)
-            break;
-        sceKernelDelayThread(500);
     }
-    gCutAudioWriteSlot ^= 1;
+
+done:
+    if (frame) av_frame_free(&frame);
+    if (pkt) av_packet_free(&pkt);
+    P.aq_eof = true;      // covers the early-exit paths above
+    P.decode_done = true;
+    return NULL;
 }
+
+// ---------------------------------------------------------------------------
+// Init / shutdown
+// ---------------------------------------------------------------------------
 
 void video_init() {
-    int ret = sceSysmoduleLoadModule(SCE_SYSMODULE_AVPLAYER);
-    if (ret < 0) {
-        l_error("video: sceSysmoduleLoadModule(AVPLAYER) failed (0x%08X) -- cutscenes will be skipped", (unsigned) ret);
-        gModuleLoaded = false;
-        return;
+    memset(&P, 0, sizeof(P));
+    P.aport = -1;
+    pthread_mutex_init(&P.ring_lock, NULL);
+    pthread_mutex_init(&P.aq_lock, NULL);
+    l_note("video: FFmpeg software decoder ready (%s)", av_version_info());
+    video_log_startup_benchmark();
+}
+
+static void free_frame_slots(void) {
+    for (int i = 0; i < VIDEO_FRAME_SLOTS; i++) {
+        free(P.slots[i].rgb);
+        P.slots[i].rgb = NULL;
+        P.slots[i].cap = 0;
     }
-    gModuleLoaded = true;
-    l_success("video: SceAvPlayer module loaded.");
 }
 
 void video_shutdown() {
-    if (gVideoYTex) {
-        glDeleteTextures(1, &gVideoYTex);
-        gVideoYTex = 0;
+    if (gVideoTex) {
+        glDeleteTextures(1, &gVideoTex);
+        gVideoTex = 0;
+        gVideoTexW = 0;
+        gVideoTexH = 0;
     }
-    if (gVideoUVTex) {
-        glDeleteTextures(1, &gVideoUVTex);
-        gVideoUVTex = 0;
-    }
-    gVideoTexW = 0;
-    gVideoTexH = 0;
-    if (gVideoProgram) {
-        glDeleteProgram(gVideoProgram);
-        gVideoProgram = 0;
-    }
-    free(gYuvScratch);
-    gYuvScratch = NULL;
-    gYuvScratchCap = 0;
-    if (gModuleLoaded) {
-        sceSysmoduleUnloadModule(SCE_SYSMODULE_AVPLAYER);
-        gModuleLoaded = false;
-    }
+    free_frame_slots();
 }
 
+// GLMediaPlayer.loadMovie() on Android built its path from
+// "/sdcard/gameloft/games/Gangstar2//" + movieName, i.e. the same
+// external-storage asset root the toolkit extracted to DATA_PATH "data/"
+// (see java.c's res_open()) -- try that first, same 3 candidates the
+// previous SceAvPlayer-based version of this file used.
+static bool resolve_video_path(const char *name, char *path, size_t pathSize) {
+    SceIoStat st;
+    const char *prefixes[] = {
+        DATA_PATH "data/%s",
+        DATA_PATH "%s",
+        DATA_PATH "files/%s",
+    };
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        snprintf(path, pathSize, prefixes[i], name);
+        if (sceIoGetstat(path, &st) >= 0)
+            return true;
+    }
+    return false;
+}
+
+static bool audio_rate_supported(int rate) {
+    static const int kRates[] = { 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000 };
+    for (size_t i = 0; i < sizeof(kRates) / sizeof(kRates[0]); i++)
+        if (kRates[i] == rate)
+            return true;
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// video_play()
+// ---------------------------------------------------------------------------
+
 /**
- * @brief Plays a video file using SceAvPlayer.
+ * @brief Plays a video file, blocking the calling (render) thread until it
+ *        ends, is skipped, or fails -- always returns, never hangs.
  * @param name Bare filename of the video cutscene to play (as passed to
  *             GLMediaPlayer.loadMovie() on Android, e.g. "intro.m4v").
  */
 void video_play(const char *name) {
-    if (!gModuleLoaded) {
-        l_warn("video: AVPLAYER module not loaded, skipping cutscene request \"%s\"", name ? name : "(null)");
-        return;
-    }
     if (!name) {
         l_warn("video: video_play() called with a null name, skipping");
         return;
     }
 
     char path[512];
-    bool found = false;
-    SceIoStat st;
-
-    // GLMediaPlayer.loadMovie() on Android built its path from
-    // "/sdcard/gameloft/games/Gangstar2//" + movieName, i.e. the same
-    // external-storage asset root that the toolkit extracted to
-    // DATA_PATH "data/" (see java.c's res_open()) -- try that first.
-    snprintf(path, sizeof(path), DATA_PATH "data/%s", name);
-    if (sceIoGetstat(path, &st) >= 0) {
-        found = true;
-    } else {
-        snprintf(path, sizeof(path), DATA_PATH "%s", name);
-        if (sceIoGetstat(path, &st) >= 0) {
-            found = true;
-        } else {
-            snprintf(path, sizeof(path), DATA_PATH "files/%s", name);
-            if (sceIoGetstat(path, &st) >= 0) {
-                found = true;
-            }
-        }
-    }
-
-    if (!found) {
+    if (!resolve_video_path(name, path, sizeof(path))) {
         l_error("video: file not found for \"%s\" (tried %sdata/%s, %s%s and %sfiles/%s)",
                 name, DATA_PATH, name, DATA_PATH, name, DATA_PATH, name);
         return;
     }
 
-    SceAvPlayerInitData init;
-    memset(&init, 0, sizeof(init));
-    init.memoryReplacement.allocate = av_alloc;
-    init.memoryReplacement.deallocate = av_free;
-    init.memoryReplacement.allocateTexture = av_alloc_texture;
-    init.memoryReplacement.deallocateTexture = av_free_texture;
-    init.fileReplacement.objectPointer = &gAvFileCtx;
-    init.fileReplacement.open = av_file_open;
-    init.fileReplacement.close = av_file_close;
-    init.fileReplacement.readOffset = av_file_read;
-    init.fileReplacement.size = av_file_size;
-    init.eventReplacement.objectPointer = NULL;
-    init.eventReplacement.eventCallback = av_event_cb;
-    init.basePriority = 0xA0;
-    init.numOutputVideoFrameBuffers = 2;
-    init.autoStart = SCE_TRUE;
-    init.debugLevel = 0;
+    // Reset per-playback state, keeping the mutexes video_init() set up.
+    P.vctx = NULL; P.actx = NULL; P.swr = NULL;
+    memset(&P.mp4, 0, sizeof(P.mp4));
+    P.mp4.fd = -1;
+    P.head = P.tail = P.count = 0;
+    P.aq_head = P.aq_tail = P.aq_count = 0;
+    P.aq_eof = false;
+    P.aport = -1;
+    P.arate = 0; P.achannels = 0;
+    P.aplayed = 0; P.abase_us = 0; P.aclock_valid = false;
+    P.quit = false; P.decode_done = false; P.audio_done = false; P.presenting = false;
+    P.decoded = P.presented = P.dropped_late = 0;
+    P.decode_us = P.convert_us = P.upload_us = P.draw_us = 0;
+    P.nslots = VIDEO_FRAME_SLOTS;
+    P.frame_period_us = VIDEO_FRAME_PERIOD_US;
+    gFirstDrawLogged = false;
 
-    SceAvPlayerHandle handle = sceAvPlayerInit(&init);
-    if ((unsigned)handle == 0 || (unsigned)handle == 0xFFFFFFFF || ((unsigned)handle & 0xFF000000) == 0x80000000) {
-        l_error("video: sceAvPlayerInit failed (0x%08X) for %s", (unsigned) handle, path);
-        return;
-    }
-
-    if (sceAvPlayerAddSource(handle, path) < 0) {
-        l_error("video: sceAvPlayerAddSource failed for %s", path);
-        sceAvPlayerClose(handle);
-        return;
-    }
-
-    l_success("video: playing %s", path);
-
-    int audioPort = -1;
-    int audioChannels = 0;
-    unsigned audioFrameLen = 0;
-    SceUID cutAudioThreadUid = -1;
-
+    pthread_t decodeThread, audioThread;
+    bool decodeThreadUp = false, audioThreadUp = false;
     bool skipped = false;
 
-    int wait_count = 0;
-    while (!sceAvPlayerIsActive(handle) && wait_count < 500) {
-        sceKernelDelayThread(10000);
-        wait_count++;
-    }
+    // ---- parse the MP4 box tree ourselves; libavformat is not involved
+    // at all (see the file header for why) ----
+    if (!mp4_open(path, &P.mp4))
+        return;
 
-    SceCtrlData pad_start;
-    sceCtrlPeekBufferPositive(0, &pad_start, 1);
-    uint32_t old_pad_buttons = pad_start.buttons;
+    Mp4Track *vtrk = &P.mp4.track[MP4_STREAM_VIDEO];
+    Mp4Track *atrk = &P.mp4.track[MP4_STREAM_AUDIO];
 
-    l_info("video: loop starting. active=%d, wait_count=%d, initial_pad_buttons=0x%08X",
-           sceAvPlayerIsActive(handle), wait_count, (unsigned) old_pad_buttons);
-
-    int frame_count = 0;
-    int video_frames = 0, audio_frames = 0;
-    bool audioOpenAttempted = false;
-
-    if (!sceAvPlayerIsActive(handle)) {
-        l_warn("video: timed out waiting for video decoder to become active (%s)", path);
-    }
-
-    while (sceAvPlayerIsActive(handle)) {
-        SceCtrlData pad;
-        sceCtrlPeekBufferPositive(0, &pad, 1);
-        uint32_t pressed = pad.buttons & ~old_pad_buttons;
-
-        if (pressed & (SCE_CTRL_CROSS | SCE_CTRL_START)) {
-            l_info("video: skipped by user button press! (pad=0x%08X old_pad=0x%08X pressed=0x%08X, %d loop iteration(s) in)",
-                   (unsigned) pad.buttons, (unsigned) old_pad_buttons, (unsigned) pressed, frame_count);
-            skipped = true;
-            break;
-        }
-        old_pad_buttons = pad.buttons;
-
-        SceAvPlayerFrameInfo video;
-        if (sceAvPlayerGetVideoData(handle, &video)) {
-            unsigned w = video.details.video.width;
-            unsigned h = video.details.video.height;
-            if (++video_frames == 1)
-                l_info("video: first video frame decoded (%ux%u, pData=%p)", w, h, video.pData);
-            unsigned yuvNeed = w * h + w * h / 2;
-            if (yuvNeed > gYuvScratchCap) {
-                free(gYuvScratch);
-                gYuvScratch = (unsigned char *) malloc(yuvNeed);
-                gYuvScratchCap = gYuvScratch ? yuvNeed : 0;
-            }
-            if (gYuvScratch && gYuvScratchCap >= yuvNeed) {
-                kuKernelFlushCaches((void *) video.pData, yuvNeed);
-                memcpy(gYuvScratch, video.pData, yuvNeed);
-                draw_video_frame(gYuvScratch, w, h);
-            }
-        }
-
-        SceAvPlayerFrameInfo audio;
-        if (sceAvPlayerGetAudioData(handle, &audio)) {
-            if (++audio_frames == 1)
-                l_info("video: first audio frame decoded (ch=%u rate=%u)",
-                       (unsigned) audio.details.audio.channelCount,
-                       (unsigned) audio.details.audio.sampleRate);
-            if (audioPort < 0 && !audioOpenAttempted) {
-                audioOpenAttempted = true;
-                audioChannels = audio.details.audio.channelCount;
-                SceAudioOutMode mode = (audioChannels >= 2) ? SCE_AUDIO_OUT_MODE_STEREO : SCE_AUDIO_OUT_MODE_MONO;
-                audioFrameLen = audio.details.audio.size / (audioChannels * sizeof(int16_t));
-                l_info("video: cutscene audio port: %u frames/channel (size=%u bytes, ch=%u)",
-                       audioFrameLen, (unsigned) audio.details.audio.size, audioChannels);
-                audioPort = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_VOICE, audioFrameLen,
-                                                (int) audio.details.audio.sampleRate, mode);
-                if (audioPort < 0) {
-                    l_warn("video: sceAudioOutOpenPort for cutscene audio failed (0x%08X) -- cutscene audio disabled",
-                           (unsigned) audioPort);
-                } else {
-                    gCutAudioPort = audioPort;
-                    gCutAudioWriteSlot = 0;
-                    gCutAudioLen[0] = 0;
-                    gCutAudioLen[1] = 0;
-                    gCutAudioQuit = false;
-                    cutAudioThreadUid = sceKernelCreateThread("cutscene audio out", cutscene_audio_thread,
-                                                               0x10000100, 0x4000, 0, 0, NULL);
-                    if (cutAudioThreadUid >= 0) {
-                        sceKernelStartThread(cutAudioThreadUid, 0, NULL);
-                    } else {
-                        l_warn("video: cutscene audio thread creation failed (0x%08X) -- cutscene audio disabled",
-                               (unsigned) cutAudioThreadUid);
-                        sceAudioOutReleasePort(audioPort);
-                        audioPort = -1;
-                        gCutAudioPort = -1;
+    // ---- video decoder, single-threaded (see VIDEO_DECODE_THREADS) ----
+    {
+        const AVCodec *codec = avcodec_find_decoder(vtrk->codec_id);
+        if (!codec) {
+            l_error("video: no software decoder registered for video codec id %d", (int) vtrk->codec_id);
+        } else {
+            P.vctx = avcodec_alloc_context3(codec);
+            if (P.vctx) {
+                P.vctx->width = vtrk->width;
+                P.vctx->height = vtrk->height;
+                if (vtrk->extradata) {
+                    P.vctx->extradata = (uint8_t *) av_mallocz(vtrk->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+                    if (P.vctx->extradata) {
+                        memcpy(P.vctx->extradata, vtrk->extradata, vtrk->extradata_size);
+                        P.vctx->extradata_size = vtrk->extradata_size;
                     }
                 }
-            }
-            if (audioPort >= 0) {
-                cutscene_audio_submit(audio.pData, (unsigned) audio.details.audio.size);
+                P.vctx->thread_count = VIDEO_DECODE_THREADS;
+                P.vctx->flags2 |= AV_CODEC_FLAG2_FAST;
+                // Decode at half resolution -- quarters the NEON conversion,
+                // the texture upload and the MPEG-4 decode itself, same fix
+                // as Asphalt-5-Vita's Bug #25. `lowres` is honored by the
+                // mpegvideo-family decoders (this asset's MPEG-4 Part 2
+                // included); must be set before avcodec_open2(). If a future
+                // FFmpeg build ever ignores it, playback still works --
+                // frames just come back full-size and ring_push()/
+                // draw_video_frame() size themselves from f->width/height.
+                P.vctx->lowres = 1;
+                if (avcodec_open2(P.vctx, codec, NULL) < 0) {
+                    l_error("video: avcodec_open2 failed for video stream");
+                    avcodec_free_context(&P.vctx);
+                }
             }
         }
-
-        frame_count++;
-        sceKernelDelayThread(1000);
+    }
+    if (!P.vctx) {
+        l_error("video: no usable video decoder for %s, aborting playback", path);
+        goto cleanup;
     }
 
-    l_info("video: loop exited! active=%d, iterations=%d, video_frames=%d, audio_frames=%d",
-           sceAvPlayerIsActive(handle), frame_count, video_frames, audio_frames);
-
-    if (cutAudioThreadUid >= 0) {
-        pthread_mutex_lock(&gCutAudioLock);
-        gCutAudioQuit = true;
-        pthread_mutex_unlock(&gCutAudioLock);
-        sceKernelWaitThreadEnd(cutAudioThreadUid, NULL, NULL);
-        sceKernelDeleteThread(cutAudioThreadUid);
+    {
+        AVRational vtb = { 1, (int) vtrk->timescale };
+        P.vtb = vtb;
     }
-    gCutAudioPort = -1;
+    P.frame_period_us = VIDEO_FRAME_PERIOD_US;
+    l_note("video: playing %s -- %dx%d %s (lowres=%d), fixed 30 fps (period %lldus), %d decode thread(s)",
+           path, P.vctx->width, P.vctx->height, avcodec_get_name(P.vctx->codec_id),
+           P.vctx->lowres, (long long) P.frame_period_us, P.vctx->thread_count);
 
-    if (audioPort >= 0)
-        sceAudioOutReleasePort(audioPort);
+    // ---- audio decoder + resampler + output port ----
+    if (atrk->present) {
+        const AVCodec *codec = avcodec_find_decoder(atrk->codec_id);
+        if (!codec) {
+            l_warn("video: no software decoder registered for audio codec id %d -- cutscene will be silent",
+                   (int) atrk->codec_id);
+        } else {
+            P.actx = avcodec_alloc_context3(codec);
+            if (P.actx) {
+                P.actx->sample_rate = atrk->sample_rate;
+                av_channel_layout_default(&P.actx->ch_layout, atrk->channels > 0 ? atrk->channels : 2);
+                if (atrk->extradata) {
+                    P.actx->extradata = (uint8_t *) av_mallocz(atrk->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+                    if (P.actx->extradata) {
+                        memcpy(P.actx->extradata, atrk->extradata, atrk->extradata_size);
+                        P.actx->extradata_size = atrk->extradata_size;
+                    }
+                }
+                P.actx->thread_count = 1;  // AAC is cheap; keep the cores for video
+                if (avcodec_open2(P.actx, codec, NULL) < 0) {
+                    l_warn("video: avcodec_open2 failed for audio stream -- cutscene will be silent");
+                    avcodec_free_context(&P.actx);
+                }
+            }
+        }
+    } else {
+        l_note("video: no audio track in %s -- cutscene will be silent, pacing on wall clock", path);
+    }
 
-    sceAvPlayerStop(handle);
-    sceAvPlayerClose(handle);
+    if (P.actx) {
+        {
+            AVRational atb = { 1, (int) atrk->timescale };
+            P.atb = atb;
+        }
+        P.achannels = P.actx->ch_layout.nb_channels > 0 ? P.actx->ch_layout.nb_channels : 2;
+        if (P.achannels > 2)
+            P.achannels = 2;  // a Vita port is stereo at most
+        P.arate = audio_rate_supported(P.actx->sample_rate) ? P.actx->sample_rate : 48000;
+        if (P.arate != P.actx->sample_rate)
+            l_note("video: source audio is %d Hz, which no Vita audio port accepts -- resampling to %d Hz",
+                   P.actx->sample_rate, P.arate);
 
-    l_success("video: %s (%s)", skipped ? "skipped" : "finished", path);
+        AVChannelLayout outLayout;
+        av_channel_layout_default(&outLayout, P.achannels);
+        int rc = swr_alloc_set_opts2(&P.swr, &outLayout, AV_SAMPLE_FMT_S16, P.arate,
+                                      &P.actx->ch_layout, P.actx->sample_fmt, P.actx->sample_rate,
+                                      0, NULL);
+        av_channel_layout_uninit(&outLayout);
+        if (rc < 0 || !P.swr || swr_init(P.swr) < 0) {
+            l_warn("video: swr_alloc_set_opts2/swr_init failed -- cutscene will be silent");
+            if (P.swr) { swr_free(&P.swr); P.swr = NULL; }
+        }
+    }
+
+    if (P.swr) {
+        SceAudioOutMode mode = (P.achannels >= 2) ? SCE_AUDIO_OUT_MODE_STEREO
+                                                   : SCE_AUDIO_OUT_MODE_MONO;
+        P.aport = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_VOICE, AUDIO_GRAIN, P.arate, mode);
+        if (P.aport < 0) {
+            l_warn("video: sceAudioOutOpenPort for cutscene audio failed (0x%08X) -- cutscene audio disabled",
+                   (unsigned) P.aport);
+            swr_free(&P.swr);
+            P.swr = NULL;
+        } else {
+            l_note("video: cutscene audio port %d open (%d Hz, %d ch, %d frames/block)",
+                   P.aport, P.arate, P.achannels, AUDIO_GRAIN);
+        }
+    }
+
+    // ---- start the workers ----
+    // pthread_create, not sceKernelCreateThread: FFmpeg's frame threading
+    // waits on condition variables on whichever thread calls
+    // avcodec_receive_frame(), and that is only safe from a thread
+    // libpthread knows about. Affinity/priority are set from inside each
+    // thread instead (see video_decode_thread()/cutscene_audio_thread()).
+    {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 512 * 1024);
+        if (pthread_create(&decodeThread, &attr, video_decode_thread, NULL) == 0) {
+            decodeThreadUp = true;
+        } else {
+            l_error("video: could not start the decode thread -- aborting playback");
+        }
+        pthread_attr_destroy(&attr);
+    }
+    if (!decodeThreadUp)
+        goto cleanup;
+
+    if (P.swr && P.aport >= 0) {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 256 * 1024);
+        if (pthread_create(&audioThread, &attr, cutscene_audio_thread, NULL) == 0) {
+            audioThreadUp = true;
+        } else {
+            l_warn("video: could not start the cutscene audio thread -- cutscene will be silent");
+        }
+        pthread_attr_destroy(&attr);
+    }
+    if (!audioThreadUp)
+        P.aclock_valid = false;  // nothing will advance the audio clock: wall clock it is
+
+    // ---- present, on this (the render/GL) thread ----
+    {
+        SceCtrlData pad_start;
+        sceCtrlPeekBufferPositive(0, &pad_start, 1);
+        uint32_t old_pad = pad_start.buttons;
+
+        int64_t play_start = now_us();
+        P.wall_base_us = play_start;
+        __sync_synchronize();
+        P.presenting = true;
+
+        int64_t last_clk = -1;
+        int64_t last_clk_move = play_start;
+        int64_t last_present_us = 0;  // wall time of the last gl_swap; 0 = none yet
+
+        l_note("video: present loop starting");
+
+        while (!P.quit) {
+            sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
+
+            // Backstop watchdog (Fase 48/50): the ring/decode_done bookkeeping
+            // below should always reach a natural end on a well-formed file,
+            // but this file used to hang forever on one that never delivered
+            // frames (SceAvPlayer + an unsupported codec, see the file
+            // header) -- keep the same "always return" guarantee for any
+            // future asset swap. intro.m4v is ~7.4s, so 30s is generous.
+            if (now_us() - play_start > 30000000LL) {
+                l_note("video: watchdog: 30s cap reached (decoded=%d presented=%d) -- stopping",
+                       P.decoded, P.presented);
+                break;
+            }
+
+            SceCtrlData pad;
+            sceCtrlPeekBufferPositive(0, &pad, 1);
+            uint32_t pressed = pad.buttons & ~old_pad;
+            old_pad = pad.buttons;
+            if (pressed & (SCE_CTRL_CROSS | SCE_CTRL_START)) {
+                l_note("video: skipped by user button press! (pad=0x%08X)", (unsigned) pad.buttons);
+                skipped = true;
+                P.quit = true;
+                break;
+            }
+
+            int64_t clk = playback_clock_us();
+            int64_t nw = now_us();
+            if (clk != last_clk) {
+                last_clk = clk;
+                last_clk_move = nw;
+            } else if (P.aclock_valid && nw - last_clk_move > 2000000) {
+                l_warn("video: audio clock stalled for 2s -- pacing on the wall clock from here");
+                P.wall_base_us = nw - clk;
+                __sync_synchronize();
+                P.aclock_valid = false;
+                last_clk_move = nw;
+            }
+
+            pthread_mutex_lock(&P.ring_lock);
+            int count = P.count;
+            int head = P.head;
+            pthread_mutex_unlock(&P.ring_lock);
+
+            if (count == 0) {
+                if (P.decode_done && ring_count() == 0)
+                    break;  // re-checked under the lock: nothing more is coming
+                sceKernelDelayThread(1000);
+                continue;
+            }
+
+            // Drop-to-latest: if the frame after head is due as well, head's
+            // slot has already passed -- skip straight to the newest due
+            // frame instead of delaying it further.
+            while (count >= 2) {
+                int nxt = (head + 1) % P.nslots;
+                if (P.slots[nxt].pts_us > clk)
+                    break;
+                pthread_mutex_lock(&P.ring_lock);
+                P.head = nxt;
+                P.count--;
+                head = P.head;
+                count = P.count;
+                pthread_mutex_unlock(&P.ring_lock);
+                P.dropped_late++;
+            }
+
+            FrameSlot *s = &P.slots[head];
+            {
+                // Fixed 30 fps tick: never present two frames closer together
+                // than one period, and never before the frame is due.
+                int64_t wait = s->pts_us - clk;
+                if (last_present_us != 0) {
+                    int64_t tick_wait = (last_present_us + P.frame_period_us) - now_us();
+                    if (tick_wait > wait)
+                        wait = tick_wait;
+                }
+                if (wait > 0) {
+                    if (wait > 8000) wait = 8000;
+                    sceKernelDelayThread((SceUInt) wait);
+                    continue;
+                }
+            }
+
+            draw_video_frame(s->rgb, s->w, s->h);
+            P.presented++;
+            last_present_us = now_us();
+
+            pthread_mutex_lock(&P.ring_lock);
+            P.head = (P.head + 1) % P.nslots;
+            P.count--;
+            pthread_mutex_unlock(&P.ring_lock);
+        }
+
+        // Let the audio tail finish rather than cutting it off mid-word.
+        if (!skipped && audioThreadUp) {
+            int64_t deadline = now_us() + 1500000;
+            while (!P.audio_done && now_us() < deadline)
+                sceKernelDelayThread(2000);
+        }
+
+        int64_t play_end = now_us();
+        double elapsed = (double) (play_end - play_start) / 1000000.0;
+        double avg_fps = elapsed > 0.0 ? (double) P.presented / elapsed : 0.0;
+        int div = P.presented > 0 ? P.presented : 1;
+        l_note("video: loop exited! presented=%d, decoded=%d, dropped_late=%d, audio_frames_played=%u, "
+               "elapsed=%.2fs, avg_fps=%.1f [decode=%.1fms/frame, yuv_convert=%.1fms/frame, "
+               "tex_upload=%.1fms/frame, gl_draw+swap=%.1fms/frame]",
+               P.presented, P.decoded, P.dropped_late, (unsigned) P.aplayed, elapsed, avg_fps,
+               ((double) P.decode_us / 1000.0) / div,
+               ((double) P.convert_us / 1000.0) / div,
+               ((double) P.upload_us / 1000.0) / div,
+               ((double) P.draw_us / 1000.0) / div);
+    }
+
+cleanup:
+    // Order matters: stop the workers before tearing down anything they touch.
+    P.quit = true;
+    __sync_synchronize();
+    if (decodeThreadUp)
+        pthread_join(decodeThread, NULL);
+    if (audioThreadUp)
+        pthread_join(audioThread, NULL);
+
+    aq_drain_and_free();
+
+    if (P.aport >= 0) {
+        sceAudioOutReleasePort(P.aport);
+        P.aport = -1;
+    }
+    if (P.swr) swr_free(&P.swr);
+    // avcodec_free_context() joins FFmpeg's frame threads, so it runs here on
+    // the same thread that created them in avcodec_open2().
+    if (P.vctx) avcodec_free_context(&P.vctx);
+    if (P.actx) avcodec_free_context(&P.actx);
+    mp4_close(&P.mp4);
+    // The ring's RGB565 buffers are ~400KB each (half-res); don't hold them
+    // for the rest of the session just because a cutscene played.
+    free_frame_slots();
+    P.presenting = false;
+
+    if (skipped) {
+        // Wait until Cross/Start are released so the skip button doesn't leak
+        // into gameplay as an unintended action on the next frame (max ~500ms).
+        for (int i = 0; i < 50; ++i) {
+            SceCtrlData p;
+            sceCtrlPeekBufferPositive(0, &p, 1);
+            if (!(p.buttons & (SCE_CTRL_CROSS | SCE_CTRL_START)))
+                break;
+            sceKernelDelayThread(10000);
+        }
+    }
+
+    l_note("video: %s (%s)", skipped ? "skipped" : "finished", path);
 }

@@ -14,6 +14,7 @@
 #include "utils/logger.h"
 #include "utils/utils.h"
 #include "utils/settings.h"
+#include "utils/filecache.h"
 #include "reimpl/io.h"
 
 #include <string.h>
@@ -65,6 +66,9 @@ void soloader_init_all() {
     // The .so writes into subdirectories of its (translated) content root that
     // nothing else creates -- see io_prepare_dirs() in reimpl/io.c.
     io_prepare_dirs();
+
+    // Index all files in data directory into RAM to eliminate expensive FAT32 scans
+    filecache_init();
 
     if (!file_exists(SO_PATH)) {
         fatal_error("Looks like you haven't installed the data files for this "

@@ -14,6 +14,7 @@
  */
 
 #include "utils/audio.h"
+#include "utils/filecache.h"
 #include "utils/logger.h"
 #include "sound_files.h"
 
@@ -91,11 +92,7 @@ static int snd_exists(int index) {
     if (index < 0 || index >= GMV_SOUND_COUNT)
         return 0;
     if (sound_exists_cache[index] == 0) {
-        char path[512];
-        snd_path(index, path, sizeof(path));
-        FILE *f = path[0] ? fopen(path, "rb") : NULL;
-        if (f) {
-            fclose(f);
+        if (filecache_exists(gmv_sound_files[index])) {
             sound_exists_cache[index] = 1;
         } else {
             sound_exists_cache[index] = -1;

@@ -41,11 +41,17 @@ elegí "Continuar con un port existente" apuntando a esta carpeta.
    `JNINativeInterface` lo llama el `.so`.
 5. **`SceAvPlayer` solo decodifica H.264/AVC por hardware.** `intro.m4v` (extraído del APK, 2011)
    es MPEG-4 Part 2 (Simple Profile) -- confirmado con `ffprobe`, se abre bien (contenedor MP4
-   válido) pero no produce ni un frame de video por esa vía. **No transcodificar/alterar el
-   asset original para "arreglar" esto** -- el asset se deja tal cual sale del APK. `video.cpp`
-   sigue el método de Shadow Guardian-vita (SceAvPlayer) sin cambios; con este asset puntual el
-   intro no se ve, y eso es un límite conocido, no un bug del loader (ver Fase 38/40 en
-   `port_progress.md`).
+   válido) pero no produce ni un frame de video por esa vía (Fase 38/40). **No transcodificar/
+   alterar el asset original para "arreglar" esto** sigue siendo la regla -- pero desde la
+   Fase 50 el intro SÍ se reproduce, decodificando el `.m4v` original sin tocarlo, **en software**
+   vía FFmpeg (`avcodec`/`swresample`, sin `libavformat`: el build de vita-portlibs no trae el
+   demuxer `mov`, así que `source/video.cpp` parsea el árbol de cajas ISO-BMFF a mano). Mismo
+   bug y mismo fix que el port hermano Asphalt-5-Vita en este mismo workspace, portado de ahí
+   casi verbatim (demuxer MP4 mínimo, decode+audio en threads dedicados, conversión YUV420P→
+   RGB565 por NEON, dibujado por pipeline fijo GLES1.1 -- **nunca** un shader GLSL custom para
+   esto, ver el comentario de `draw_video_frame()` para la regresión confirmada en hardware que
+   ese camino causó en Asphalt-5-Vita). `SceAvPlayer`/`SceAvPlayer_stub` ya no se usan en este
+   port.
 
 ## Flujo de trabajo esperado
 

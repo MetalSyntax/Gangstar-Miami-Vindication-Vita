@@ -3,7 +3,752 @@
 > Bitácora cronológica, un bug confirmado a la vez. Para el estado **estructural** del port (motor,
 > mapa JNI, filesystem, niveles de logging, checklist) ver `PORTING_PLAN.md`.
 
-## Estado actual — 2026-09-16 (Fase 41: `SAFER_DRAW_SPEEDHACK` restaurado -- sacarlo no era el fix del negro, era la velocidad; sospechoso ahora es `MATH_SPEEDHACK`, `logs/debug_local_044.log`)
+## Estado actual — 2026-09-20 (Fase 51: cruceta + stick izquierdo mueven al personaje — synthesized drag sobre el `AnalogStick` de la HUD; confirmado que este motor NO tiene control manual de cámara)
+
+**Punto de partida:** el usuario reporta que la cruceta y el joystick izquierdo siguen sin
+mover al personaje, y que el joystick derecho no mueve la cámara.
+
+### Investigación en el `.so` decompilado antes de tocar código (no se adivinó nada)
+
+- `CHudManager::load()` (out_ghidra.c) crea exactamente **un** `AnalogStick` (0x8c bytes,
+  frame base=0, frame knob=1), guardado en `CHudManager+0x28`. Su ctor llama primero a
+  `HudElement::HudElement(...)`, o sea que hereda el mismo layout de vtable que `VirtualButton`
+  -- el gate de interactuable en +0x14 y `getTouchRegion()` en +0x1c que `gamepad_actions.c` ya
+  usa para los botones (Fase 47) aplican sin cambios.
+- `OnFootControlHandler::onEvent()` sólo se suscribe a 3 tipos de evento: `EvStickMove` (7),
+  `EvStickReleased` (8) y `EvVirtualButton` (0xd) -- **nada de cámara**. `handleStickMove()`
+  llama directo a un método del `Player` (vtable+0x17c) con la dirección/magnitud del evento:
+  es el movimiento, y es la única entrada de teclado/touch que el modo a pie escucha aparte de
+  los botones de acción ya mapeados.
+- `AnalogStick::processTouch()` no hace hit-test contra su región en cada llamada -- consulta el
+  punto de toque YA CAPTURADO por id en `TouchScreenBase::s_touchScreenBase` y acumula el delta
+  entre muestras consecutivas. Es captura de touch estándar: alcanza con que el DOWN caiga una
+  vez dentro de la región: los MOVE siguientes van al mismo widget aunque el dedo se arrastre
+  bien afuera del dibujo del stick -- exactamente como arrastrar el pulgar de un joystick real.
+- **La cámara**: revisando cada `*ControlHandler::onEvent()` y `FollowCamera::updateAngles()`
+  (out_ghidra.c) -- ninguno lee touch para orientar la cámara a pie ni manejando. Es una cámara
+  de seguimiento 100% automática. Los dos `SlideControl` en `CHudManager+0x54`/`+0x58`
+  (`EvLeftRightStickMove`/`EvUpDownStickMove`) tampoco son cámara: en
+  `DrivingControlHandler::handleLeftRightStickMove()` llaman al **mismo** slot de vtable
+  (`Player+0xe8`) que `handleWheelTurn()` -- son un volante/acelerador alternativo por touch
+  para manejar, no un control de mirada. Y el propio `AnalogStick` se reutiliza tal cual en
+  `SniperControlHandler::handleStickMove()` para apuntar en modo francotirador -- no hay un
+  segundo stick en ningún lado del binario. Conclusión: **el joystick derecho no tiene nada a
+  qué mapearse** -- no es un bug del port, el juego original nunca tuvo mirada libre a pie ni
+  manejando.
+
+### Cambio (`source/utils/gamepad_actions.{c,h}`, `source/main.c`)
+
+Nueva `gamepad_stick_update(dpad_buttons, lx, ly)`, llamada una vez por frame desde `main.c`
+junto a `gamepad_actions_update()` ya existente:
+
+1. Normaliza el stick analógico izquierdo (`SceCtrlData.lx/ly`, 0..255 con 128=centro) a
+   [-1,1] con deadzone de ±24/128; la cruceta pisa el eje correspondiente a deflexión completa
+   si está presionada (para que ambos métodos de entrada funcionen, como pidió el usuario).
+2. Si hay deflexión y el stick sintético no está "activo": ubica el `AnalogStick` real
+   (`CHudManager+0x28`), corre el mismo gate de interactuable que los botones, y manda un touch
+   DOWN en el centro de su región -- igual que `pad_press()` para los `VirtualButton`, mismo
+   mecanismo, reutilizado.
+3. Mientras hay deflexión: manda touch MOVE cada frame a `centro + deflexión*radio*1.25` (radio
+   = mitad del ancho/alto de la región del widget, en píxeles de touch del motor) -- el 1.25x es
+   margen para garantizar que se alcanza el clamp interno de intensidad máxima de
+   `AnalogStick::processTouch`, igual que un pulgar real arrastrando un poco más allá del
+   dibujo del stick.
+4. Al soltar (deflexión vuelve a 0): touch UP en la última posición mandada.
+5. Logs `l_note` (release-visible) en down/up, `l_debug` en cada move (por frame, sólo en debug
+   para no volver a repetir el error de la Fase 8).
+
+`CLAUDE.md`/`PORTING_PLAN.md` no necesitan cambios de reglas -- esto es el mismo patrón de
+síntesis de touch de la Fase 47, extendido de tap discreto a drag continuo.
+
+### Build y despliegue
+
+`psvita-toolkit build --preset release` verde a la primera, `eboot.bin` subido
+(2026-09-20 00:06). Pendiente de confirmar en consola real.
+
+### Qué mirar en el próximo log
+
+1. `[input] move-stick down @(...) r=(...) slot 23` al mover la cruceta/stick -- confirma que
+   `CHudManager+0x28` se resolvió y el gate de interactuable pasó.
+2. Si en cambio sale `[input] move-stick: AnalogStick not interactable right now` en modo a pie
+   normal, el offset o el gate necesitan revisión (comparar contra un log con
+   `PTHR_TRACE_LOCKS`/build debug si hace falta).
+3. Confirmar en el juego real que el personaje efectivamente camina/corre en la dirección
+   correcta (arriba=alejarse de cámara, no al revés -- el signo de `ny` se invirtió a propósito
+   porque Y de pantalla crece hacia abajo).
+4. La cámara seguirá sin responder al stick derecho -- es el comportamiento correcto del juego
+   original, no algo pendiente de arreglar.
+
+## Estado previo — 2026-09-19 (Fase 50: `intro.m4v` se reproduce de verdad — decode de software vía FFmpeg, portado del port hermano Asphalt-5-Vita)
+
+**Punto de partida:** el usuario pide reparar la reproducción del intro (seguía en negro) y
+agregar logs para poder verificarlo. Antes de tocar código se le marcó que la causa raíz (Fase
+40/48) ya estaba confirmada como un límite de formato -- `SceAvPlayer` solo decodifica H.264 por
+hardware, `intro.m4v` es MPEG-4 Part 2 -- y no un bug de `video.cpp`. El usuario eligió la vía de
+decodificar el asset original en software (sin transcodificarlo), como "lo hizo Shadow Guardian".
+
+### Verificación de la premisa antes de portar nada
+
+Comparado byte a byte: `intro.m4v` de este port (800x500, `mpeg4`/mp4v, MD5 `9f134e99...`) y
+`logo.m4v` de Shadow-Guardian-vita (480x270, **h264**, MD5 `448c6535...`) **no son el mismo
+archivo** -- Shadow Guardian nunca necesitó decode de software porque su video ya era H.264
+(el camino que sí usa hardware). El port de este mismo workspace que YA resuelve exactamente
+este problema (MPEG-4 Part 2 + build de vita-portlibs sin demuxer `mov`) es **Asphalt-5-Vita**
+(`/Volumes/Seagate/PSVITA Develop/Asphalt-5-Vita/source/video.cpp`, 2090 líneas, con bugs de
+hardware ya cazados y documentados: #17 el mismo bug del demuxer, #25 contención de threads +
+decode a mitad de resolución, #26 el idle-timer del loop de present, y la regresión de shader
+GLES2 en `draw_video_frame()`). `source/video.cpp` de este port es ahora un port casi verbatim
+de ese archivo, no una reimplementación independiente -- para no arriesgarse a redescubrir esos
+mismos bugs de Vita a los golpes por segunda vez.
+
+### Qué se confirmó en la máquina de desarrollo antes de escribir código
+
+- `$HOME/vitasdk/arm-vita-eabi/lib/` ya tiene `libavformat.a`/`libavcodec.a`/`libavutil.a`/
+  `libswresample.a`/`libmp3lame.a` instalados (vita-portlibs, probablemente de una sesión previa
+  de Asphalt-5-Vita en esta misma máquina) -- `nm`/`ar t` confirmaron `ff_mpeg4_decoder` y
+  `ff_h264_decoder` presentes en `libavcodec.a`, y CERO `ff_mov_demuxer` en `libavformat.a`
+  (igual que documenta el header de Asphalt-5's `video.cpp`): el demuxer MP4 hecho a mano no es
+  opcional en este build, es obligatorio.
+- Símbolos de la API nueva de canal (`av_channel_layout_default`, `swr_alloc_set_opts2`, etc.,
+  la que usa Asphalt-5-Vita) confirmados presentes con `nm` antes de escribir una sola línea.
+
+### Cambios
+
+1. **`source/video.cpp` reescrito de punta a punta** (ver el comentario de cabecera del archivo
+   para la arquitectura completa): demuxer MP4/ISO-BMFF mínimo (`mp4_open`/`mp4_next_packet`,
+   sin `libavformat`), decode de video en un hilo dedicado (`video_decode_thread`, cores 1-2,
+   `VIDEO_DECODE_THREADS=1` -- Asphalt-5-Vita ya cazó en consola real que 3 threads de frame de
+   libavcodec sin afinidad de Vita generan contención de scheduler y triplican el costo, no lo
+   reducen), audio AAC + resample en otro hilo dedicado (`cutscene_audio_thread`, core 2,
+   prioridad realtime) que alimenta `sceAudioOut` en bloques fijos de 1024 frames, reloj de
+   reproducción maestreado por las muestras de audio realmente reproducidas (no wall clock, así
+   que si el decode se atrasa el audio se atrasa con él y no se desincronizan), conversión
+   YUV420P→RGB565 por NEON (Q7 fixed point, el fix de rendimiento "Bug #25" de Asphalt-5-Vita) y
+   decode a mitad de resolución (`lowres=1`, 400x250) por el mismo motivo de rendimiento. Dibujo
+   por **pipeline fijo GLES1.1** (`glVertexPointer`/`glTexCoordPointer`/`glDrawArrays`), a
+   propósito **sin** el shader GLSL custom que tenía la versión anterior (NV12→RGB en el
+   fragment shader) -- ver el comentario de cabecera y el de `draw_video_frame()`: ese exacto
+   patrón le rompió el render de pantallas de carga/título para el resto de la corrida en
+   Asphalt-5-Vita (todo blanco sólido), confirmado en hardware real, y nuestra versión anterior
+   nunca llegó a probarse con frames reales para saber si tenía el mismo problema. Ningún
+   `pthread_cond_t` en ningún lado (confirmado roto en este port, ver comentario del archivo).
+2. **`CMakeLists.txt`**: linkea `avformat`/`avcodec`/`avutil`/`swresample`/`mp3lame` (este
+   último es dependencia dura de link de `avcodec.a` en el build de vita-portlibs aunque el
+   port nunca codifique nada -- confirmado por Asphalt-5-Vita con un error de link real). Se
+   saca `SceAvPlayer_stub`: nada en el port lo usa más.
+3. **`source/video.h`**: comentario de `video_init()` actualizado (ya no carga el sysmódulo
+   AVPLAYER).
+4. **Logs nuevos, todos con `l_note()` (release-visible, sobreviven al build que se despliega
+   normalmente)** -- exactamente lo que pidió el usuario para poder verificar esto sin un build
+   debug: qué tracks encontró el demuxer y con qué codec/dimensiones/timescale/sample_count
+   (`video: demux: video track FOUND (codec_id=... WxH...)`), qué decoder/resolución/fps quedó
+   activo, primer frame de video y de audio decodificados, benchmark de arranque del conversor
+   NEON (800x500 y 400x250, para comparar contra un log real si el rendimiento resulta ser el
+   cuello de botella), el mismo `[video_diag]` de framebuffer readback que ya probó útil en la
+   Fase 48, el watchdog de 30s (backstop, no debería dispararse nunca con este asset de 7.4s) y
+   la línea de resumen final (`presented=... decoded=... dropped_late=... avg_fps=...` +
+   desglose de ms/frame por etapa).
+5. **Build verde** (`psvita-toolkit build --preset release`, 2026-09-19) a la primera pasada,
+   sin warnings nuevos en `video.cpp` -- linkeó `avformat`/`avcodec`/`avutil`/`swresample`/
+   `mp3lame` sin símbolos faltantes.
+
+### Qué mirar en el próximo log (pendiente de confirmar en consola real)
+
+1. `video: demux: video track FOUND (codec_id=... 800x500 ...), audio track FOUND (...)` --
+   confirma que el parser de MP4 a mano encontró ambos tracks reales (si sale `absent` para
+   video, el parser tiene un bug con este archivo puntual, no relacionado al codec).
+2. `video: playing .../intro.m4v -- 400x250 mpeg4 (lowres=1), fixed 30 fps ...` -- confirma que
+   `avcodec_open2` abrió el decoder de verdad.
+3. `video: first video frame decoded (400x250)` y `[video_diag] framebuffer readback ... rgba=
+   R,G,B,A` con **valores que no sean todos 0** -- esa es la prueba definitiva de que hay píxeles
+   reales en pantalla (la Fase 48 tenía el mismo chequeo del lado del decoder; ahora hay uno
+   también del lado del framebuffer).
+4. `video: loop exited! presented=N decoded=N dropped_late=... avg_fps=...` -- si `avg_fps` sale
+   muy por debajo de 30 o `dropped_late` es alto, comparar `yuv_convert=Xms/frame` de esa línea
+   contra el benchmark de arranque (`video: startup benchmark (400x250, ...)`) para saber si el
+   cuello de botella es el mismo que Asphalt-5-Vita ya resolvió con `lowres=1`, o algo nuevo.
+5. Si algo cuelga: el watchdog de 30s corta y lo dice explícitamente en el log en vez de dejar
+   la consola en negro sin explicación -- si aparece esa línea, es la primera pista.
+
+## Estado previo — 2026-09-19 (Fase 49: sacado el cap artificial de 30 fps del main loop — vsync ya pacea a 60 Hz; inventario de speedhacks de vitaGL sin probar)
+
+**Punto de partida:** el usuario pide seguir subiendo FPS "con más técnicas que hayan usado en
+otros ports". Antes de tocar nada de vitaGL de nuevo (terreno ya pisado varias veces con
+regresiones reales — Fases 38/41/43/44), se revisó primero si el propio loop tenía algún
+limitador artificial.
+
+### Hallazgo: el cap de 30 fps era una copia innecesaria del ahorro de batería de Android
+
+`source/main.c` traía, desde el bootstrap inicial, un `sceKernelDelayThread(33000 - frame_time)`
+comentado como "mirrors GameRenderer.onDrawFrame()'s own 30 FPS pacing". Se confirmó leyendo
+`decompiled/apk_jadx/sources/.../GameRenderer.java:80-86`: el Java mide
+`System.currentTimeMillis()` él mismo y solo duerme el tiempo **sobrante** hasta 33 ms — nunca
+fuerza un paso fijo si el frame tardó más. Es decir, el motor es delta-time, no tick-locked: no
+hay ninguna dependencia de simulación en correr a exactamente 30 Hz, ese `Thread.sleep` en
+Android es pura gestión térmica/batería de teléfono, irrelevante en Vita.
+
+Y en Vita ese cap era **redundante** con un limitador real que ya existía: `gl_swap()` →
+`vglSwapBuffers()` → `scene_end()` llama `sceDisplayWaitVblankStartMulti(vsync_interval)`
+(`lib/vitaGL/source/gxm.c:569-570`, `vsync_interval=1` por default) — o sea que cada frame ya
+se bloquea hasta el próximo vblank a 60 Hz. El `sceKernelDelayThread` de `main.c` no aportaba
+ninguna protección que el vsync no diera ya, y en cambio le ponía un techo de 30 fps a
+cualquier escena que el hardware puede dibujar en menos de 16,6 ms (menús, interiores, escenas
+simples) — coincide con el "corre a 20-30 fps" reportado desde la Fase 33 sin que nunca se viera
+más arriba de 30 pase lo que pase.
+
+### Cambio (`source/main.c`, sin tocar vitaGL/motor)
+
+Se saca el `sceKernelDelayThread(33000 - frame_time)` de punta a punta. `sceKernelPowerTick()`
+sigue llamándose cada iteración (protección de la Fase 31 contra que el governor baje relojes),
+así que no se reintroduce ese riesgo. El único limitador de framerate que queda es el vsync real
+de vitaGL.
+
+### Qué esperar en el próximo log
+
+- El heartbeat `[022] frame N | %.1f fps` (cada 5 s de pared) debería mostrar **más de 30 fps**
+  en cualquier tramo donde antes marcaba exactamente ~30.0 de forma sostenida (eso era el cap,
+  no el techo real del hardware). En tramos ya por debajo de 30 (mundo abierto pesado, Fases
+  29/46) no debería cambiar nada, porque ahí el limitador real ya era el propio render/GPU.
+- Si algo de gameplay se sintiera "más rápido" de forma incorrecta (animaciones/física
+  desincronizadas), sería la señal de que el motor SÍ asume un dt fijo en algún punto interno
+  pese a lo que muestra `GameRenderer.java` — no confirmado en Ghidra todavía, revertir esta
+  fase primero si aparece.
+
+### Candidatos pendientes (vitaGL, NO aplicados todavía — probar de a uno, con consola real)
+
+Inventario de flags de `lib/vitaGL/source/shared.h` que este port todavía no probó, en orden de
+riesgo creciente (ver `CMakeLists.txt` para los que ya están: `TEXTURES_SPEEDHACK`,
+`SAMPLERS_SPEEDHACK`, `SAFER_DRAW_SPEEDHACK`, `HAVE_TEX_CACHE`, `HAVE_WVP_ON_GPU`,
+`HAVE_SHADER_CACHE`, `DISABLE_TILE_CLIPPER`; `MATH_SPEEDHACK` y `SKIP_ERROR_HANDLING` ya se
+probaron y se sacaron por regresiones reales, Fases 41/43):
+
+1. **`PRIMITIVES_SPEEDHACK`** — el más acotado, sin sitios de `sceGxmSetVertexStream` de por
+   medio (afecta el path de armado de primitivas en `ffp.c`). Punto de partida razonable para
+   la próxima corrida.
+2. **`TEXTURE_UPLOADS_SPEEDHACK`** — evita sincronizar antes de subir una textura que la GPU
+   podría estar todavía leyendo del frame anterior; riesgo de un frame de parpadeo en texturas
+   que cambian en caliente (el motor tiene pocas de esas fuera de HUD/video), no de crash.
+3. **`INDICES_SPEEDHACK` / `INDICES_DRAW_SPEEDHACK`** — equivalente de `SAFER_DRAW_SPEEDHACK`
+   pero para los índices en vez de los atributos de vértice. Mismo mecanismo que ya se validó
+   en consola para vértices; probar recién después de (1) y (2) para no mezclar variables.
+4. **`READBACKS_SPEEDHACK`** (`framebuffers.c:672`) — saca el `scene_reset()+sceGxmFinish()`
+   forzado cuando se lee de un framebuffer que sigue siendo el de escritura activa. Solo
+   importa si el motor hace algo de render-a-textura con lectura (reflejos, minimapa, efectos
+   de pantalla) — no confirmado todavía si este motor lo usa. Antes de tocarlo: `objdump -T`
+   o Ghidra para ver si aparece `glCopyTexImage2D`/`glCopyTexSubImage2D` en el `.so`.
+5. **`DRAW_SPEEDHACK`** (el "hermano sin red" de `SAFER_DRAW_SPEEDHACK`) y
+   **`CIRCULAR_POOL_SPEEDHACK`**/**`BUFFERS_SPEEDHACK`** — los tres sacan la protección de
+   doble/triple buffer que evita que la CPU pise datos que la GPU todavía está leyendo. La
+   Fase 41 ya mostró en consola real que sacar la versión "safer" de esta misma familia
+   devuelve degradación progresiva de fps (overrun del circular pool), así que estos tres son
+   los últimos candidatos a probar y los que más justifican una build de prueba dedicada
+   (fácil de revertir, pero el síntoma si sale mal es sutil: corrupción visual intermitente,
+   no un crash limpio).
+
+Cada uno se agrega solo, se compila release, se prueba en consola, y si el log/la imagen no
+muestran regresión se documenta acá antes de sumar el siguiente — mismo método que ya viene
+dando resultados verificables desde la Fase 8.
+
+## Estado previo — 2026-09-18 (Fase 48: video con diagnóstico visible en release + watchdog anti-cuelgue; el método es el de Shadow Guardian y el límite es el asset)
+
+**Punto de partida:** el usuario, probando el build de la Fase 47, reporta que el video no se
+reproduce y pide revisar cómo se hizo en `Shadow-Guardian-vita/source`.
+
+### Comparativa (hecha archivo por archivo, no de memoria)
+
+- El `source/video.cpp` de este port **ya es** el método de Shadow Guardian (portado de ahí:
+  mismo `SceAvPlayerInitData` con `av_alloc`/`av_alloc_texture` en 3 tiers CDRAM→PHYCONT→UNCACHE,
+  mismo `fileReplacement` por `sceIoPread`, mismo shader GLES2 YUV→RGB con texturas
+  `LUMINANCE`/`LUMINANCE_ALPHA`, mismo present con save/restore de estado GL + `gl_swap()`,
+  mismo hilo de audio `SCE_AUDIO_OUT_PORT_TYPE_VOICE`, mismo skip con Cross/Start). Las únicas
+  diferencias reales de SG son diagnóstico (logs de `glGetError`, readback del framebuffer,
+  análisis del plano Y, timings) y `VIDEO_DOWNSAMPLE_UPLOAD` (solo rendimiento) -- nada que
+  explique un "no se reproduce".
+- La diferencia que sí lo explica es el **asset**, verificada con `ffprobe`: el `logo.m4v` de
+  Shadow Guardian es **H.264** (Constrained Baseline, 480x270) -- lo que el decodificador por
+  hardware de `SceAvPlayer` sabe decodificar -- mientras que nuestro `intro.m4v` es **MPEG-4
+  Part 2** (`mp4v`, Simple Profile, 800x500, 7,36 s, + pista AAC 48 kHz stereo). `SceAvPlayer`
+  jamás va a producir un frame de video de ese archivo, con este código ni con ningún otro:
+  sigue siendo el límite conocido de la Fase 40 (no se transcodifica el asset -- regla del
+  proyecto). El audio AAC sí podría sonar sobre pantalla negra.
+- Agravante encontrado al leer el loop: `while (sceAvPlayerIsActive(handle))` **no tenía
+  timeout**. Si el decoder se queda "activo" sin entregar frames (justo el caso de un codec
+  que no maneja), `video_play()` no retorna nunca y el juego cuelga en negro en el hilo
+  principal. Además en release TODO el logging de video es mudo (`l_info`/`l_success` se
+  compilan fuera): un intro que se salta, que suena a negro o que cuelga dejan el mismo log
+  vacío (el 049 no trae ni una línea `video:`), imposible de triagear.
+
+### Cambios (`source/video.cpp` solamente, build verde release 2026-09-18)
+
+1. **Diagnóstico visible en release** (todo `l_note`, acotado -- unas pocas líneas por
+   reproducción, nunca por frame): `playing <path> (<bytes>)`, `loop starting (decoder
+   active=...)`, primer frame (`%ux%u` + análisis del plano Y con el truco `[video_diag]` de
+   SG: `all_same=1` con Y en cero = el decoder no escribió datos reales, i.e. codec no
+   soportado), primer present (`draw_err`, readback del centro, `program` -- prueba la vía
+   de presentación aunque no haya frames), y resumen de salida (`iters`, `video_frames`,
+   `audio_frames`, `skipped/finished`).
+2. **Watchdog**: cualquier frame de video O audio cuenta como progreso; 8 s sin progreso o
+   60 s totales cortan el loop con su `l_note` y retornan al motor. Un codec imposible ya no
+   puede colgar el juego (skip con Cross/Start sigue intacto).
+
+### Qué mirar en el próximo log (con este build, al arrancar -- el intro corre al inicio)
+
+1. `video: playing .../intro.m4v` + `loop starting` -- confirman que el motor pidió el video.
+2. `first frame 800x500 ... all_same=1` (esperado) = confirmación en consola de que el
+   decoder no produce datos (límite hardware, no bug del loader).
+3. `video: exited ... video_frames=0 audio_frames=N` -- si `audio_frames>0`, el intro "suena
+   a negro" ~7 s; si el watchdog corta, sale su línea explícita en vez de un cuelgue mudo.
+4. La confirmación de la Fase 47 (botones, líneas `[input]`) sigue pendiente -- el usuario la
+   está probando en paralelo con este mismo build.
+
+## Estado previo — 2026-09-18 (Fase 47: botones físicos re-mapeados como taps sintetizados — la premisa de la Fase 45 era incorrecta, `logs/debug_local_049.log`)
+
+**Punto de partida:** el usuario mandó `logs/debug_local_049.log` (corrida real en consola con el
+build de la Fase 45: el juego corre a 15-26 fps, se ve `gamepad_actions: ready`, suenan
+`DeviceKeyInput:23` y `:4`) pidiendo que los botones físicos funcionen, revisando el código
+decompilado para mapearlos con los virtuales.
+
+### Causa raíz: el `fire()` de la Fase 45 no podía funcionar (confirmado en el desensamblado)
+
+Releyendo `VirtualButton::processTouch(long)` en `decompiled/disasm/full_libGangster2.so.md`
+(`002bfb24`): la primera instrucción útil es `ldr r2, [r0, #12]` -- lee el flags word del
+**botón** (`this+0xc`) y `tst r2, #1; beq return` sale sin hacer nada si el bit0 del botón no
+está puesto. El segundo argumento (r1, el buffer `{0,0,0,1}` que armaba `fire()`) **no se lee
+jamás** en toda la función. El listado de Ghidra en que se basó la Fase 45 (`*(param_1+0xc)`)
+es el mismo campo visto a través del segundo vtable (el thunk `_ZThn8_` lee `this+4`, que ES
+`this+0xc` del objeto real) -- no un struct de touch externo. Conclusión: cada `fire()` caía
+sobre una instancia de skin inactiva con bit0 en cero y era un no-op silencioso. Encaja exacto
+con el log 049 (ready al arranque, cero efecto al pulsar).
+
+Dos defectos más, confirmados en el pseudo-C (`out_ghidra.c`):
+1. **Una sola instancia por tipo id es la skin equivocada casi siempre.**
+   `CHudManager::load()` construye varias instancias por id (una por skin: ataque/tipo 0 vive
+   en +0x34, +0x50, +0x60 y +0x68; entrar-auto/tipo 2 en +0x30, +0x48, +0x5c y +0x64;
+   especiales 4/5 en +0x38/+0x40 y +0x3c/+0x44). La Fase 45 disparaba una sola a mano.
+2. **Medio tap no alcanza.** Los handlers on-foot actúan en mitades distintas del tap:
+   ataque y entrar-auto en el DOWN (`EvVirtualButton+8 == 0`, desde `processTouch`),
+   pero cubrirse, entrar-tienda y mini-save solo en el UP (`+8 == 2`, desde
+   `processTouchRelease`), y sprint es un latch down(1)/up(0). Solo llamar a `processTouch`
+   jamás podría activar cover/shop aunque el bit0 hubiera estado puesto.
+
+### Fix: sintetizar toques reales en vez de pokear flags ( `source/utils/gamepad_actions.{c,h}` reescritos, `source/main.c`)
+
+En el flanco de subida se busca, entre TODAS las instancias del tipo, la que pasa el mismo
+predicado de vtable (+0x14) que `CHudManager::update()` (`002b5ec4`) consulta antes de
+despachar un toque real (también lo usa `draw2d()`, o sea que sigue visibilidad -- los
+botones gated por `nearCar`/`nearShop`/`nearCover` se excluyen solos); se lee su rect con el
+slot +0x1c (`getTouchRegion`), se escala con `Application::GetScreenScaleFactors()` (ambos
+símbolos son exports dinámicos reales, verificados en `syms.txt`) y se inyecta
+`nativeOnTouch(1, cx, cy, slot)` con el mismo entry point del relay táctil. En el flanco de
+bajada, `nativeOnTouch(0, ...)` con el mismo slot. Primera instancia interactuable gana: un
+tap completo por pulsación física, sin multi-fire entre skins. Slots 16-22 (los dedos reales
+usan 0-4 en `main.c`, sin colisión posible). Todo el dispatch posterior (hit-test,
+`processTouch`/`processTouchRelease`, construcción del `EvVirtualButton` con sus `+8`
+correctos) lo hace el propio motor -- cero manipulación de bits privados. Si un símbolo
+falla, se desactiva solo con warning (el táctil sigue igual).
+- Mapeo: Cross=ataque, Triangle=entrar-auto+entrar-tienda (slots distintos), Square=cubrirse,
+  Circle=sprint, L/R=especiales A/B de vehículo. Movimiento/volante siguen pendientes
+  (necesitan drag del `AnalogStick`, no taps -- la infra de síntesis lo deja a un paso).
+- `main.c`: `gamepad_actions_init()` ahora recibe el `GameGLSurfaceView_nativeOnTouch`
+  resuelto; comentario del loop de keycodes corregido (`DeviceKeyPress` ignora todo salvo
+  4/BACK y 82/MENU -- dpad/Cross nunca navegaron nada por esa vía).
+- Logging nuevo de bajo volumen (solo al pulsar/soltar físico):
+  `[input] pad <acción> down -> vbutton hud+0x<off> @(x,y) slot N` y el `up` parejo.
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-18).
+- **Pendiente de confirmar en consola real.** Qué mirar en el próximo log:
+  1. Líneas `[input] pad ... down/up` al pulsar cada botón físico -- confirman qué instancia
+     (offset) y qué coordenadas tocó cada acción, en cada modo (a pie / manejando / volando).
+  2. Si alguna acción no responde aunque su línea `[input]` salga: el toque llega pero el
+     handler del modo actual lo ignora -- reportar qué botón/modo para revisar ese handler.
+  3. Si sale `no interactable vbutton right now` (solo en debug): el gate +0x14 no pasó para
+     ninguna instancia -- reportar botón/modo.
+
+## Estado previo — 2026-09-18 (Fase 46: `HAVE_TEX_CACHE` de vitaGL — memoria de GPU agotada en mundo abierto real, stalls de 4+ segundos por frame, `logs/debug_local_048.log`)
+
+**Punto de partida:** el usuario mandó `logs/debug_local_048.log` (corrida real en consola con el
+build de la Fase 45 ya desplegado — se ve `gamepad_actions: ready` al principio) pidiendo seguir
+mejorando el rendimiento. El log arranca con la carga normal (frame 2 tarda 21 s, esperado) y
+llega a 30 fps estables por un buen rato (frames 347-1279), pero a partir del frame ~2499 -- ya en
+mundo abierto real, no en una pantalla de carga -- aparece una racha nueva:
+
+```
+[vitaGL] .../utils/gpu_utils.c:249 gpu_alloc_mapped_aligned_for_gpu failed with a requested size
+of 4194304 bytes, attempting to forcefully free required memory.
+[vitaGL] .../utils/gpu_utils.c:256 gpu_alloc_mapped_aligned_unsafe_for_gpu failed with a requested
+size of 4194304 bytes.
+[022] main loop: frame 2499 slow render (4135 ms)
+```
+
+repetida varias veces (frames 2499, 2507, 2515, 2609, 2617, 2625, 2633), con frames de **4.1-4.4
+segundos** cada uno y el fps cayendo a 0.1-2.4. De 8 fallos de
+`gpu_alloc_mapped_aligned_for_gpu` en el log, solo **1** terminó en "successfully allocated" -- los
+otros 7 agotaron los reintentos sin conseguir memoria.
+
+### Causa raíz (confirmada leyendo `lib/vitaGL/source/utils/gpu_utils.c`, vendorizado en este port)
+
+`gpu_alloc_mapped_aligned_for_gpu_inner()` prueba, en orden, los pools VRAM, RAM, PHYCONT y BUDGET
+(`utils/gpu_utils.c:103-113`); si los cuatro fallan (como en el log: mundo abierto real, muchas
+texturas de personajes/vehículos/edificios en memoria a la vez), sin `HAVE_TEX_CACHE` vitaGL no
+tiene ninguna forma de liberar memoria por su cuenta y cae directo a
+`gpu_alloc_mapped_aligned_unsafe_for_gpu()` (`utils/gpu_utils.c:181-205`), que por cada intento
+hace `sceGxmFinish()` + **`sceKernelDelayThread(1000000)` (1 segundo fijo, sin importar si hace
+falta)** y reintenta hasta `FRAME_PURGE_FREQ=4` veces (`lib/vitaGL/source/shared.h:49`) -- coincide
+exacto con los "4130-4368 ms" del log (4 ciclos × ~1 s + overhead). Si los 4 ciclos no alcanzan
+(7 de 8 veces en este log), la textura simplemente **no se sube** -- no es solo un problema de fps,
+es un riesgo real de textura rota o un `NULL`-deref más adelante.
+
+### Fix: activar `HAVE_TEX_CACHE` (mismo mecanismo que usa Rinnegatamante en sus ports de la
+familia GTA para mundos abiertos con más texturas que VRAM disponible)
+
+Con el flag puesto, antes de caer al GC "unsafe", `gpu_alloc_mapped_aligned_for_gpu/for_cpu`
+prueban `vgl_cache_old_textures()` (`utils/gpu_utils.c:116-165`), que vuelca a disco
+(`ux0:data/vgl_cache/<titleid>`, creado solo por vitaGL en `vglInitWithCustomSizes` -- no hace
+falta tocar `glutil.c`) cualquier textura no usada en el frame actual y libera su copia en VRAM. Si
+no alcanza, cae igual al mismo camino "unsafe" de antes (no empeora el peor caso).
+
+**Bug de vendorizado encontrado y corregido al activarlo:** el build inicial con solo
+`HAVE_TEX_CACHE` **no compilaba** -- `tex->last_frame` no existe cuando `TEXTURES_SPEEDHACK`
+también está puesto (como en este port desde el scaffold inicial), porque el campo se declara bajo
+`#ifndef TEXTURES_SPEEDHACK` en `shared.h`. Investigando más a fondo (antes de simplemente forzar
+el campo a existir): `last_frame` es exactamente el dato que el LRU de `HAVE_TEX_CACHE` necesita
+para distinguir "textura en uso este frame" de "inactiva, se puede mandar a disco" -- sin él, con
+`TEXTURES_SPEEDHACK` puesto, **todo el mecanismo se comporta mal en vez de simplemente no
+compilar**: las texturas nunca refrescan su "último uso" al bindearse (la escritura vive dentro de
+`#ifndef TEXTURES_SPEEDHACK` en 5 sitios de `ffp.c`, el único pipeline que usa este motor GLES 1.1)
+y tampoco se inicializan a "no usada" al subirse (7 sitios en `gpu_utils.c` + 1 en `textures.c`,
+mismo patrón) -- quedan en 0 (memoria estática en cero), lo que a partir del frame 3600
+(`vgl_tex_cache_freq` por defecto) haría que **cualquier textura activa, incluso una dibujada todos
+los frames, se marque evictable y se recicle a disco en cada draw call** -- un thrashing de I/O
+mucho peor que el bug original. Se agregó una macro puente
+(`VGL_SKIP_LAST_FRAME_TRACKING = TEXTURES_SPEEDHACK && !HAVE_TEX_CACHE`, `shared.h`) y se
+reemplazaron esos 13 guards puntuales (`#ifndef TEXTURES_SPEEDHACK` → `#ifndef
+VGL_SKIP_LAST_FRAME_TRACKING`) **solo** en los sitios que tocan `last_frame` para el LRU -- el resto
+de los guards de `TEXTURES_SPEEDHACK` (la heurística de copia/defrag en `textures.c` al hacer
+`glTexSubImage2D`, y la distinción free-vs-mark-dirty en `gpu_free_texture_data`) se dejan como
+estaban, sin restaurar ese costo. `mark_as_cacheable()` en sí (el registro real en la lista LRU al
+subir una textura, en 7 funciones de `gpu_utils.c`) **ya estaba fuera de cualquier guard de
+`TEXTURES_SPEEDHACK`** -- ese fue el primer punto verificado antes de tocar nada, para no activar
+un flag que terminara siendo un no-op.
+
+### Estado
+
+- **Build:** verde (`psvita-toolkit build --preset release`, 2026-09-18).
+- **No se tocó `source/`** -- todo el cambio vive en `lib/vitaGL/source/` (vendorizado) y
+  `CMakeLists.txt` (una definición nueva).
+- **Pendiente de confirmar en consola real.** Qué mirar en el próximo log:
+  1. Las líneas `gpu_alloc_mapped_aligned_for_gpu failed` deberían **bajar en frecuencia y
+     duración** (idealmente desaparecer del todo en la zona de mundo abierto del log anterior).
+  2. Nuevas líneas de I/O a `ux0:data/vgl_cache/PSVGMV002/` no deberían producir stalls visibles en
+     el framerate -- si aparecen micro-cortes nuevos y frecuentes (thrashing: una textura
+     evict-and-restore en cada draw call), es la señal de que algo del LRU sigue sin refrescar
+     `last_frame` correctamente en algún camino no cubierto acá (ninguno identificado en la lectura
+     de `ffp.c`, pero este motor no usa el pipeline de shaders custom de vitaGL -- si eso cambiara,
+     revisar los mismos 3 guards en `custom_shaders.c`, que quedaron sin tocar a propósito por no
+     aplicar a este motor GLES 1.1).
+  3. Visualmente: personajes/vehículos/edificios no deberían mostrar texturas rotas o negras nuevas
+     (si alguna textura se restaura mal desde el cache de disco, sería la primera señal).
+
+## Estado previo — 2026-09-16 (Fase 45: botones físicos mapeados a las acciones del HUD virtual, on-foot/driving/flying/sniper — `source/utils/gamepad_actions.c`, sin confirmar en consola real)
+
+**Punto de partida:** el usuario pidió mapear los botones físicos de la Vita considerando que los
+botones virtuales en pantalla (ataque, entrar al auto, sprint, cobertura, etc.) cambian según el
+personaje esté a pie, manejando, volando o apuntando con mira. Hasta ahora el port solo relayaba
+el touchscreen 1:1 (`source/main.c`, `GameGLSurfaceView_nativeOnTouch`) y mapeaba D-Pad/Cross/
+Circle/Start a keycodes Android (19-22/23/4/82) -- pero se confirmó (ver más abajo) que ese camino
+de keycodes es casi inútil para gameplay real.
+
+### Arquitectura real del motor (confirmada leyendo `decompiled/libGangster2_armeabi/ghidra/out_ghidra.c`, cruzada con `nm -D libGangster2.so` para los símbolos mangled reales)
+
+1. **`Application::DeviceKeyPress` (el destino final de `nativeKeyDown`) solo reacciona a keycode
+   `0x52` (MENU) y `4` (BACK)** -- cualquier otro código hace `return` inmediato. O sea: hoy los
+   botones físicos no hacen NADA durante el gameplay real (movimiento, disparo, manejar); solo el
+   touchscreen relayado servía, lo cual es impracticable para acelerador/freno/apuntar en juego real.
+2. El input de gameplay real va por un bus de eventos: los widgets táctiles (`VirtualButton`,
+   `AnalogStick`, `Wheel`, `SlideControl`, `ToggleButton`, clases en `out_ghidra.c` líneas
+   ~69872-79100) llaman `EventManager::raise(...)` con un evento (`EvVirtualButton`,
+   `EvStickMove`, `EvAcceleration`, ...), y el manejador de controles actualmente activo
+   (`OnFootControlHandler` / `DrivingControlHandler` / `FlyingControlHandler` /
+   `SniperControlHandler`, líneas ~81149-83530) está suscripto (`attach`/`detach` en sus propios
+   `activate()`/`deactivate()`) y reacciona -- el **modo actual lo decide el motor solo**, nunca
+   hace falta que nosotros lo rastreemos.
+3. **Hallazgo clave:** `VirtualButton` construye su evento con un `EvVButton::ButtonType::Type`
+   (un id chico, ESTABLE Y MODO-INDEPENDIENTE) fijado una sola vez en el constructor. Cruzando
+   `CHudManager::load()` (líneas ~68417-69075, que construye TODOS los widgets del HUD como
+   miembros permanentes de `CHudManager`, nunca destruidos) contra los `switch` reales de
+   `OnFootControlHandler::handleVirtualButton` (~82980), `DrivingControlHandler::handleVirtualButton`
+   (~81571), `FlyingControlHandler::handleVirtualButton` (~82291) y
+   `SniperControlHandler::handleVirtualButton` (~83366), se arma esta tabla confirmada (mismo id
+   en los cuatro `switch`, cada handler ignora los que no le tocan):
+
+   | tipo | acción | modos que reaccionan |
+   |------|--------|------------------------|
+   | 0    | Atacar/disparar | on-foot, driving, flying, sniper |
+   | 2    | Entrar/salir del auto | on-foot, driving, flying |
+   | 3    | Entrar a la tienda | on-foot |
+   | 4    | Acción especial de vehículo A (sin confirmar cuál -- ¿freno de mano?) | driving, flying |
+   | 5    | Acción especial de vehículo B (sin confirmar cuál -- ¿bocina?) | driving, flying |
+   | 7/8  | Cambiar arma sig./ant. | on-foot, driving, flying, sniper (sin instancia `VirtualButton` propia encontrada aún -- ver pendientes) |
+   | 9    | Minimapa | on-foot, driving, flying (sin instancia propia encontrada aún) |
+   | 0xa/0xb | Radio toggle/cambiar estación | driving, flying (via `ToggleButton`/`Radio`, no `VirtualButton` -- API distinta, no mapeado aún) |
+   | 0xc  | Salir de la mira | sniper (sin instancia propia encontrada aún) |
+   | 0xe  | Cubrirse | on-foot, sniper |
+   | 0xf  | Sprint | on-foot |
+   | 0x10 | Guardado rápido | on-foot, driving (sin instancia propia encontrada aún) |
+
+4. `VirtualButton::processTouch(long)` (símbolo real `_ZN13VirtualButton12processTouchEl`,
+   confirmado con `nm -D`) es la función que arma y levanta el evento. Se leyó su cuerpo completo:
+   **solo desreferencia el segundo argumento** (`*(uint32_t*)(param_1+0xc)`, un word de flags:
+   bit0=touch activo, bit1=ya entregado) -- nunca toca campos de `this` más allá de lo fijado en
+   el constructor. Esto la hace segura de llamar directamente con un puntero a un buffer chico
+   armado a mano, sin necesitar reconstruir el layout completo de `EvVirtualButton`/`IEvent` (que
+   sí se investigó -- `IEvent` tiene un contador de reentrancia en +0x2c y varios campos
+   intermedios sin identificar; construirlo a mano a ciegas era el camino más arriesgado y se
+   descartó).
+
+### Decisión de implementación
+
+**Se llama `VirtualButton::processTouch()` directamente sobre las instancias ya construidas y
+permanentes de `CHudManager`**, en vez de (a) sintetizar coordenadas de touch (las posiciones
+salen del atlas `huds.bsprite` vía `ASprite::GetFrame`, no son constantes en código -- requeriría
+parsear ese formato propietario) o (b) construir objetos `EvVirtualButton`/`IEvent` a mano (layout
+parcialmente desconocido, riesgo real de corromper memoria). Se resolvieron los offsets de
+`CHudManager` para una instancia de cada tipo confirmado directamente desde
+`CHudManager::load()` (varios tipos tienen más de una instancia -- una por skin de HUD -- pero da
+igual cuál se dispare, el enrutamiento real lo hace el tipo, no el widget).
+
+### Implementado
+
+- `source/utils/gamepad_actions.{c,h}` (nuevo, agregado a `CMakeLists.txt`): resuelve
+  `_ZN13VirtualButton12processTouchEl` y `_ZN11CHudManager12s_hudManagerE` por nombre real
+  (`so_symbol`, mismo mecanismo que ya usa el resto del port) -- si algo no resuelve, loguea un
+  warning y se desactiva solo (el relay de touchscreen real sigue andando igual, no se rompe nada).
+  Por cada botón mapeado, arma `{0,0,0,1}` (word de flags en el offset correcto) y llama
+  `processTouch(instancia, buffer)`.
+- `source/main.c`: `gamepad_actions_init()` tras resolver los símbolos `Java_*` (Fase 2 del log de
+  arranque); `gamepad_actions_update(pad.buttons, oldButtons)` cada frame, junto al loop de
+  keycodes existente (no lo reemplaza -- Cross/Circle siguen mandando también los keycodes 23/4,
+  que el motor ignora fuera de menús, así que no hay conflicto real).
+- Mapeo elegido (Cross/Triangle/Square/Circle/L/R -- movimiento y volante quedan **pendientes**,
+  ver abajo):
+  - **Cross (✕):** Atacar/disparar (tipo 0).
+  - **Triangle (△):** Entrar/salir del auto (tipo 2) Y entrar a la tienda (tipo 3) -- se disparan
+    los dos; cada `handleXxxButton` internamente chequea su propio estado de cercanía
+    (`CHudManager::nearCar`/`nearShop`), así que el que no aplica no hace nada.
+  - **Square (□):** Cubrirse (tipo 0xe).
+  - **Circle (○):** Sprint (tipo 0xf) -- **superposición conocida:** Circle también manda
+    keycode 4 (BACK) por el loop existente; no se tocó esa asignación por pedido explícito de
+    mantenerla, así que Circle hace ambas cosas. BACK fuera de menú/IGP es un no-op confirmado
+    (`Application::DeviceKeyPress`), así que en gameplay normal no debería notarse.
+  - **L (LTRIGGER):** acción especial de vehículo A (tipo 4).
+  - **R (RTRIGGER):** acción especial de vehículo B (tipo 5).
+- Build verde: `psvita-toolkit build --preset release` (2026-09-16), `build/gangstarmiamivindication.vpk`
+  y `eboot.bin` regenerados, código de salida 0.
+
+### Pendiente (no implementado en esta fase, requiere más ingeniería inversa)
+
+- **Movimiento (a pie) y volante (manejando):** `AnalogStick`/`Wheel` no funcionan como los
+  `VirtualButton` -- su `processTouch(long)` recibe un ID de touch y lo busca en el singleton
+  global `TouchScreenBase::s_touchScreenBase` (no un puntero directo a un struct de flags), así
+  que moverlos a mano requeriría inyectar una entrada falsa en esa tabla global de touch points,
+  no solo llamar una función -- más invasivo y no se investigó lo suficiente para hacerlo con
+  confianza en esta sesión. **Hoy movimiento/volante siguen dependiendo del touchscreen real**
+  (relay existente sin cambios).
+- **Cambiar arma (7/8), minimapa (9), radio (0xa/0xb), salir de mira (0xc), guardado rápido
+  (0x10):** no se encontró una instancia `VirtualButton` de tipo simple para todos estos en
+  `CHudManager::load()` -- varios probablemente cuelgan de `WeaponSelector`/`ToggleButton`/`Radio`,
+  clases con su propia API de touch (no `VirtualButton::processTouch`), sin investigar aún.
+- **Semántica exacta de tipo 4/5** ("acción especial de vehículo A/B"): confirmado que
+  `DrivingControlHandler`/`FlyingControlHandler` los manejan llamando a un método del vtable de
+  `Player::s_player` con un literal `1.0f`, pero no se identificó a qué método corresponde eso
+  (¿freno de mano? ¿bocina? ¿nitro?) -- mapeado a L/R por ser los únicos botones "extra" libres,
+  a falta de una etiqueta más precisa.
+- **Repetición mientras se mantiene apretado:** se implementó como disparo único por flanco de
+  subida (como un toque discreto), no como "mantener apretado". Si algún botón necesita disparo
+  continuo (por ejemplo disparo automático), no está cubierto todavía.
+
+**Sin consola física ni control real disponible en esta sesión, nada de este mapeo se probó en
+hardware.** Falta que el usuario lo despliegue y confirme: (a) que Cross/Triangle/Square/Circle/L/R
+efectivamente disparan las acciones esperadas en cada modo, y (b) que no aparece ningún crash o
+comportamiento raro al llamar `processTouch` fuera del ciclo normal de touch (no debería, por lo
+leído en el código, pero es exactamente el tipo de cosa que solo se confirma en consola real).
+
+## Estado previo — 2026-09-16 (Fase 44: causa raíz confirmada del negro en personajes/vehículos — `DISABLE_TEXTURE_COMBINER` descartaba el `GL_COMBINE` real del motor, `logs/debug_local_046.log`)
+
+**Punto de partida:** la instrumentación de la Fase 43 (`SKIP_ERROR_HANDLING` afuera + `LOG_ERRORS`
+de vuelta) corrió por primera vez en consola real. `logs/debug_local_046.log` trae la evidencia
+que faltaba.
+
+### Evidencia exacta
+
+Líneas 62-93 y 132-134 del log: decenas de
+
+```
+[vitaGL] .../lib/vitaGL/source/ffp.c:3021: glTexEnvi set GL_INVALID_ENUM (pname: 0x8571)
+[vitaGL] .../lib/vitaGL/source/ffp.c:3021: glTexEnvi set GL_INVALID_ENUM (pname: 0x8580)
+[vitaGL] .../lib/vitaGL/source/ffp.c:3021: glTexEnvi set GL_INVALID_ENUM (pname: 0x8590)
+... (0x8571/0x8572, 0x8580-0x858A, 0x8590-0x859A, 0xD1C)
+```
+
+Esos `pname` son, sin excepción, los parámetros de `GL_COMBINE`: `GL_COMBINE_RGB`/`_ALPHA`
+(0x8571/0x8572), `GL_SOURCE0-2_RGB`/`_ALPHA` (0x8580-0x858A), `GL_OPERAND0-2_RGB`/`_ALPHA`
+(0x8590-0x859A) y `GL_ALPHA_SCALE` (0xD1C). En `lib/vitaGL/source/ffp.c` (`glTexEnvi`, switch de
+`pname`, ~línea 2652 en adelante) **todos esos `case` existen únicamente dentro de
+`#ifndef DISABLE_TEXTURE_COMBINER`** — con el flag puesto (como estaba desde la Fase 37), el
+switch no los reconoce y cae al `default: SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, pname)` de la
+línea 3021. Con `SKIP_ERROR_HANDLING` puesto (como estuvo hasta la Fase 42) ese error ni se
+generaba; con `LOG_ERRORS` apagado (como estuvo siempre hasta la Fase 43) tampoco se veía en el
+log aunque se generara. Por eso esta causa raíz estuvo invisible desde la Fase 37 hasta ahora.
+
+### Causa raíz confirmada
+
+**La premisa de la Fase 37 era incorrecta:** "revisado en Ghidra y desensamblado que Gangstar
+nunca utiliza `GL_COMBINE` (0x8570), sino la tubería fija estándar de GLES 1.1" — el motor **sí**
+arma un `GL_COMBINE` real (múltiples fuentes/operandos por canal RGB y alpha) para el material de
+personajes y vehículos, y `DISABLE_TEXTURE_COMBINER` descartaba cada llamada de configuración en
+silencio. El resultado: el combinador de textura de esos objetos nunca terminaba de armarse
+(quedaba en un estado sin fuente de color válida) → negro. El mundo estático nunca pasó por este
+camino (usa `GL_MODULATE`/`GL_REPLACE` simple, por eso siempre renderizó bien) — coincide
+exactamente con el patrón "negro selectivo a personajes/vehículos, no a todos los objetos"
+documentado desde la Fase 39.
+
+### Fix aplicado
+
+- `CMakeLists.txt`: `DISABLE_TEXTURE_COMBINER` sacado de
+  `target_compile_definitions(vitaGL_local ...)`, con un comentario que deja registrada la
+  evidencia exacta (líneas de log, pnames, ubicación en `ffp.c`) por si hay que revisar esto de
+  nuevo.
+- Build verde (`psvita-toolkit build --preset release`, 2026-09-16): `build/gangstarmiamivindication.vpk`
+  y `eboot.bin` regenerados, código de salida 0.
+- `SKIP_ERROR_HANDLING` y `LOG_ERRORS` de la Fase 43 se **dejan como están** (validación de
+  vitaGL activa, errores logueados) para esta próxima corrida — así, si queda algún otro
+  `GL_INVALID_*` real, también se ve en el log en vez de quedar oculto de nuevo. Si el log sale
+  limpio, `SKIP_ERROR_HANDLING` se puede restaurar en una fase futura por rendimiento (es
+  ortogonal a este fix: son macros independientes, no se pisan).
+
+### Pendiente de confirmar en consola real
+
+Desplegar esta build, entrar a la partida (que aparezca un personaje/vehículo en pantalla) y
+mandar un log fresco. Se espera: (a) que las líneas `[vitaGL] ... glTexEnvi set GL_INVALID_ENUM
+(pname: 0x85xx/0xD1C)` desaparezcan del log, y (b) que las texturas de personajes/vehículos dejen
+de verse negras. Si (a) se cumple pero (b) no, el combinador se arma bien pero el bug está en otro
+lado de la cadena de material (haría falta revisar qué fuente/operando concreto configura el motor
+vs. qué soporta el combinador de 2 etapas de vitaGL). Si (a) no se cumple, revisar si quedó algún
+otro `case` de `GL_COMBINE` bajo el mismo `#ifndef` que se haya pasado por alto.
+
+## Estado previo — 2026-09-16 (Fase 43: `SKIP_ERROR_HANDLING` afuera + `LOG_ERRORS` de vuelta — el negro de personajes/vehículos sigue sin causa confirmada, instrumentado para la próxima corrida)
+
+**Punto de partida:** con el build de la Fase 42 (filecache en RAM) el usuario confirma que el
+juego **va mejor** (`logs/debug_local_045.log`: arranque limpio, piso de 30 fps en frames 352-956),
+pero **las texturas de personaje y vehículos siguen en negro**. Mundo estático (con lightmap
+horneado) renderiza bien — el síntoma sigue siendo selectivo al mismo tipo de objeto que en las
+Fases 39-41: geometría animada con iluminación dinámica en tiempo real (`GL_LIGHTING` + luces
+reales), no la geometría estática.
+
+### Descarte por código (sin consola, sobre `lib/vitaGL/source/`)
+
+Con `SAFER_DRAW_SPEEDHACK` y `MATH_SPEEDHACK` ya descartados en consola real (Fases 41),
+quedaban dos flags nuevos de la misma tanda (Fase 33-39, commit `dd61619`) sin verificar:
+`SKIP_ERROR_HANDLING` y `HAVE_WVP_ON_GPU`.
+
+- **`HAVE_WVP_ON_GPU`:** revisado el mecanismo completo (`ffp.c` líneas ~1027 y ~1119, y el
+  shader `lib/vitaGL/source/shaders/ffp_v.h` línea 139: `Jwvp = mul(Jwvp, Imodelview)`). Este
+  camino de composición World-View-Projection en GPU se ejecuta **igual para toda la geometría**,
+  con o sin luces (`calculate_wvp == 1` no depende de `lights_num`) — incluyendo el mundo estático
+  que ya renderiza bien. No hay un mecanismo que lo haga selectivo a personajes/vehículos, así que
+  queda como sospechoso **débil** (no descartado del todo, pero no hay evidencia de código que lo
+  señale).
+- **`SKIP_ERROR_HANDLING`:** auditado a mano — la mayoría de sus ~90 sitios en
+  `lib/vitaGL/source/*.c` son validación pura (`SET_GL_ERROR` + veces un `return` temprano, sin
+  efecto de estado real si se saltean). Un caso concreto con efecto real: `glPopAttrib` (`misc.c`)
+  pierde el `return` de stack-underflow, lo que leería `attrib_stack[255]` (contador `uint8_t`
+  desbordado) — pero confirmado con `objdump -T` sobre `libGangster2.so` que el motor **no
+  importa** `glPushAttrib`/`glPopAttrib`, así que ese caso puntual no aplica acá.
+- Se revisó además el camino de iluminación en sí (`glMaterialfv`, `glLightfv` en `ffp.c`,
+  `light_global_ambient` con el default correcto de la spec `{0.2,0.2,0.2,1}`) sin encontrar un
+  bug: son funciones genéricas de vitaGL, sin parches de este port, usadas por otros ports Vita
+  sin este síntoma.
+
+**Conclusión honesta: no se encontró una causa de código confirmada.** Ninguno de los dos flags
+tiene un mecanismo probado que explique por qué el negro es selectivo a objetos con iluminación
+dinámica. Sin acceso a consola real en esta sesión, seguir revisando vitaGL a ciegas no suma más
+certeza.
+
+### Cambio aplicado (instrumentación, no una apuesta a ciegas)
+
+En vez de sacar un flag más "a ver si esta vez sí", se restauró la capacidad de **ver** errores de
+GL reales en el log:
+
+- `SKIP_ERROR_HANDLING` sacado de `CMakeLists.txt` (comentado con la explicación de arriba) —
+  reactiva las validaciones de parámetros de vitaGL (`SET_GL_ERROR` en ~90 sitios).
+- `LOG_ERRORS` reactivado (estaba fuera desde después de la Fase 24) — sin esto, `SET_GL_ERROR()`
+  llama a un `vgl_log()` que es no-op (`lib/vitaGL/source/utils/debug_utils.h`), así que sacar
+  `SKIP_ERROR_HANDLING` solo no alcanzaba para ver nada nuevo. `source/reimpl/gl.c` ya tiene
+  `vgl_log_capture()` de la Fase 24 (reenvía a `l_note("[vitaGL] ...")` con dedupe), así que esto
+  no agrega código nuevo, solo reactiva el que ya existía.
+
+**Qué se espera ver en la próxima corrida:** si el motor dispara algún `GL_INVALID_ENUM`/
+`GL_INVALID_VALUE`/`GL_INVALID_OPERATION` al armar el material o el estado de luces de un
+personaje/vehículo, el log va a mostrar la línea exacta `[vitaGL] file:line: func set X (...)` —
+evidencia concreta en vez de otra hipótesis. Si el log sale limpio (`lastErr=0x0` en los
+checkpoints existentes) y el negro persiste, el siguiente paso es probar sacar `HAVE_WVP_ON_GPU`
+(el sospechoso débil que queda) y, si tampoco es eso, instrumentar directamente el valor de
+`vColor`/`Ambient`/`Diffuse` por-vértice en el shader de personajes (posible causa: el motor no
+está pasando luces reales, o `mask.lights_num` da 0 cuando debería ser >0, para esos materiales
+puntuales — no verificable sin un dump del estado real en consola).
+
+### Estado
+
+- **Build:** verde, verificado en esta sesión con `psvita-toolkit build --preset release`
+  (`build/gangstarmiamivindication.vpk` generado, código de salida 0).
+- **NO desplegado ni confirmado en consola real** — este cambio es instrumentación para la
+  próxima corrida, no un fix confirmado. No se tocó `filecache.c`/`filecache.h`/`fios.c`/
+  `audio.c`/`init.c`/`main.c` (trabajo de la Fase 42, ya verificado por separado y sin relación
+  con el color de las texturas).
+- **Pendiente:** desplegar, correr hasta reproducir un vehículo/personaje en pantalla, traer
+  `logs/debug_local_046.log`. Buscar líneas `[vitaGL]` nuevas (antes no aparecían porque
+  `SKIP_ERROR_HANDLING` las tenía compiladas afuera).
+
+## Estado previo — 2026-09-16 (Fase 42: optimización integral de velocidad de carga en pantallas de inicio y al comenzar partida — mejores prácticas de Rinnegatamante y The Flow)
+
+**Punto de partida:** El usuario reporta lentitud en las pantallas de carga tanto al inicio del juego (boot / splash) como al comenzar una partida (carga del mundo 3D / miami.bdae).
+
+### Diagnóstico exacto con telemetría real (`logs/debug_local_044.log`)
+
+1. **Pantalla de carga inicial (Frame 2):** Registra `frame 2 returned (35895248 us)` — ¡**35.8 segundos** estancado en un solo frame!
+2. **Pantalla de carga al empezar partida (Frames 181-184):** Registra `frame 182 render 42079 ms` (42.0 s) y `frame 184 render 45413 ms` (45.4 s) — ¡**más de 90 segundos** bloqueado en la carga de misión/partida!
+3. **Causa raíz 1 (Escaneos masivos en FAT32):** Se contabilizaron **621 llamadas a `stat()`** en el arranque y **527 llamadas en el frame 182-184**, con un **100% de fallos (-1)**. El motor (`CCustomFileSystem::createAndOpenFile` y `CCustomResFactory::getTexture`) busca variantes `_lo` y `_hi` de cada asset antes de abrirlo. Al haber **3,214 archivos** en un único directorio (`ux0:data/gangstarmiamivindication/data/`), el sistema de archivos FAT32 de la PS Vita realiza un escaneo lineal de decenas de sectores por cada archivo inexistente. A ~3-5 ms por fallo, se desperdiciaban más de 3 segundos por pantalla solo en escaneos fallidos.
+4. **Causa raíz 2 (Thrashing en FIOS2):** El búfer de RAM cache de FIOS2 era de solo 16 MB (`RAMCACHEBLOCKNUM 128`), mientras que el archivo principal de la ciudad (`miami.bdae`) pesa **17.2 MB**. Al superar el tamaño del caché, FIOS2 desalojaba continuamente bloques recién leídos, provocando relecturas forzadas desde la tarjeta de memoria física.
+5. **Causa raíz 3 (Desalineación en búferes de flujo):** `setvbuf` usaba búferes de 64 KB, requiriendo 2 transiciones por cada bloque de 128 KB de FIOS2.
+6. **Causa raíz 4 (Aperturas en audio):** `snd_exists()` realizaba consultas con `fopen`/`fclose` físicos en disco para 1,737 sonidos.
+
+### Soluciones implementadas (Prácticas de Rinnegatamante y The Flow)
+
+1. **File Existence & Stat Cache en RAM (`source/utils/filecache.h`, `source/utils/filecache.c`):**
+   - Siguiendo la técnica de Rinnegatamante en `UT99-Vita` (`filecache.cpp` / directory listing cache):
+   - Al iniciar la aplicación, `filecache_init()` indexa mediante `sceIoDopen`/`sceIoDread` los 3,214 archivos de `ux0:data/gangstarmiamivindication/data` en un único pase secuencial contiguo (~25 ms).
+   - Tabla hash abierta de 16,384 ranuras en memoria RAM (<1.3 MB) que almacena nombre relativo, tamaño y permisos exactos (`d_stat`).
+   - `stat_soloader()` y `access_soloader()` responden en O(1) directamente desde memoria RAM en ~15 nanosegundos. Las 1,148 llamadas a `stat()` que antes tardaban segundos ahora toman microsegundos con **0 lecturas físicas al disco**.
+   - `fopen_soloader()` aplica fast-reject inmediato cuando se intenta abrir en modo lectura un archivo inexistente (como `dummy.tga` o `*_lo`), eliminando el escaneo FAT32 y la sincronización forzada por `l_error` a la tarjeta de memoria.
+2. **Ampliación de FIOS2 a 64 MB y Afinidades de Hilo (`lib/fios/fios.c`):**
+   - Siguiendo la implementación de referencia de The Flow en `gtasa_vita` y `max_vita`:
+   - `RAMCACHEBLOCKNUM` aumentado de 128 a **512 bloques de 128 KB (64 MB de caché en RAM)**.
+   - Toda la geometría de Miami (`miami.bdae`, 17.2 MB) y las texturas `atlas*.tga` (1.3 MB c/u) caben holgadamente en RAM. Relecturas y aperturas concurrentes del mismo asset se resuelven a velocidad de memoria bus.
+   - Afinidades y prioridades de hilos FIOS sincronizadas con `gtasa_vita`: hilos de I/O y de Callback fijados en Core 1 (`0x20000`, prioridad `66`), evitando cualquier contienda de CPU con el hilo de render/lógica (Core 0) y el hilo de mezcla de audio (Core 2).
+3. **Alineación de Búferes de Flujo y Expansión de SceLibc (`source/main.c`, `source/reimpl/io.c`):**
+   - `sceLibcHeapSize` ampliado de 8 MB a 16 MB.
+   - Búfer de flujo en `fopen_soloader` elevado a **128 KB** (`_IOFBF, 128 * 1024`), alineándose perfectamente 1:1 con el tamaño de bloque de FIOS2 (`RAMCACHEBLOCKSIZE`).
+4. **Optimización de Consultas de Audio (`source/utils/audio.c`):**
+   - `snd_exists()` consulta `filecache_exists(gmv_sound_files[index])` en RAM sin tocar el sistema de archivos.
+5. **Expansión del Caché de Rutas (`source/reimpl/io.c`):**
+   - `PATH_CACHE_SIZE` ampliado de 512 a 2048 ranuras para evitar colisiones y desalojos.
+
+### Estado
+- Compilación limpia con CMake/VitaSDK: `gangstarmiamivindication.vpk` y `eboot.bin` generados con código 0.
+
+## Estado previo — 2026-09-16 (Fase 41: `SAFER_DRAW_SPEEDHACK` restaurado -- sacarlo no era el fix del negro, era la velocidad; sospechoso ahora es `MATH_SPEEDHACK`, `logs/debug_local_044.log`)
 
 **Punto de partida:** con el build de la Fase 39 (sin `SAFER_DRAW_SPEEDHACK`, con
 `MATH_SPEEDHACK` nuevo) el usuario reporta que el juego **volvió a ir muy lento** y las

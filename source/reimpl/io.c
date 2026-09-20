@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <dirent.h>
 #include <stdarg.h>
+#include <errno.h>
 #include <psp2/kernel/threadmgr.h>
 
 #ifdef USE_SCELIBC_IO
@@ -23,6 +24,7 @@
 
 #include "utils/logger.h"
 #include "utils/utils.h"
+#include "utils/filecache.h"
 
 // Includes the following inline utilities:
 // int oflags_musl_to_newlib(int flags);
@@ -111,7 +113,7 @@ static void _mkdir_parents(const char * path) {
     }
 }
 
-#define PATH_CACHE_SIZE 512
+#define PATH_CACHE_SIZE 2048
 typedef struct {
     char orig[256];
     char trans[256];
@@ -214,51 +216,44 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
     char buf[IO_PATH_BUF];
     const char * path = _path_translate(filename, buf, sizeof(buf));
 
-    if (mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+')))
+    int is_write = (mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+')));
+    if (is_write)
         _mkdir_parents(path);
+
+    const char *data_prefix = VITA_DATA_ROOT "/";
+    size_t prefix_len = strlen(data_prefix);
+    int in_data = (strncmp(path, data_prefix, prefix_len) == 0);
+    const char *rel = in_data ? (path + prefix_len) : NULL;
+
+    // Fast-reject for read-only opens of non-existent files in data root.
+    // Avoids expensive FAT directory scans and avoids sync-to-disk error logging.
+    if (!is_write && in_data) {
+        if (!filecache_exists(rel)) {
+            l_debug("fopen(%s, %s) [fast-reject]: NULL", path, mode);
+            errno = ENOENT;
+            return NULL;
+        }
+    }
 
 #ifdef USE_SCELIBC_IO
     FILE* ret = sceLibcBridge_fopen(path, mode);
-    if (ret && mode && !strchr(mode, 'w') && !strchr(mode, 'a') && !strchr(mode, '+')) {
-        sceLibcBridge_setvbuf(ret, NULL, _IOFBF, 64 * 1024);
+    if (ret && !is_write) {
+        sceLibcBridge_setvbuf(ret, NULL, _IOFBF, 128 * 1024);
     }
 #else
     FILE* ret = fopen(path, mode);
-    if (ret && mode && !strchr(mode, 'w') && !strchr(mode, 'a') && !strchr(mode, '+')) {
-        setvbuf(ret, NULL, _IOFBF, 64 * 1024);
+    if (ret && !is_write) {
+        setvbuf(ret, NULL, _IOFBF, 128 * 1024);
     }
 #endif
 
     if (ret) {
+        if (is_write && in_data) {
+            filecache_insert(rel, 0, S_IFREG | 0666);
+        }
         l_debug("fopen(%s, %s): %p", path, mode, ret);
     } else {
-        // l_error(), not l_warn(): a missing asset is the most common cause of
-        // a later NULL-deref (Fase 9) and l_warn() vanishes in a Release build.
-        //
-        // Dedupe (2026-09-06): the engine retries a missing file many times in
-        // a row (dummy.tga x18 in debug_local_021.log), and every l_error()
-        // pays for an immediate sceIoSyncByFd() to the memory card. Only the
-        // FIRST miss of each path keeps l_error (one sync); repeats go through
-        // l_debug (free in Release). When the path changes, one l_note line
-        // reports how many repeats the previous path had, so the count is not
-        // lost in Release logs.
-        static char last_failed[256];
-        static int last_failed_repeats = 0;
-        char key[256];
-        strncpy(key, filename, sizeof(key) - 1);
-        key[sizeof(key) - 1] = '\0';
-        if (strcmp(key, last_failed) == 0) {
-            last_failed_repeats++;
-            l_debug("fopen(%s, %s): FAILED (repeat #%d) [was: %s]", path, mode,
-                    last_failed_repeats + 1, filename);
-        } else {
-            if (last_failed_repeats > 0)
-                l_note("fopen: %s failed x%d total", last_failed, last_failed_repeats + 1);
-            strncpy(last_failed, key, sizeof(last_failed) - 1);
-            last_failed[sizeof(last_failed) - 1] = '\0';
-            last_failed_repeats = 0;
-            l_error("fopen(%s, %s): FAILED [was: %s]", path, mode, filename);
-        }
+        l_debug("fopen(%s, %s): FAILED [was: %s]", path, mode, filename);
     }
 
     return ret;
@@ -323,10 +318,33 @@ int stat_soloader(const char * path, stat64_bionic * buf) {
     char pbuf[IO_PATH_BUF];
     const char * real = _path_translate(path, pbuf, sizeof(pbuf));
 
+    const char *data_prefix = VITA_DATA_ROOT "/";
+    size_t prefix_len = strlen(data_prefix);
+    if (strncmp(real, data_prefix, prefix_len) == 0) {
+        const char *rel = real + prefix_len;
+        uint32_t fsize = 0;
+        uint16_t fmode = 0;
+        if (filecache_lookup(rel, &fsize, &fmode)) {
+            if (buf) {
+                memset(buf, 0, sizeof(stat64_bionic));
+                buf->st_mode = fmode ? fmode : (S_IFREG | 0666);
+                buf->st_size = fsize;
+                buf->st_blksize = 4096;
+                buf->st_blocks = (fsize + 511) / 512;
+            }
+            l_debug("stat(%s) [cached]: 0", real);
+            return 0;
+        } else {
+            l_debug("stat(%s) [cached]: -1", real);
+            errno = ENOENT;
+            return -1;
+        }
+    }
+
     struct stat st;
     int res = stat(real, &st);
 
-    if (res == 0)
+    if (res == 0 && buf)
         stat_newlib_to_bionic(&st, buf);
 
     l_debug("stat(%s): %i", real, res);
@@ -337,17 +355,7 @@ int stat_soloader(const char * path, stat64_bionic * buf) {
 // `struct stat` into a buffer the .so sized and laid out as bionic's
 // `struct stat64` -- the same mismatch stat_soloader() exists to avoid.
 int lstat_soloader(const char * path, stat64_bionic * buf) {
-    char pbuf[IO_PATH_BUF];
-    const char * real = _path_translate(path, pbuf, sizeof(pbuf));
-
-    struct stat st;
-    int res = lstat(real, &st);
-
-    if (res == 0)
-        stat_newlib_to_bionic(&st, buf);
-
-    l_debug("lstat(%s): %i", real, res);
-    return res;
+    return stat_soloader(path, buf);
 }
 
 int fclose_soloader(FILE * f) {
@@ -484,6 +492,21 @@ int fsync_soloader(int fd) {
 int access_soloader(const char * path, int mode) {
     char buf[IO_PATH_BUF];
     const char * real = _path_translate(path, buf, sizeof(buf));
+
+    const char *data_prefix = VITA_DATA_ROOT "/";
+    size_t prefix_len = strlen(data_prefix);
+    if (strncmp(real, data_prefix, prefix_len) == 0) {
+        const char *rel = real + prefix_len;
+        if (filecache_exists(rel)) {
+            l_debug("access(%s, %i) [cached]: 0", real, mode);
+            return 0;
+        } else {
+            l_debug("access(%s, %i) [cached]: -1", real, mode);
+            errno = ENOENT;
+            return -1;
+        }
+    }
+
     int ret = access(real, mode);
     l_debug("access(%s, %i): %i", real, mode, ret);
     return ret;
@@ -509,6 +532,13 @@ int remove_soloader(const char * path) {
     char buf[IO_PATH_BUF];
     const char * real = _path_translate(path, buf, sizeof(buf));
     int ret = remove(real);
+    if (ret == 0) {
+        const char *data_prefix = VITA_DATA_ROOT "/";
+        size_t prefix_len = strlen(data_prefix);
+        if (strncmp(real, data_prefix, prefix_len) == 0) {
+            filecache_remove(real + prefix_len);
+        }
+    }
     l_debug("remove(%s): %i", real, ret);
     return ret;
 }
@@ -517,6 +547,13 @@ int unlink_soloader(const char * path) {
     char buf[IO_PATH_BUF];
     const char * real = _path_translate(path, buf, sizeof(buf));
     int ret = unlink(real);
+    if (ret == 0) {
+        const char *data_prefix = VITA_DATA_ROOT "/";
+        size_t prefix_len = strlen(data_prefix);
+        if (strncmp(real, data_prefix, prefix_len) == 0) {
+            filecache_remove(real + prefix_len);
+        }
+    }
     l_debug("unlink(%s): %i", real, ret);
     return ret;
 }

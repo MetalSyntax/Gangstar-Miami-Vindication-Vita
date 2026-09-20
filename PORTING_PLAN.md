@@ -168,9 +168,19 @@ jamás `sceClibPrintf(buf)`. El motor manda mensajes con `%s` adentro.
 - [x] **Assets**: capa de traducción de rutas Android → Vita, los 3214 archivos en su lugar
       (sección 5, Fase 9).
 - [x] **Input**: touch frontal (5 slots, mapeo a `nativeOnTouch` down/move/up) +
-      botones como keycodes Android por el camino `s_keyDownCode/s_keyUpCode`
-      (dpad → 19-22, CROSS → 23, CIRCLE → 4/BACK, START → 82/MENU) + heartbeat
-      por tiempo y slow-frames en release (`source/main.c`, Fase 13).
+      botones físicos como taps sintetizados sobre los VirtualButtons del HUD
+      (`source/utils/gamepad_actions.c`, Fase 47: down/up vía `nativeOnTouch`
+      en el centro del botón visible, ids 16+; keycodes Android 4/82 solo para
+      menús -- el motor ignora el resto) + cruceta/stick izquierdo como drag
+      sintetizado sobre el `AnalogStick` de movimiento (Fase 51,
+      `gamepad_stick_update()`: down en el centro de su región + move continuo
+      proporcional a la deflexión + up al soltar, mismo mecanismo de captura
+      de touch que usa el propio motor) + heartbeat por tiempo y slow-frames
+      en release (`source/main.c`, Fase 13).
+      **Sin control manual de cámara** (confirmado en Fase 51 leyendo cada
+      `*ControlHandler::onEvent()`/`FollowCamera::updateAngles()`): el juego
+      original no tiene mirada libre a pie ni manejando, así que el stick
+      derecho no tiene nada a qué mapearse -- no es una limitación del port.
 - [x] **Gráficos (parcial)**: vitaGL vendorizado (`lib/vitaGL` + `lib/vitashark`), shaders GLSL con
   `DUMP_COMPILED_SHADERS`, y el spoof de `glGetString(GL_VERSION)` a "OpenGL ES 1.1" que el
   motor exige (`source/reimpl/gl.h`, Fase 7). **Todavía no se vio un solo frame dibujado
@@ -191,22 +201,35 @@ jamás `sceClibPrintf(buf)`. El motor manda mensajes con `%s` adentro.
   playRadio/playSound cada frame al leer siempre "not playing".
 - [x] **Salida limpia**: `Gangster2.Exit()` (`java.c`) termina el proceso
   en vez de colgar en el loop `Native Exit Triggered` del log 036.
-- [x] **Video**: `intro.m4v` real vía SceAvPlayer (`source/video.cpp`, portado
-      de Shadow Guardian-vita). `Method_loadMovie` (`java.c`) llama a
-      `video_play(name)` -- decodifica NV12, convierte a RGB por GPU con un
-      shader GLES2 propio (vitaGL soporta esto aunque el motor solo vea GLES
-      1.1), letterbox a 960x544, audio por `sceAudioOut` en hilo dedicado,
-      saltable con Cruz/Start -- y solo entonces dispara
-      `nativeSetOnVideoCompletion()`. `video_play()` nunca cuelga (Fase 33).
-      **Importante (Fase 38, revertido en Fase 40):** el `.so`/APK trae
-      `intro.m4v` en MPEG-4 Part 2 (Simple Profile) -- el decodificador por
-      hardware de `SceAvPlayer` **solo soporta H.264/AVC**, así que este asset
-      puntual no se reproduce aunque `video.cpp` (método Shadow Guardian-vita,
-      sin cambios) esté bien. **Decisión del proyecto: NO transcodificar ni
-      alterar el asset original** -- `intro.m4v` en `ux0_data/` se dejó tal
-      cual sale del APK. El intro queda sin reproducirse con este asset
-      puntual; es un límite conocido del formato de origen, no algo que el
-      loader deba "arreglar" tocando datos del juego.
+- [x] **Video**: `intro.m4v` real, decodificado **en software** (Fase 50,
+      `source/video.cpp` -- port casi verbatim del port hermano
+      `Asphalt-5-Vita/source/video.cpp` en este mismo workspace, que resolvió
+      exactamente este mismo problema primero). `Method_loadMovie` (`java.c`)
+      llama a `video_play(name)`.
+      **Historia (Fase 33-40, 48):** la primera versión usaba `SceAvPlayer`
+      (hardware), portada de Shadow Guardian-vita -- pero el `.so`/APK trae
+      `intro.m4v` en MPEG-4 Part 2 (Simple Profile), y `SceAvPlayer` **solo
+      decodifica H.264/AVC por hardware**, así que nunca producía un frame.
+      **Decisión del proyecto (sigue vigente): NO transcodificar ni alterar
+      el asset original.**
+      **Fix real (Fase 50):** en vez de tocar el asset, `video.cpp` lo
+      decodifica tal cual sale del APK, enteramente en software, vía FFmpeg
+      (`avcodec`/`swresample` de vita-portlibs). `libavformat` no se usa --
+      ese build no trae el demuxer `mov`/MP4 (`ar t libavformat.a` no tiene
+      `mov.o`) -- así que `video.cpp` parsea el árbol de cajas ISO-BMFF
+      (`moov`/`trak`/`mdia`/`minf`/`stbl`) a mano. Arquitectura: demux +
+      decode de video en un hilo dedicado, decode de audio AAC + resample en
+      otro, reloj de reproducción maestreado por las muestras de audio
+      realmente reproducidas, conversión YUV420P→RGB565 por NEON, decode a
+      mitad de resolución (`lowres=1`) por rendimiento, dibujado por
+      **pipeline fijo GLES1.1** (a propósito, no un shader GLSL custom -- ver
+      el comentario de cabecera de `video.cpp` para la regresión de hardware
+      confirmada que ese camino causó en Asphalt-5-Vita), letterbox a
+      960x544, saltable con Cruz/Start, watchdog de 30s de respaldo. Logs
+      release-visibles (`l_note`) en cada punto clave para verificar en
+      consola sin build debug -- ver `port_progress.md` Fase 50 para la
+      lista completa y qué esperar en un log real. `SceAvPlayer`/
+      `SceAvPlayer_stub` ya no se usan en este port.
 - [ ] **Ciclo de vida incompleto**: `nativePause`/`nativeResume`/`nativeAccelerometer`/`nativeDone`/
       `nativeOpenIGM`/`nativeCanInterrupt` están exportados pero **no cableados** en `main.c`.
       Hacen falta para suspender/reanudar la consola y para el menú in-game.

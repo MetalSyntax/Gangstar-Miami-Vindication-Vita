@@ -3,6 +3,7 @@
 #include "utils/logger.h"
 #include "utils/dialog.h"
 #include "utils/audio.h"
+#include "utils/gamepad_actions.h"
 #include "reimpl/gl.h"
 #include "video.h"
 
@@ -18,7 +19,7 @@
 int _newlib_heap_size_user = 256 * 1024 * 1024;
 
 #ifdef USE_SCELIBC_IO
-int sceLibcHeapSize = 8 * 1024 * 1024;
+int sceLibcHeapSize = 16 * 1024 * 1024;
 #endif
 
 so_module so_mod;
@@ -82,6 +83,15 @@ int main() {
     RESOLVE(Gangster2_nativeKeyDown, "Java_com_gameloft_android_TBFV_GloftGMHP_ML_Gangster2_nativeKeyDown")
     RESOLVE(Gangster2_nativeKeyUp, "Java_com_gameloft_android_TBFV_GloftGMHP_ML_Gangster2_nativeKeyUp")
     l_checkpoint(2, "main: all Java_* symbols resolved");
+
+    // Fase 47: maps physical buttons onto the engine's own on-screen virtual
+    // HUD buttons (attack, enter car/shop, take cover, sprint, ...) by
+    // synthesizing real touches at the active button's position -- see
+    // gamepad_actions.h. Gets the same nativeOnTouch() entry point the
+    // touchscreen relay below uses (dedicated pointer ids 16+, real fingers
+    // own slots 0-4). Soft-fails (touchscreen relay below still works)
+    // if the engine's internal symbols ever move.
+    gamepad_actions_init(GameGLSurfaceView_nativeOnTouch);
 
     gl_init();
     l_checkpoint(3, "main: gl_init() done");
@@ -196,11 +206,14 @@ int main() {
 
         sceCtrlPeekBufferPositive(0, &pad, 1);
         // Android keycodes forwarded through the same s_keyDownCode/s_keyUpCode
-        // path the real Activity uses (GameRenderer.onDrawFrame consumes them):
-        // KEYCODE_BACK = 4, KEYCODE_DPAD_UP/DOWN/LEFT/RIGHT = 19/20/21/22,
-        // KEYCODE_DPAD_CENTER = 23 ("confirm"), KEYCODE_MENU = 82. The engine
-        // ignores codes it does not bind, so unmapped buttons are harmless --
-        // same as pressing them on a real keyboard-equipped device.
+        // path the real Activity uses (GameRenderer.onDrawFrame consumes them).
+        // Decompiled reality check (Fase 47): Application::DeviceKeyPress
+        // only reacts to KEYCODE_BACK = 4 and KEYCODE_MENU = 82 -- every
+        // other code (including DPAD 19-22 and DPAD_CENTER 23) hits an
+        // immediate `return` and is a confirmed no-op, in menus and in game.
+        // Kept for parity with a real keyboard-equipped device; gameplay
+        // input for the mapped buttons goes through gamepad_actions_update()
+        // below, not through here.
         static const struct { uint32_t btn; int code; } keymap[] = {
             { SCE_CTRL_UP,    19 },
             { SCE_CTRL_DOWN,  20 },
@@ -216,6 +229,25 @@ int main() {
             if (!(pad.buttons & keymap[k].btn) && (oldButtons & keymap[k].btn))
                 Gangster2_nativeKeyUp(&jni, NULL, keymap[k].code);
         }
+        // Fase 47: Cross/Triangle/Square/Circle/L/R synthesize real taps on
+        // the engine's own on-screen action buttons (attack, enter car/shop,
+        // take cover, sprint, vehicle-only extras) via gamepad_actions.c --
+        // down on press, up on release, at the currently visible skin's
+        // position. Independent of the keycode loop above (CROSS/CIRCLE also
+        // send keycodes 23/4 there, which the engine ignores outside menus).
+        gamepad_actions_update(pad.buttons, oldButtons);
+        // Fase 51: physical movement input (D-pad + left analog stick) was
+        // never wired to anything -- the keycode loop above only reaches
+        // KEYCODE_BACK/MENU (Fase 47), and nothing else in this file drove
+        // the engine's on-screen movement AnalogStick. See
+        // gamepad_actions.c's GA_OFF_ANALOGSTICK comment for why a synthetic
+        // touch-drag on that HUD widget is the only path that works, and
+        // why there is no equivalent camera-look control to wire the right
+        // stick to (this engine's on-foot/driving camera is fully
+        // automatic -- confirmed in the decompiled sources, not a gap in
+        // this port).
+        gamepad_stick_update(pad.buttons & (SCE_CTRL_UP | SCE_CTRL_DOWN | SCE_CTRL_LEFT | SCE_CTRL_RIGHT),
+                              pad.lx, pad.ly);
         oldButtons = pad.buttons;
 
         GameRenderer_nativeRender(&jni, NULL);
@@ -280,10 +312,29 @@ int main() {
         }
 #endif
 
-        // Mirrors GameRenderer.onDrawFrame()'s own 30 FPS pacing (33ms/frame).
-        SceUInt64 frame_time = sceKernelGetProcessTimeWide() - frame_start;
-        if (frame_time < 33000)
-            sceKernelDelayThread(33000 - frame_time);
+        // Fase 49 (2026-09-19): the Android-side `Thread.sleep(33 - elapsed)`
+        // this used to mirror (GameRenderer.onDrawFrame(), decompiled Java)
+        // is a battery/thermal throttle for phone hardware, not a simulation
+        // requirement -- confirmed in the decompiled source: onDrawFrame()
+        // measures `System.currentTimeMillis()` itself and only sleeps the
+        // *leftover* time, never enforcing a fixed step when a frame runs
+        // long. The engine is delta-time driven, not tick-locked.
+        //
+        // On Vita this cap was pure waste stacked on top of a real limiter
+        // that was already there: gl_swap() -> vglSwapBuffers() ->
+        // scene_end() calls sceDisplayWaitVblankStartMulti(vsync_interval)
+        // (lib/vitaGL/source/gxm.c, vsync_interval=1 by default) every frame,
+        // which already blocks this thread until the next 60 Hz vblank. That
+        // is the correct place to pace frames -- unlike the old
+        // sceKernelDelayThread(33000 - elapsed) here, it can never leave the
+        // CPU idle-spinning past the display's actual refresh, and it does
+        // not clamp a fast frame down to 30 fps. Removing the extra sleep
+        // lets any scene that renders in under 16.6 ms present at a full
+        // 60 fps instead of being held to 30; scenes that are already
+        // GPU/CPU-bound past 33 ms are unaffected either way.
+        //
+        // sceKernelPowerTick() above still runs every iteration regardless,
+        // so this does not reintroduce the governor/suspend risk from Fase 31.
     }
 
     sceKernelExitDeleteThread(0);
