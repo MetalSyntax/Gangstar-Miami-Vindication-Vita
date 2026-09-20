@@ -134,24 +134,27 @@ static sfx_entry_t *sfx_find(int index) {
     return NULL;
 }
 
-/* Decode whole ogg to stereo OUT_RATE PCM. Returns entry or NULL. */
-static sfx_entry_t *sfx_decode(int index) {
-    sfx_entry_t *hit = sfx_find(index);
-    if (hit)
-        return hit;
-
+/* Decode whole ogg to stereo OUT_RATE PCM into a LOCAL buffer -- touches no
+ * shared state (sfx_cache/sfx_voices), so unlike the old single-function
+ * sfx_decode() this is safe to call WITHOUT audio_mutex held. This is the
+ * expensive part (file open + full decode + resample, up to several hundred
+ * ms for a long SFX on flash storage) and is only ever called from the
+ * mixer thread now (see audio_mix_thread()'s pending-request drain below) --
+ * never from the JNI/render thread. Returns 0 and fills *out_pcm/*out_frames
+ * on success. */
+static int sfx_decode_raw(int index, int16_t **out_pcm, uint32_t *out_frames_p) {
     char path[512];
     snd_path(index, path, sizeof(path));
     if (!path[0])
-        return NULL;
+        return -1;
 
     FILE *f = fopen(path, "rb");
     if (!f)
-        return NULL;
+        return -1;
     OggVorbis_File vf;
     if (ov_open(f, &vf, NULL, 0) < 0) {
         fclose(f);
-        return NULL;
+        return -1;
     }
     vorbis_info *vi = ov_info(&vf, -1);
     long src_rate = vi ? vi->rate : 44100;
@@ -159,17 +162,17 @@ static sfx_entry_t *sfx_decode(int index) {
     double total = ov_time_total(&vf, -1);
     if (!(total > 0.0) || total > 30.0) {
         ov_clear(&vf);
-        return NULL;
+        return -1;
     }
     uint32_t out_frames = (uint32_t)(total * OUT_RATE) + 1;
     if ((uint64_t)out_frames * 4 > SFX_DECODE_CAP) {
         ov_clear(&vf);
-        return NULL;
+        return -1;
     }
     int16_t *pcm = calloc(out_frames, 4);
     if (!pcm) {
         ov_clear(&vf);
-        return NULL;
+        return -1;
     }
 
     /* Decode at source rate into a stereo temp buffer, then
@@ -205,7 +208,7 @@ static sfx_entry_t *sfx_decode(int index) {
     if (!src || !src_frames) {
         free(src);
         free(pcm);
-        return NULL;
+        return -1;
     }
 
     for (uint32_t i = 0; i < out_frames; i++) {
@@ -224,6 +227,15 @@ static sfx_entry_t *sfx_decode(int index) {
     }
     free(src);
 
+    *out_pcm = pcm;
+    *out_frames_p = out_frames;
+    return 0;
+}
+
+/* Installs already-decoded PCM into the cache. Mutates sfx_cache/sfx_voices,
+ * so the caller MUST hold audio_mutex. Cheap (no I/O), unlike the decode
+ * above. */
+static sfx_entry_t *sfx_cache_install(int index, int16_t *pcm, uint32_t frames) {
     int slot = -1;
     for (int i = 0; i < SFX_CACHE_MAX; i++)
         if (!sfx_cache[i].used) {
@@ -252,9 +264,10 @@ static sfx_entry_t *sfx_decode(int index) {
     sfx_cache[slot].last_used = ++sfx_tick;
     sfx_cache[slot].index = index;
     sfx_cache[slot].pcm = pcm;
-    sfx_cache[slot].frames = out_frames;
+    sfx_cache[slot].frames = frames;
     return &sfx_cache[slot];
 }
+
 
 /* ---------------- Big (streamed) voices ---------------- */
 
@@ -278,6 +291,8 @@ typedef struct {
     int buf_frames;               /* valid frames held in buf[0..buf_frames) */
     double frac_pos;              /* fractional read position within buf */
     int eof;                      /* stream exhausted, non-looping: drain then stop */
+    int pending_open;             /* reserved by audio_play_big(), fopen()/ov_open()
+                                    * not done yet -- see the request queue below. */
 } big_voice_t;
 
 static big_voice_t big_voices[MAX_BIG_VOICES];
@@ -293,6 +308,7 @@ static void big_close(big_voice_t *v) {
     v->buf_frames = 0;
     v->frac_pos = 0.0;
     v->eof = 0;
+    v->pending_open = 0;
 }
 
 static int big_open(big_voice_t *v, int index) {
@@ -323,6 +339,95 @@ static int big_open(big_voice_t *v, int index) {
     return 0;
 }
 
+/* ---------------- Deferred load/open request queue ----------------
+ *
+ * Fase 56 (2026-09-20): real hardware logs (logs/debug_local_053/054/056.log)
+ * show "[022] main loop: frame N slow render" spikes of 500 ms to 4+ s
+ * landing exactly on frames right after engine ALOG lines for a brand-new
+ * SOUNDS-VV PLAYEX, "pad enter-car", or stopRadio/playRadio -- i.e. right
+ * when the engine calls Method_playSound()/Method_playSoundBig() (java.c)
+ * for an index that was not decoded/opened yet. Those methods run
+ * synchronously on whatever thread the engine calls them from, which for
+ * this port is the SAME thread that drives GameRenderer_nativeRender() in
+ * the main loop (java.c's Method_* handlers are invoked inline from the
+ * engine's own JNI call, not from a separate engine thread) -- so the old
+ * sfx_decode()/big_open() calls inside audio_play()/audio_play_big(),
+ * which do a blocking fopen() + full ogg decode (or ov_open()'s
+ * end-of-file bisection for the streamed path) while holding audio_mutex,
+ * stalled the render loop itself for their entire duration. This matches
+ * the "tirones fuertes" (periodic hitches, not a flat low fps) reported by
+ * the user -- a flat fps ceiling was already addressed in Fases 33-53.
+ *
+ * Fix: audio_play()/audio_load()/audio_play_big() below only take the fast,
+ * already-cached/already-opened path synchronously (cheap, no I/O). A
+ * cache miss instead pushes a small request here and returns immediately;
+ * the actual fopen()/decode happens on the dedicated mixer thread
+ * (audio_mix_thread(), core 2 per audio_init()) at the top of its own
+ * loop, never blocking the render thread. Worst case, a brand-new sound
+ * starts one mixer tick (~OUT_FRAMES/OUT_RATE, ~43 ms) later than before,
+ * or drops one mixer output buffer while decoding -- an inaudible-to-minor
+ * audio hiccup instead of a multi-second visual freeze. */
+#define MAX_PENDING_SFX 8
+#define MAX_PENDING_BIG 4
+
+typedef struct {
+    int index;
+    float volume;
+    float pitch;
+    int activate; /* 1 = audio_play() (decode + start a voice), 0 =
+                   * audio_load() (decode-only preload, no voice) */
+} pending_sfx_req_t;
+
+typedef struct {
+    int slot;   /* big_voices[] slot already reserved (pending_open=1) by the caller */
+    float volume;
+    int loop;
+} pending_big_req_t;
+
+static pending_sfx_req_t pending_sfx[MAX_PENDING_SFX];
+static int pending_sfx_count = 0;
+static pending_big_req_t pending_big[MAX_PENDING_BIG];
+static int pending_big_count = 0;
+
+/* Called with audio_mutex held. Cheap (struct copy only, no I/O): coalesces
+ * a repeated request for the same index instead of growing the queue. A
+ * later audio_play() (activate=1) upgrades an already-queued audio_load()
+ * preload (activate=0) for the same index; a later audio_load() never
+ * downgrades one that is already set to play. */
+static void enqueue_play_sfx_locked(int index, float volume, float pitch, int activate) {
+    for (int i = 0; i < pending_sfx_count; i++) {
+        if (pending_sfx[i].index == index) {
+            if (activate) {
+                pending_sfx[i].volume = volume;
+                pending_sfx[i].pitch = pitch;
+                pending_sfx[i].activate = 1;
+            }
+            return;
+        }
+    }
+    if (pending_sfx_count < MAX_PENDING_SFX) {
+        pending_sfx[pending_sfx_count].index = index;
+        pending_sfx[pending_sfx_count].volume = volume;
+        pending_sfx[pending_sfx_count].pitch = pitch;
+        pending_sfx[pending_sfx_count].activate = activate;
+        pending_sfx_count++;
+    }
+    /* Queue full: drop. A missed one-shot SFX trigger is far less bad than
+     * blocking the render thread; a steady/looping sound will simply be
+     * requested again on its next occurrence. */
+}
+
+/* Called with audio_mutex held: removes slot's queued open request, if any
+ * (used when a slot with a still-pending open gets forcibly reused). */
+static void cancel_pending_big_locked(int slot) {
+    for (int q = 0; q < pending_big_count; q++) {
+        if (pending_big[q].slot == slot) {
+            pending_big[q] = pending_big[--pending_big_count];
+            return;
+        }
+    }
+}
+
 /* ---------------- Mixer thread ---------------- */
 
 static int16_t mix_buf[OUT_FRAMES * 2];
@@ -346,6 +451,80 @@ static int audio_mix_thread(SceSize argc, void *argv) {
     (void)argc;
     (void)argv;
     while (audio_running) {
+        /* Drain deferred load/open requests queued by audio_play()/
+         * audio_load()/audio_play_big() (see the request-queue comment
+         * above enqueue_play_sfx_locked()). The blocking part -- fopen()
+         * plus a full ogg decode, or ov_open()'s end-of-file bisection --
+         * runs right here, on this thread/core, UNLOCKED, so it never
+         * holds up the render thread or blocks the mixing section below
+         * for longer than the cheap dequeue/install copies do. */
+        pending_sfx_req_t sfx_reqs[MAX_PENDING_SFX];
+        int sfx_req_n;
+        int big_slots[MAX_PENDING_BIG];
+        float big_vols[MAX_PENDING_BIG];
+        int big_loops[MAX_PENDING_BIG];
+        int big_req_n;
+
+        sceKernelLockMutex(audio_mutex, 1, NULL);
+        sfx_req_n = pending_sfx_count;
+        memcpy(sfx_reqs, pending_sfx, sizeof(pending_sfx_req_t) * (size_t)sfx_req_n);
+        pending_sfx_count = 0;
+        big_req_n = pending_big_count;
+        for (int i = 0; i < big_req_n; i++) {
+            big_slots[i] = pending_big[i].slot;
+            big_vols[i] = pending_big[i].volume;
+            big_loops[i] = pending_big[i].loop;
+        }
+        pending_big_count = 0;
+        sceKernelUnlockMutex(audio_mutex, 1);
+
+        for (int i = 0; i < sfx_req_n; i++) {
+            int16_t *pcm;
+            uint32_t frames;
+            if (sfx_decode_raw(sfx_reqs[i].index, &pcm, &frames) != 0)
+                continue;
+            sceKernelLockMutex(audio_mutex, 1, NULL);
+            sfx_entry_t *e = sfx_find(sfx_reqs[i].index);
+            if (e) {
+                /* A concurrent request for the same index was coalesced
+                 * (enqueue_play_sfx_locked) or raced in via the fast path
+                 * -- someone else's copy already won, drop ours. */
+                free(pcm);
+            } else {
+                e = sfx_cache_install(sfx_reqs[i].index, pcm, frames);
+            }
+            if (e && sfx_reqs[i].activate) {
+                /* audio_play(): actually start a voice. A plain
+                 * audio_load() preload (activate=0) only needed the decode
+                 * + cache install above -- no voice to start. */
+                int slot = -1;
+                for (int s = 0; s < MAX_SFX_VOICES; s++)
+                    if (!sfx_voices[s].active) { slot = s; break; }
+                if (slot < 0) slot = 0;
+                sfx_voices[slot].active = 1;
+                sfx_voices[slot].paused = 0;
+                sfx_voices[slot].e = e;
+                sfx_voices[slot].pos_fix = 0;
+                sfx_voices[slot].step_fix = (uint32_t)((double)sfx_reqs[i].pitch * 65536.0);
+                sfx_voices[slot].vol = sfx_reqs[i].volume;
+            }
+            sceKernelUnlockMutex(audio_mutex, 1);
+        }
+
+        for (int i = 0; i < big_req_n; i++) {
+            big_voice_t *v = &big_voices[big_slots[i]];
+            int ok = big_open(v, v->index) == 0;
+            sceKernelLockMutex(audio_mutex, 1, NULL);
+            v->pending_open = 0;
+            if (ok) {
+                v->vol = big_vols[i];
+                v->loop = big_loops[i] ? 1 : 0;
+                v->paused = 0;
+                v->active = 1;
+            }
+            sceKernelUnlockMutex(audio_mutex, 1);
+        }
+
         int32_t acc[OUT_FRAMES * 2];
         memset(acc, 0, sizeof(acc));
 
@@ -505,7 +684,9 @@ void audio_load(int index) {
     if (audio_port < 0 || index < 0 || index >= GMV_SOUND_COUNT)
         return;
     sceKernelLockMutex(audio_mutex, 1, NULL);
-    sfx_decode(index);
+    sfx_entry_t *hit = sfx_find(index);
+    if (!hit)
+        enqueue_play_sfx_locked(index, 0.0f, 1.0f, 0 /* decode-only, no voice */);
     sceKernelUnlockMutex(audio_mutex, 1);
 }
 
@@ -520,7 +701,9 @@ void audio_play(int index, float volume, float pitch) {
         l_note("[AUDIO] first play: idx=%d vol=%.2f pitch=%.2f", index, volume, pitch);
     }
     sceKernelLockMutex(audio_mutex, 1, NULL);
-    sfx_entry_t *e = sfx_decode(index);
+    /* Fast path: already decoded and cached -- cheap, no I/O, stays
+     * synchronous exactly like before. */
+    sfx_entry_t *e = sfx_find(index);
     if (e) {
         /* Steal the first free (or oldest = slot 0) voice. */
         int slot = -1;
@@ -537,7 +720,16 @@ void audio_play(int index, float volume, float pitch) {
         sfx_voices[slot].pos_fix = 0;
         sfx_voices[slot].step_fix = (uint32_t)((double)pitch * 65536.0);
         sfx_voices[slot].vol = volume;
+        sceKernelUnlockMutex(audio_mutex, 1);
+        return;
     }
+    /* Cold path (Fase 56): first play of this index -- fopen() + a full
+     * ogg decode would otherwise block whatever thread called us (the
+     * engine's own JNI call from inside GameRenderer_nativeRender(), see
+     * the comment above enqueue_play_sfx_locked()). Defer it to the mixer
+     * thread and return immediately; the voice starts up to one mixer
+     * tick (~43 ms) later instead of freezing the frame. */
+    enqueue_play_sfx_locked(index, volume, pitch, 1 /* start a voice once decoded */);
     sceKernelUnlockMutex(audio_mutex, 1);
 }
 
@@ -646,38 +838,97 @@ void audio_play_big(int index, float volume, int loop) {
             sceKernelUnlockMutex(audio_mutex, 1);
             return;
         }
+
+    /* Fase 56: an already-open handle for this exact index sitting idle
+     * (e.g. previously stopped) can be restarted with just
+     * ov_time_seek(0.0), which -- unlike ov_open() -- needs no
+     * end-of-file bisection, so this stays cheap/synchronous. */
+    for (int i = 0; i < MAX_BIG_VOICES; i++) {
+        big_voice_t *v = &big_voices[i];
+        if (v->opened && !v->pending_open && v->index == index && !v->active) {
+            ov_time_seek(&v->vf, 0.0);
+            v->buf_frames = 0;
+            v->frac_pos = 0.0;
+            v->eof = 0;
+            v->vol = volume;
+            v->loop = loop ? 1 : 0;
+            v->paused = 0;
+            v->active = 1;
+            sceKernelUnlockMutex(audio_mutex, 1);
+            return;
+        }
+    }
+
+    /* An open request for this exact index is already queued (e.g. two
+     * rapid playRadio() calls before the mixer thread caught up) --
+     * refresh the params it will start with instead of queuing a second
+     * request for the same slot. */
+    for (int i = 0; i < MAX_BIG_VOICES; i++) {
+        if (big_voices[i].pending_open && big_voices[i].index == index) {
+            for (int q = 0; q < pending_big_count; q++)
+                if (pending_big[q].slot == i) {
+                    pending_big[q].volume = volume;
+                    pending_big[q].loop = loop;
+                    sceKernelUnlockMutex(audio_mutex, 1);
+                    return;
+                }
+            break; /* reservation without a queue entry shouldn't happen -- fall through and re-reserve */
+        }
+    }
+
+    /* Cold path (Fase 56, see real hardware logs logs/debug_local_053/
+     * 054/056.log, e.g. frame 3145 "playRadio" -> 906 ms slow render):
+     * fopen() + ov_open() -- the latter does an end-of-file bisection to
+     * find the stream's duration/bitrate -- blocks whatever thread calls
+     * us, which for this port is the same thread driving
+     * GameRenderer_nativeRender(). Reserve a slot now (cheap, no I/O) and
+     * defer the actual open to the mixer thread; see the request-queue
+     * comment above enqueue_play_sfx_locked(). */
     int slot = -1;
     for (int i = 0; i < MAX_BIG_VOICES; i++)
-        if (!big_voices[i].active) {
+        if (!big_voices[i].active && !big_voices[i].pending_open) {
             slot = i;
             break;
         }
     if (slot < 0) {
-        big_close(&big_voices[0]);
-        slot = 0;
+        /* No idle slot: evict one that is merely active/playing (safe --
+         * a big_voice_t is only ever mutated under audio_mutex, except
+         * for the mixer thread's big_open() below, which runs UNLOCKED
+         * on a slot it marked pending_open). NEVER force-evict a
+         * pending_open slot here: the mixer thread may be mid-flight in
+         * an unlocked fopen()+ov_open() for that exact slot right now,
+         * and closing it out from under that call would race on the same
+         * OggVorbis_File/FILE* from two threads. If every slot happens to
+         * be pending_open at once (all voices mid-open in the same tick),
+         * drop this request instead -- the caller's next attempt (e.g.
+         * the next playRadio retry) gets a slot once one finishes. */
+        for (int i = 0; i < MAX_BIG_VOICES; i++)
+            if (!big_voices[i].pending_open) {
+                slot = i;
+                break;
+            }
+        if (slot < 0) {
+            sceKernelUnlockMutex(audio_mutex, 1);
+            return;
+        }
+        cancel_pending_big_locked(slot);
+        big_close(&big_voices[slot]);
     }
     big_voice_t *v = &big_voices[slot];
-    if (v->opened && v->index != index)
-        big_close(v);
-    if (!v->opened && big_open(v, index) < 0) {
-        sceKernelUnlockMutex(audio_mutex, 1);
-        return;
-    }
-    if (v->index == index && v->opened && v->active && v->paused) {
-        /* Resume same stream. */
-        v->paused = 0;
-        v->vol = volume;
-        v->loop = loop ? 1 : 0;
+    if (v->opened)
+        big_close(v); /* release the old ov handle before handing this slot to the mixer thread */
+    v->pending_open = 1;
+    v->index = index;
+    if (pending_big_count < MAX_PENDING_BIG) {
+        pending_big[pending_big_count].slot = slot;
+        pending_big[pending_big_count].volume = volume;
+        pending_big[pending_big_count].loop = loop;
+        pending_big_count++;
     } else {
-        if (v->opened)
-            ov_time_seek(&v->vf, 0.0);
-        v->buf_frames = 0;
-        v->frac_pos = 0.0;
-        v->eof = 0;
-        v->vol = volume;
-        v->loop = loop ? 1 : 0;
-        v->paused = 0;
-        v->active = 1;
+        /* Can't happen in practice (MAX_PENDING_BIG == MAX_BIG_VOICES, at
+         * most one request per slot) -- don't leave the slot stuck
+         * pending forever if it ever did. */
+        v->pending_open = 0;
     }
     sceKernelUnlockMutex(audio_mutex, 1);
 }

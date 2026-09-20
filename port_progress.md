@@ -3,7 +3,245 @@
 > Bitácora cronológica, un bug confirmado a la vez. Para el estado **estructural** del port (motor,
 > mapa JNI, filesystem, niveles de logging, checklist) ver `PORTING_PLAN.md`.
 
-## Estado actual — 2026-09-20 (Fase 51: cruceta + stick izquierdo mueven al personaje — synthesized drag sobre el `AnalogStick` de la HUD; confirmado que este motor NO tiene control manual de cámara)
+## Estado actual — 2026-09-20 (Fase 57: comparativa contra otros ports Android→Vita del mismo ecosistema (soloader+FalsoJNI+vitaGL) -- render thread pineado al core 0, sin confirmar en consola real)
+
+**Punto de partida:** el usuario pidió revisar cómo otros ports de Android a Vita de
+Rinnegatamante/su mismo ecosistema (nombró puntualmente "Asphalt 6" y "Dungeon Hunter 2", más
+"otros ports" en general) manejan rendimiento/estabilidad, para bajar el riesgo de que este port
+caiga por debajo de ~10 fps.
+
+### Aclaración sobre los ports nombrados
+
+Ni "Asphalt 6" ni "Dungeon Hunter 2" son ports de **Rinnegatamante** -- son de **MetalSyntax**
+(`github.com/MetalSyntax`). "Dungeon Hunter 2 HD" no tiene port real, solo figura como entrada
+pendiente en `Rinnegatamante/Android2Vita-Candidate-Ports-List#496` (candidatura, sin código).
+Lo que sí existe y es directamente comparable -- de hecho más relevante que un port genérico de
+Rinnegatamante, porque comparten el motor Gameloft "Glitch" real de este mismo port, no solo el
+toolchain -- son 4 repos de MetalSyntax, todos soloader+FalsoJNI+vitaGL (vitaGL es de
+Rinnegatamante, vendorizado igual que acá):
+
+- `MetalSyntax/Asphalt-5-Vita` (ya citado en este repo, Fases 12/38/48) -- "fully playable start
+  to finish".
+- `MetalSyntax/Asphalt-6-Vita` -- según su propio README, port temprano con bugs abiertos, no
+  pulido.
+- `MetalSyntax/Shadow-Guardian-vita` (ya citado, Fase 48) -- "fully playable at a smooth 60 FPS".
+- `MetalSyntax/Sacred-Odyssey-vita` -- mismo motor Glitch, primera build jugable.
+
+### Comparativa (código real leído de los 4 repos vía GitHub, no de memoria)
+
+| Patrón | Otros ports MetalSyntax (mismo motor/stack) | Este port (`Gangstar-...`) | Resultado |
+|---|---|---|---|
+| `vglInitExtended()` 4to arg (`ram_threshold`, no es el pool en sí -- ver nota) | Asphalt-5: 12 MB · Shadow-Guardian/Sacred-Odyssey: 6 MB (con 4X MSAA) · Asphalt-6: 24 MB | 12 MB (`glutil.c:88`) | Ya coincide con Asphalt-5 (de donde se copió, Fase 12). Asphalt-6 usa un valor MAYOR, pero leyendo `lib/vitaGL/source/vgl.c:566` ese argumento es lo que se **resta** de la RAM libre para decidir el pool que vitaGL se queda -- un valor mayor le da MENOS pool a vitaGL, no más. Copiar el 24 MB de Asphalt-6 iría en la dirección **contraria** a lo que necesita la Fase 46 (agotamiento de VRAM/pools). **No se tocó** -- ver sección "no se cambió" abajo. |
+| `HAVE_TEX_CACHE` / tuning de caché de texturas | Ninguno de los 4 lo define | Sí, desde la Fase 46 | Este port ya está adelante acá; ninguno de los otros documenta haber pisado el mismo síntoma (mundo abierto con VRAM agotada) tan a fondo. |
+| Flags `*_SPEEDHACK` de vitaGL | Asphalt-6 **revirtió** `CIRCULAR_POOL_SPEEDHACK`, `SAMPLERS_SPEEDHACK`, `NO_TEX_COMBINER` y `MATH_SPEEDHACK` por regresiones reales (su propio `CMakeLists.txt`); usa `DRAW_SPEEDHACK=2` (= `SAFER_DRAW_SPEEDHACK`) | Mismos 4 hacks ya descartados en este repo por regresiones reales propias (Fases 39/41/43), y `SAFER_DRAW_SPEEDHACK` restaurado (Fase 41) | Coincidencia total, cruzada de forma independiente en dos ports distintos del mismo motor -- refuerza que esas decisiones ya tomadas fueron correctas. Sin cambios. |
+| Heap newlib | 256 MB en los 4 | 256 MB (`main.c:19`) | Ya coincide. |
+| `ATTRIBUTE2` (memoria extendida, `param.sfo`) | `ATTRIBUTE2=12` en los 4 | `ATTRIBUTE2=12` (`CMakeLists.txt:18`) | Ya coincide. |
+| Afinidad/prioridad de hilos | Shadow-Guardian y Sacred-Odyssey pinean el **hilo principal** a `SCE_KERNEL_CPU_MASK_USER_0` justo después del overclock, antes de cualquier otra cosa (`int main()`, comentario "Dedicate main thread to core 0"); Asphalt-5/6 no pinean nada | Los hilos de video/audio de `video.cpp` SÍ pinean (`USER_2` y `USER_1\|USER_2`) con el comentario explícito "keep the render thread's core to itself" -- pero el hilo principal/render nunca se pineaba | **Gap real, con evidencia de dos fuentes independientes** (los dos ports MetalSyntax documentados como estables + la intención ya escrita en el propio `video.cpp` de este repo que nunca se implementó). Corregido. |
+| Fallback de baja-fps / calidad dinámica | Ninguno de los 4 tiene nada así (ni frame-skip, ni downgrade de filtrado) | No tiene | Coincide (nada que copiar). |
+| `sceKernelAllocMemBlock` / memoria extra fuera de heap+ATTRIBUTE2 | Ninguno de los 4 | No tiene | Coincide (nada que copiar). |
+
+### Cambio aplicado (`source/utils/init.c`, único cambio de código de esta fase)
+
+Se agregó `sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0)`
+en `soloader_init_all()`, inmediatamente después de los 4 `scePowerSet*()` -- mismo lugar y mismo
+orden que `Shadow-Guardian-vita` y `Sacred-Odyssey-vita` en su `int main()`. Riesgo bajo: no
+cambia semántica de render, solo fija en qué core físico corre el hilo que ya existía -- a
+diferencia de los `*_SPEEDHACK` que este proyecto ya probó y revirtió (CLAUDE.md regla 2,
+Fases 39-41), esto no toca ningún camino de dibujo. Se agregó `#include <psp2/kernel/threadmgr.h>`
+para `sceKernelGetThreadId()`/`sceKernelChangeThreadCpuAffinityMask()`.
+
+Build verde (`psvita-toolkit build --preset release`), código de salida 0,
+`build/gangstarmiamivindication.vpk` regenerado.
+
+### Lo que se investigó pero NO se cambió (y por qué)
+
+- **`vglInitExtended()` ram_threshold a 24 MB (como Asphalt-6):** como se explica en la tabla,
+  la semántica real del argumento hace que un valor mayor le dé MENOS memoria a vitaGL, no más
+  -- justo lo contrario de lo que ayudaría a la Fase 46. Además Asphalt-6 es, por su propio
+  README, el menos pulido de los 4 comparados. No hay evidencia que justifique tocar un valor ya
+  validado desde la Fase 12/46.
+- **Prioridad de hilo (`sceKernelChangeThreadPriority`) para el hilo principal:** ninguno de los
+  4 ports la fija (solo la afinidad), así que no hay evidencia externa para copiar un valor
+  puntual; tocar prioridades a ciegas es más riesgoso que fijar afinidad.
+- **Pendiente de confirmar en consola real:** el pin de afinidad del hilo principal no se probó
+  todavía en hardware. Si en el próximo log aparece contención nueva (por ejemplo el mixer de
+  audio, que corre en `USER_2` sin prioridad explícita, compitiendo de forma distinta ahora que
+  el render está fijo en `USER_0`), es la primera hipótesis a revisar.
+
+## Estado actual — 2026-09-20 (Fase 56: "tirones fuertes" en gameplay real -- audio_play()/audio_play_big() decodificaban ogg de forma síncrona en el mismo hilo que GameRenderer_nativeRender(), sin confirmar en consola real)
+
+**Punto de partida:** el usuario reporta tirones fuertes (no un techo de fps bajo y estable, sino
+cortes puntuales) durante gameplay real, tras las Fases 33-53 que ya llevaron el juego a
+20-30/60 fps jugables. Se pidió auditar el código del port (no el motor cerrado) buscando
+sobrecosto por-frame o por-evento con evidencia concreta, sin adivinar.
+
+### Evidencia real de consola ya existente en el repo (no generada para esta fase)
+
+`logs/debug_local_053.log`, `_054.log` y `_056.log` (tres sesiones reales distintas, todas del
+2026-09-20) ya traían el heartbeat `[022] main loop: frame N slow render (X ms)` de la Fase 22.
+Cruzando esas líneas con el log de eventos del motor (`[ALOG]`) inmediatamente antes de cada
+pico, aparece un patrón repetido en las tres sesiones:
+
+- `frame 2347 slow render (4337 ms)` -- precedido por `[ALOG][SOUNDS-VV] PLAYEX:1662/1653` y,
+  unas líneas antes, `[input] pad enter-car down` (subir a un vehículo).
+- `frame 3145 slow render (906 ms)` -- precedido por `[ALOG][----Gameloft----] -----stopRadio-----`
+  / `-----playRadio------` (cambio de estación de radio manejando).
+- Picos similares (500-950 ms) en `_053.log`/`_054.log` en los mismos puntos: primer
+  `[AUDIO] first play_big`, primeros `PLAYEX` de un índice nuevo.
+
+(El otro patrón visible en los tres logs -- una ráfaga de 5-8 frames entre 500 ms y 16 s justo
+después de la pantalla de carga, frames ~290-339 -- es la ráfaga de shaders/texturas de arranque
+ya documentada en la Fase 25, no gameplay en curso; no se tocó nada de eso acá.)
+
+### Causa raíz (confirmada leyendo `source/utils/audio.c` y `source/java.c`, no adivinada)
+
+`Method_playSound()`/`Method_playSoundBig()` (`source/java.c:211-226`) son invocadas por el motor
+vía JNI **desde el mismo hilo que llama a `GameRenderer_nativeRender()`** en el loop de
+`main.c` -- no hay un hilo de juego separado para esto. Antes de esta fase:
+
+- `audio_play()` llamaba a `sfx_decode()` **sosteniendo `audio_mutex`**, que hace `fopen()` +
+  decodifica el ogg **completo** (hasta 30 s de audio, ov_read en bucle) + resamplea a 48 kHz --
+  todo de forma síncrona en ese mismo hilo.
+- `audio_play_big()` llamaba a `big_open()` de la misma forma para un índice no abierto todavía:
+  `fopen()` + `ov_open()`, que hace una bisección al final del archivo para determinar
+  duración/bitrate -- también síncrono, también sosteniendo `audio_mutex`.
+
+Es decir: la primera vez que suena un efecto nuevo (subir a un auto dispara un SFX no cacheado
+antes) o se abre un stream nuevo (cambiar de emisora), el hilo que dibuja el frame se queda
+bloqueado en I/O + decode de audio durante cientos de ms a varios segundos -- exactamente el
+perfil de "tirón fuerte" puntual, no un techo de fps. El propio comentario de cabecera del
+archivo ya declaraba la intención de diseño ("the mixer thread is the ONLY thread touching voice
+decode state; the JNI thread only flips flags/volumes") pero el código no la cumplía para el
+primer `play`/`play_big` de cada índice.
+
+### Fix (`source/utils/audio.c`)
+
+Se separó decode de instalación y se agregó una cola de pedidos diferidos, consumida por el
+mixer thread (que ya corre en su propio hilo/core, `SCE_KERNEL_CPU_MASK_USER_2`) al principio de
+cada iteración, antes de mezclar:
+
+1. `sfx_decode()` (una sola función que decodificaba Y instalaba en cache bajo lock) se separó en
+   `sfx_decode_raw()` (fopen+decode+resample en un buffer local, sin tocar `sfx_cache`/
+   `sfx_voices`, seguro sin lock) y `sfx_cache_install()` (la parte barata que sí muta estado
+   compartido, requiere `audio_mutex`).
+2. `audio_play()`/`audio_load()`: si el índice ya está en cache (`sfx_find()`), camino rápido sin
+   cambios (síncrono, barato). Si no, encolan un pedido (`enqueue_play_sfx_locked()`, con un flag
+   `activate` para distinguir "reproducir" de "solo precargar") y retornan de inmediato -- ya no
+   bloquean.
+3. `audio_play_big()`: se agregaron los mismos caminos rápidos para "ya activo" (sin cambios,
+   existía) y "ya abierto pero inactivo" (`ov_time_seek(0)`, barato, no necesita la bisección de
+   `ov_open()`). El camino frío (nunca abierto) reserva un slot (`big_voice_t.pending_open`,
+   campo nuevo) y encola el `fopen()+ov_open()` para el mixer thread en vez de hacerlo ahí mismo.
+4. `audio_mix_thread()`: al principio de cada iteración, vacía ambas colas bajo `audio_mutex`
+   (copia barata, sin I/O), y decodifica/abre **fuera del lock** -- sólo vuelve a tomar el mutex
+   para instalar el resultado (crear la voz activa o marcar `pending_open=0`). Un pedido
+   duplicado para el mismo índice se combina (`enqueue_play_sfx_locked`/slot ya reservado) en vez
+   de encolarse dos veces.
+
+Peor caso nuevo: un sonido recién solicitado arranca hasta un tick del mixer (~43 ms,
+`OUT_FRAMES/OUT_RATE`) más tarde que antes, o el buffer de audio de ese tick se retrasa mientras
+decodifica -- un hipo de audio menor en vez de un frame congelado de hasta varios segundos.
+Limitación conocida y aceptada: si `audio_stop_big()` llega para un índice cuyo `pending_open`
+todavía no fue resuelto por el mixer thread, el stop no tiene efecto (la reserva no se cancela) y
+el stream terminará arrancando de todos modos -- no se ha visto el patrón "stop inmediatamente
+después de play" en los logs reales disponibles, pero queda anotado por si aparece.
+
+**Bug de concurrencia encontrado en revisión y corregido antes de dar la fase por cerrada:** el
+camino de desalojo forzado de `audio_play_big()` (cuando los 4 `big_voices[]` están ocupados)
+elegía el slot 0 sin importar si tenía `pending_open=1` -- es decir, podía forzar un
+`big_close()` (bajo lock, desde el hilo de render/JNI) sobre el MISMO slot que el mixer thread
+podía estar abriendo en ese instante vía su `big_open()` **sin lock** (a propósito, ver el punto 4
+arriba). Eso es una carrera real de dos hilos sobre el mismo `OggVorbis_File`/`FILE*` -- con
+`playRadio`/cambios de vehículo rápidos (justo el escenario que originó esta fase) era alcanzable
+en la práctica, no sólo teórico. Fix: el desalojo forzado ahora sólo puede caer sobre un slot que
+NO esté `pending_open` (uno simplemente `active`, que sólo se muta bajo lock); si los 4 slots
+están `pending_open` a la vez (necesitaría 4 streams abriéndose por primera vez en el mismo tick),
+el pedido nuevo simplemente se descarta -- igual filosofía que la cola de SFX llena (un hipo de
+audio es preferible a un crash). Reconstruido, verde.
+
+### Build
+
+`psvita-toolkit build --preset release` verde a la primera (sin warnings nuevos en
+`source/utils/audio.c`). No se tocó `source/main.c` ni `source/utils/gamepad_actions.c`.
+
+**Sin confirmar en consola real.** Qué mirar en el próximo log:
+
+1. Los mismos eventos (`PLAYEX` de un índice nuevo, `playRadio`/`stopRadio`, "pad enter-car")
+   NO deberían venir seguidos de un `frame N slow render` de cientos de ms o segundos -- en el
+   peor caso, un `slow render` mucho más chico (menos de ~50 ms) o ninguno.
+2. Confirmar que el audio sigue sonando correctamente (sin más silencios/omisiones que antes) --
+   la SFX/radio recién solicitada puede tardar un tick de mixer (~43 ms) más en arrancar, eso es
+   esperado y no debería ser perceptible.
+3. Si el tirón persiste en los mismos puntos, el siguiente sospechoso a mirar (no tocado en esta
+   fase) es el propio motor cerrado: `Printer::logf` ya logueaba en `_054.log`
+   "adding texture %s: slow path pixel format conversion..." cerca de otro pico -- eso es
+   conversión de formato de píxel del lado del `.so`, no del port, y no se puede arreglar sin
+   tocar el binario cerrado.
+
+### Lo que no se pudo resolver leyendo código (necesita telemetría real de hardware)
+
+No hay forma de correr el juego ni de medir tiempos de frame reales desde acá -- todo lo de
+arriba se apoyó en logs YA CAPTURADOS por el usuario en sesiones previas, cruzados con el código
+fuente. Si tras esta fase persisten tirones que NO coincidan con eventos de audio en el log
+(`PLAYEX`/`play_big`/`playRadio`), el paso siguiente sería generar los hooks de
+`psvita-toolkit perf-telemetry --gen-hooks` (FPS/p95/stutter/`sceGxmFinish` timing) para que el
+usuario los pruebe en consola real -- no se generaron en esta fase porque la causa encontrada ya
+tenía evidencia directa en los logs existentes, sin necesidad de instrumentación nueva.
+
+## Estado actual — 2026-09-20 (Fase 55: revisión de `apply_touch_alpha()` — `this+0x34` era la offset correcta pero setAlpha() no siempre re-deriva los bytes de la quad desde ella; se refuerza escribiendo también `this+0x54` y los 4 bytes de alpha de vértice, sin confirmar en consola real)
+
+**Punto de partida:** la Fase 54 (opacidad de los botones táctiles, `apply_touch_alpha()` pokeando
+`this+0x34` a 103/255) se desplegó y el usuario reporta que los botones se ven exactamente igual
+en consola — "no perceptible change".
+
+### Re-derivación de `HudElement::setAlpha()` desde el desensamblado crudo
+
+`decompiled/disasm/full_libGangster2.so.md`, `002ba98c <HudElement::setAlpha() const>`
+(2ba98c-2bab52). El pseudo-C de Ghidra mezcla mal un test: lo que aparenta ser una variable
+`iVar1` de `this+0xc` en realidad es el valor de retorno **R0** de una llamada virtual hecha unas
+instrucciones antes (2ba99c-2ba9a2, a través de
+`(*(Application::GetInstance()+0x179bc))->vtable[4]()`) — no es un bit de flags del widget.
+
+Bits reales de `*(this+0xc)` que gatean las tres ramas fijas de `setAlpha()`:
+- bit 5 (`0x20`, 2ba9a6 `lsls r2,r3,#26`): fuerza los 4 quads a blanco sólido, alpha=0xA0 (160)
+  fijo. Grep exhaustivo de todo `out_ghidra.c` (HudElement/VirtualButton/AnalogStick/Wheel/
+  SlideControl/CHudManager): **nada pone nunca este bit** en un control táctil. Rama muerta.
+- bit 4 (`0x10`, 2ba9a8 `lsls r2,r3,#27`) = "blink", confirmado por `HudElement::isBlinking()`
+  (`(flags<<0x1b)>>0x1f`) y `HudElement::blink(bool,bool)` (orr/bic `#0x10`). Sólo lo activa
+  `CHudManager::blink(int)` para pulsos de tutorial/hint puntuales (out_ghidra.c ~66952-66991),
+  no en reposo normal.
+- bit 1 (`0x2`, "used"/presionado) + bit 2 (`0x4`, puesto a 1 en el ctor de todo HudElement
+  interactivo y nunca tocado después) se testean juntos como `flags & 6`. En reposo (no
+  presionado) da 4 → rama "drag/timer" (2baa5e) que decrementa `this+0x54` en
+  `255.0f / *(this+0x3c)` por frame. **`this+0x3c` se pone a 0 en el ctor y jamás se escribe en
+  ningún otro lado del binario** (grep exhaustivo) → división por cero todos los frames →
+  colapsa a -infinito → siempre cae al clamp `this+0x54 = this+0x34` (2bab00-2bab0e), escribiendo
+  ese valor en los 4 bytes de alpha de vértice (`this+0x47/0x4b/0x4f/0x53`). Mientras está
+  presionado (`flags&6==6`) en cambio, `setAlpha()` fuerza `this+0x54=0xff` y **retorna sin
+  tocar los bytes de la quad** (2baa58).
+
+Conclusión: `this+0x34` **sí** era la offset correcta para el estado de reposo (confirmado de
+punta a punta, no sólo en el ctor) — la Fase 54 no estaba mal orientada. El orden de llamada
+también es correcto: `gamepad_actions_update()` (source/main.c ~línea 255) corre antes que
+`GameRenderer_nativeRender()` (~línea 270) en la misma iteración del loop, así que el poke llega
+antes del `setAlpha()` de ese frame. La hipótesis más probable para el "sin cambio perceptible"
+es que +3/255 (~1.2%) es, tal como se pidió, casi imperceptible por diseño, y que la prueba con
+L+R (alpha=255, cambio grande) puede no haberse probado por separado en consola.
+
+### Cambio (`source/utils/gamepad_actions.c`)
+
+Para no depender de que `setAlpha()` re-derive los bytes desde `this+0x34` en la rama
+"presionado" (que no lo hace, ver arriba), `apply_touch_alpha()` ahora también escribe
+directamente `this+0x54` y los 4 bytes de alpha de vértice (`0x47/0x4b/0x4f/0x53`) con el mismo
+valor, además de `this+0x34`. Redundante en el resto de las ramas (setAlpha() los vuelve a
+computar desde `this+0x34` de todos modos, con el mismo resultado), pero cubre ese caso puntual
+y deja de depender enteramente de la lectura del motor. No se tocó `GA_ALPHA_BOOST` (+1% pedido)
+ni `source/main.c` más allá de lo ya verificado (orden de llamada, sin cambios).
+
+**Sin confirmar en consola real** — no hay forma de verificar visualmente el resultado desde acá;
+falta que el usuario pruebe el build y compare el estado por defecto y con L+R sostenido.
+
+## Estado previo — 2026-09-20 (Fase 51: cruceta + stick izquierdo mueven al personaje — synthesized drag sobre el `AnalogStick` de la HUD; confirmado que este motor NO tiene control manual de cámara)
 
 **Punto de partida:** el usuario reporta que la cruceta y el joystick izquierdo siguen sin
 mover al personaje, y que el joystick derecho no mueve la cámara.

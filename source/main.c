@@ -214,13 +214,30 @@ int main() {
         // Kept for parity with a real keyboard-equipped device; gameplay
         // input for the mapped buttons goes through gamepad_actions_update()
         // below, not through here.
+        //
+        // Fase 55: SCE_CTRL_CIRCLE -> KEYCODE_BACK (4) removed on purpose.
+        // Application::DeviceKeyPress(4) (out_ghidra.c ~15045-15139), when
+        // the state-machine chain checking states 1/2/3/5/4/0 all comes back
+        // false (i.e. plain on-foot/driving gameplay, no menu/cutscene/IGP
+        // active), falls through to `goto LAB_002970cc` which does
+        // StateMachine::pushState<GSInGameMenu>() -- that's the actual pause
+        // menu. Circle also drives gamepad_actions.c's independent touch
+        // synthesis (brake in a vehicle / sprint on foot, offs_veh_b /
+        // on-foot table), so every Circle press was *both* braking/sprinting
+        // AND opening the pause menu. That second effect is the bug; the
+        // touch-synthesis one is correct and untouched (lives entirely in
+        // gamepad_actions.c).
+        // SCE_CTRL_START -> KEYCODE_MENU (82/0x52) is kept as-is: the same
+        // function's 0x52 branch (out_ghidra.c ~15195-15250) reaches the
+        // *same* `goto LAB_002970cc` / pushState<GSInGameMenu>() under the
+        // equivalent all-false state check, so Start already opens the pause
+        // menu correctly on its own and needs no change.
         static const struct { uint32_t btn; int code; } keymap[] = {
             { SCE_CTRL_UP,    19 },
             { SCE_CTRL_DOWN,  20 },
             { SCE_CTRL_LEFT,  21 },
             { SCE_CTRL_RIGHT, 22 },
             { SCE_CTRL_CROSS, 23 },
-            { SCE_CTRL_CIRCLE, 4 },
             { SCE_CTRL_START, 82 },
         };
         for (unsigned k = 0; k < sizeof(keymap) / sizeof(keymap[0]); k++) {

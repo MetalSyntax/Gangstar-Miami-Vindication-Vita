@@ -64,6 +64,7 @@ static CHudManagerPtr *s_hudManagerAddr = NULL;
 static getinstance_fn s_getInstance = NULL;
 static getscale_fn s_getScale = NULL;
 static int s_ready = 0;
+static int s_alphaFull = 0;
 
 /* One representative CHudManager member offset per VirtualButton instance,
  * grouped by EvVButton::ButtonType::Type id. Taken straight from
@@ -170,6 +171,85 @@ static struct pad_action s_actions[] = {
 #define GA_OFF_ANALOGSTICK 0x28
 #define GA_OFF_WHEEL       0x2c
 #define GA_OFF_SLIDECONTROL 0x54
+
+/*
+ * Touch-control opacity. `HudElement::HudElement(ASprite*, int, bool)`
+ * (out_ghidra.c: `*(undefined4 *)(this + 0x34) = 100;`) sets a per-instance
+ * "floor" alpha at this+0x34. `HudElement::setAlpha()` (raw disasm:
+ * decompiled/disasm/full_libGangster2.so.md, `002ba98c
+ * <HudElement::setAlpha() const>`; called from `draw2d()`, 2bab68, right
+ * before `ASprite::PaintFrame()`) is re-run every frame and re-derives the
+ * actual drawn RGBA quad bytes (this+0x44/0x48/0x4c/0x50, alpha at the +3 of
+ * each: 0x47/0x4b/0x4f/0x53) and their int mirror at this+0x54.
+ *
+ * Re-derived from the RAW disassembly (not the Ghidra pseudo-C, which
+ * mis-decompiles part of this -- see below), setAlpha()'s branches on the
+ * flags word at this+0xc are:
+ *   - bit 5 (mask 0x20): forces the quads to solid white, alpha=0xA0 (160)
+ *     fixed. Grep-verified (out_ghidra.c, every HudElement/VirtualButton/
+ *     AnalogStick/Wheel/SlideControl function): NOTHING in this binary ever
+ *     sets bit 5 on a touch-control HudElement. Dead branch for our widgets.
+ *   - bit 4 (mask 0x10, confirmed = "blink" via `HudElement::isBlinking()`
+ *     `(flags<<0x1b)>>0x1f` and `HudElement::blink(bool,bool)` orr/bic #0x10,
+ *     out_ghidra.c): only toggled by `CHudManager::blink(int)` for specific
+ *     tutorial/hint pulses (out_ghidra.c lines ~66952-66991), not during
+ *     ordinary idle rendering. When set, sub-branches: 2ba9fe/2baa00 test
+ *     BIT 8 (mask 0x100) not of this+0xc but of R0, the return value of a
+ *     virtual call made earlier in setAlpha() (2ba99c-2ba9a2, through
+ *     `(*(Application::GetInstance()+0x179bc))->vtable[4]()`) -- this is
+ *     what Ghidra mis-decompiles as a standalone `iVar1`; it is NOT a flags
+ *     bit at all. Also dead for our widgets in their normal idle state.
+ *   - bit 1 (mask 0x2, "used"/pressed, `HudElement::isUsed()`/`setUsed()`)
+ *     combined with bit 2 (mask 0x4, set to 1 at construction for every
+ *     interactive HudElement, out_ghidra.c ctor, never cleared elsewhere):
+ *     tested as `flags & 6`. While NOT pressed, flags&6==4 -> falls into a
+ *     fade/"drag" sub-branch (2baa5e) that decrements this+0x54 by
+ *     `255.0f / this+0x3c` per frame. Grep-verified: this+0x3c is set to 0
+ *     in the constructor and NEVER written anywhere else in the whole
+ *     binary for HudElement/VirtualButton/AnalogStick/Wheel/SlideControl,
+ *     so this division is a 255/0 divide-by-zero EVERY frame, degenerates
+ *     to -infinity, and the result always clamps to this+0x34, deterministically
+ *     writing this+0x34's value into this+0x54 AND the RGBA quads (2bab00-
+ *     2bab0e) every single frame the widget is idle. While pressed (bit1
+ *     set, flags&6==6), setAlpha() instead hardcodes this+0x54=0xff (2baa58)
+ *     and RETURNS WITHOUT touching the RGBA quad bytes for that frame.
+ *
+ * Net result: for a touch control at rest (not pressed, not blinking, not
+ * sniper/camera hud), this+0x34 really is the field that ends up in the
+ * drawn alpha, every frame -- confirmed end to end, not just at the ctor.
+ * We poke it in addition to writing the quad alpha bytes and this+0x54
+ * directly (belt and suspenders for the one branch above that skips
+ * re-deriving them from this+0x34, i.e. while actively pressed).
+ *
+ * Call order (verified in source/main.c): gamepad_actions_update() runs at
+ * line ~255, GameRenderer_nativeRender() (which pumps CHudManager::update()
+ * -> draw2d() -> setAlpha() for that same frame) at line ~270, in the same
+ * `while(1)` iteration -- our poke always lands before that frame's
+ * setAlpha() call, never after.
+ *
+ * VirtualButton, AnalogStick and Wheel/SlideControl all derive from
+ * HudElement without overriding this field, so every touch control CHudManager
+ * owns shares the same this+0x34 byte (and the same quad-byte layout) at the
+ * same offsets -- one poke, applied every frame, covers all of them.
+ */
+#define GA_ALPHA_OFFSET      0x34
+#define GA_ALPHA_INT_OFFSET  0x54  /* this+0x54: int mirror setAlpha() itself writes/reads */
+#define GA_ALPHA_DEFAULT     100   /* engine's own default, confirmed above */
+#define GA_ALPHA_BOOST       3     /* +1% of the 0..255 range, requested bump */
+#define GA_ALPHA_FULL        255
+#define GA_ALPHA_COMBO_MASK  (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER)
+
+/* Vertex-color alpha byte of each of the 4 RGBA quads HudElement::setAlpha()
+ * writes (this+0x44/0x48/0x4c/0x50, alpha at the +3 of each -- raw disasm,
+ * e.g. 2ba9b0/2baa0e/2baac4/2ba9c2 all `strb <alpha>, [r4, #0x47/0x4b/0x4f/0x53]`). */
+static const int s_alpha_quad_offsets[] = { 0x47, 0x4b, 0x4f, 0x53 };
+#define GA_NALPHA_QUAD_OFFSETS (sizeof(s_alpha_quad_offsets) / sizeof(s_alpha_quad_offsets[0]))
+
+static const int s_alpha_offsets[] = {
+    GA_OFF_ANALOGSTICK, GA_OFF_WHEEL, GA_OFF_SLIDECONTROL,
+    0x30, 0x34, 0x38, 0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x5c, 0x60, 0x64, 0x68, 0x6c, 0x70,
+};
+#define GA_NALPHA_OFFSETS (sizeof(s_alpha_offsets) / sizeof(s_alpha_offsets[0]))
 
 /* Deadzone as a fraction of the raw analog range (SceCtrlData.lx/ly are
  * 0..255, 128 = centered) -- keeps a resting stick (which never sits at
@@ -369,6 +449,35 @@ static int clampi(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
+/* Writes the current target alpha (boosted default, or full while the L+R
+ * combo is held) into every touch control's this+0x34 floor AND directly
+ * into its this+0x54 mirror and its 4 RGBA quads' alpha bytes (see the big
+ * comment above `GA_ALPHA_OFFSET` for why both are needed: this+0x34 alone
+ * covers every setAlpha() branch a widget reaches in its normal idle state,
+ * but the "actively pressed" branch skips re-deriving the quad bytes from
+ * this+0x34 for that frame, so we stamp them ourselves too). No screen-scale
+ * gate needed here (unlike pad_press/stick_region/wheel_region) -- this only
+ * touches each widget's own alpha fields, not Application::GetScreenScaleFactors(). */
+static void apply_touch_alpha(void) {
+    CHudManagerPtr hud = *s_hudManagerAddr;
+    if (!hud)
+        return;
+
+    uint32_t alpha = s_alphaFull ? GA_ALPHA_FULL : (GA_ALPHA_DEFAULT + GA_ALPHA_BOOST);
+    uint8_t alphaByte = (uint8_t)alpha;
+
+    for (unsigned i = 0; i < GA_NALPHA_OFFSETS; i++) {
+        void *widget = *(void **)((char *)hud + s_alpha_offsets[i]);
+        if (!widget)
+            continue;
+
+        *(uint32_t *)((char *)widget + GA_ALPHA_OFFSET) = alpha;
+        *(uint32_t *)((char *)widget + GA_ALPHA_INT_OFFSET) = alpha;
+        for (unsigned q = 0; q < GA_NALPHA_QUAD_OFFSETS; q++)
+            *((uint8_t *)widget + s_alpha_quad_offsets[q]) = alphaByte;
+    }
+}
+
 void gamepad_stick_update(uint32_t dpad_buttons, uint8_t lx, uint8_t ly) {
     if (!s_ready)
         return;
@@ -507,6 +616,14 @@ void gamepad_actions_init(gamepad_touch_fn touch) {
 void gamepad_actions_update(uint32_t buttons, uint32_t old_buttons) {
     if (!s_ready)
         return;
+
+    int wantFull = (buttons & GA_ALPHA_COMBO_MASK) == GA_ALPHA_COMBO_MASK;
+    if (wantFull != s_alphaFull) {
+        s_alphaFull = wantFull;
+        l_note("[input] touch controls opacity -> %s (L+R %s)",
+               s_alphaFull ? "100%" : "default+1%", s_alphaFull ? "held" : "released");
+    }
+    apply_touch_alpha();
 
     for (unsigned i = 0; i < GA_NACTIONS; i++) {
         struct pad_action *a = &s_actions[i];

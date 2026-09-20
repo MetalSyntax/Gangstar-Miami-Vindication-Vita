@@ -22,6 +22,7 @@
 #include <psp2/appmgr.h>
 #include <psp2/apputil.h>
 #include <psp2/kernel/clib.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/power.h>
 
 #include <falso_jni/FalsoJNI.h>
@@ -51,6 +52,34 @@ void soloader_init_all() {
     scePowerSetBusClockFrequency(222);
     scePowerSetGpuClockFrequency(222);
     scePowerSetGpuXbarClockFrequency(166);
+
+    // Fase 57: pin the main/render thread to core 0. Right after the
+    // overclock, before anything else -- same spot and same order as
+    // Shadow-Guardian-vita and Sacred-Odyssey-vita (MetalSyntax, same
+    // Gameloft "Glitch" engine as this port, same soloader+vitaGL+FalsoJNI
+    // stack), both commented "Dedicate main thread to core 0"
+    // (source/main.c in both repos, called from int main() immediately
+    // after the four scePowerSet*() calls). Those two are also the only
+    // two of the four MetalSyntax Glitch-engine ports checked (the other
+    // two being Asphalt-5-Vita and Asphalt-6-Vita, neither of which pins
+    // any thread) that are documented as reaching a stable smooth
+    // framerate rather than "early port, open bugs" (Asphalt-6's own
+    // README wording).
+    //
+    // This port's own source/video.cpp already assumes this: the cutscene
+    // decode thread comment says "keep the render thread's core to itself"
+    // and explicitly avoids CPU_MASK_USER_0 for the video/audio threads
+    // (video_decode_thread uses USER_1|USER_2, cutscene_audio_thread uses
+    // USER_2 only) -- but nothing ever pinned the render thread itself, so
+    // the OS scheduler was free to migrate it onto core 1 or 2 and collide
+    // with those decode threads, adding scheduling jitter/cache-thrashing
+    // on top of whatever the frame itself costs. Pinning it here closes
+    // that gap. Low risk: this only affects which physical core runs the
+    // existing main-thread code, not what that code does -- unlike the
+    // vitaGL *_SPEEDHACK flags this project has already tried and reverted
+    // (see CLAUDE.md rule 2 / Fase 39-41), it changes no rendering
+    // semantics. Not yet hardware-verified for this specific title.
+    sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0);
 
 #ifdef USE_SCELIBC_IO
     if (fios_init(DATA_PATH) == 0)
