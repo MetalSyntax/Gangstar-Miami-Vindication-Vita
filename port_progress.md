@@ -59,6 +59,13 @@ Build release verde, VPK regenerado, sin warnings nuevos.
    ~3 s + `dropped_late` de un dígito.
 3. `nativeGetDeviceType returned:Motorola Low End 4` debe aparecer tras el `Lower Setting Profile1`.
 
+### Reporte de usuario (post-Fase 60, sin log nuevo)
+- **Solucionados (user-tested):** personajes/vehículos negros + video del intro. Pasan a fijos en
+  README/RELEASES.
+- **Pendiente confirmado:** con el volante NO se puede manejar (gira nada con cruceta/stick) y el
+  volante se ve semi-invisible (oculto por diseño; L+R lo muestra). Fix de dirección sigue
+  pendiente (Fase 61: clampear el rect visible, centro ≈182,383).
+
 ## Estado previo — 2026-09-21 (Fase 59: video a velocidad real full-res/fullscreen + botones ocultos por gate de dibujo + radio sin retry-loop, sin confirmar en consola real)
 
 **Punto de partida:** el usuario pide (1) video más nítido, pantalla completa y sin "pegarse"

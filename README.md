@@ -43,12 +43,14 @@ causing an all-black screen, a circular-pool GPU stall dragging it to ~9 fps, am
 [`port_progress.md`](port_progress.md) for the full diagnosis log, one confirmed bug at a time,
 and [`PORTING_PLAN.md`](PORTING_PLAN.md) for the living engine/JNI map.
 
-#### ✅ Confirmed on real hardware (log 059 and earlier)
+#### ✅ Confirmed on real hardware (logs + user testing)
 - Boots to warning screen, menus (~60 fps), and open gameplay on foot and driving.
 - Physical controls drive the game (attack/accelerate/brake/enter-car/cover/sprint + D-Pad/stick
   movement all log their synthesized touches and act in-game).
 - Radio/music retry-loop settled: `stopRadio`/`playRadio` now fire on events only, not per frame.
-- Intro cutscene plays from the original `intro.m4v` at full 800x500 resolution, fullscreen.
+- Intro cutscene plays from the original `intro.m4v` at full 800x500 resolution, fullscreen —
+  **video fixed (user-tested)**.
+- **Black characters/vehicles fixed (user-tested)** — they render correctly now.
 
 #### 🧪 NOT yet confirmed on hardware (latest changes, need testing)
 - Low-End device profile + bigger vitaGL pool + audio pre-demux (Fase 60): built green, awaiting
@@ -104,21 +106,19 @@ and [`PORTING_PLAN.md`](PORTING_PLAN.md) for the living engine/JNI map.
   runs faster.
 
 **Graphics**
-- **Some characters/vehicles can render solid black.** Under investigation — a vitaGL vertex-data
-  speedhack racing the GPU was ruled out on hardware; the current suspect is a matrix-math
-  speedhack that can silently drop the active matrix stack for `glOrtho`/`glFrustum`.
 - **Flatter look, no shadows (since Fase 60, unconfirmed):** the Low-End profile disables dynamic
   lighting, shadows, far water and the retro effect to save GPU. Reversible in one line if it
   looks unacceptable once the FPS wells are confirmed gone.
-- **Intro stretched ~10% horizontally** (800x500 → 960x544 fullscreen, on purpose) and its AAC
-  audio can lag/drop at full resolution (pre-demux added in Fase 60, unconfirmed). Skippable with
-  Cross/Start.
+- ~~Characters/vehicles rendering solid black~~ — **fixed (user-tested)**.
+- ~~Intro video issues~~ — **fixed (user-tested)**; plays full-res, fullscreen (stretched ~10%
+  horizontally on purpose), skippable with Cross/Start.
 
 **Controls**
-- **Steering the wheel with D-Pad/stick doesn't turn it in some driving skins** (confirmed in log
-  059: the wheel exists and passes the interactable gate, but its touch center falls outside the
-  engine's 960x480 band). Throttled `[input] wheel miss ...` diagnostics included; proper fix
-  pending. On foot, D-Pad/stick movement works.
+- **Vehicles CANNOT be steered with the wheel via D-Pad/stick yet** (confirmed in log 059: the
+  wheel exists and passes the interactable gate, but its touch center falls outside the engine's
+  960x480 band). The wheel is also **semi-invisible** — virtual buttons/wheel/stick are hidden by
+  design (hold **L+R** to show them at full opacity). Throttled `[input] wheel miss ...`
+  diagnostics included; proper steering fix pending. On foot, D-Pad/stick movement works.
 - **Lifecycle hooks not wired**: `nativePause`/`nativeResume`/`nativeAccelerometer`/`nativeDone`/
   `nativeOpenIGM`/`nativeCanInterrupt` are exported by the `.so` but not yet called from `main.c`
   — no suspend/resume or in-game menu integration yet.
