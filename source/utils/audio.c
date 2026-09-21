@@ -292,7 +292,13 @@ typedef struct {
     double frac_pos;              /* fractional read position within buf */
     int eof;                      /* stream exhausted, non-looping: drain then stop */
     int pending_open;             /* reserved by audio_play_big(), fopen()/ov_open()
-                                    * not done yet -- see the request queue below. */
+                                     * not done yet -- see the request queue below. */
+    unsigned open_gen;            /* Fase 59: bumped on every reserve AND every
+                                     * stop, so the mixer thread can tell a
+                                     * stale in-flight open (stop arrived
+                                     * mid-ov_open) from the request it was
+                                     * opened for -- see pending_big_req_t.gen
+                                     * and the mixer drain loop. */
 } big_voice_t;
 
 static big_voice_t big_voices[MAX_BIG_VOICES];
@@ -382,6 +388,9 @@ typedef struct {
     int slot;   /* big_voices[] slot already reserved (pending_open=1) by the caller */
     float volume;
     int loop;
+    unsigned gen; /* big_voices[slot].open_gen at reserve time -- the mixer
+                   * only activates the opened handle if this still matches
+                   * (a stop in between bumps open_gen and voids it). */
 } pending_big_req_t;
 
 static pending_sfx_req_t pending_sfx[MAX_PENDING_SFX];
@@ -463,6 +472,7 @@ static int audio_mix_thread(SceSize argc, void *argv) {
         int big_slots[MAX_PENDING_BIG];
         float big_vols[MAX_PENDING_BIG];
         int big_loops[MAX_PENDING_BIG];
+        unsigned big_gens[MAX_PENDING_BIG];
         int big_req_n;
 
         sceKernelLockMutex(audio_mutex, 1, NULL);
@@ -474,6 +484,7 @@ static int audio_mix_thread(SceSize argc, void *argv) {
             big_slots[i] = pending_big[i].slot;
             big_vols[i] = pending_big[i].volume;
             big_loops[i] = pending_big[i].loop;
+            big_gens[i] = pending_big[i].gen;
         }
         pending_big_count = 0;
         sceKernelUnlockMutex(audio_mutex, 1);
@@ -513,14 +524,39 @@ static int audio_mix_thread(SceSize argc, void *argv) {
 
         for (int i = 0; i < big_req_n; i++) {
             big_voice_t *v = &big_voices[big_slots[i]];
+            /* Fase 59: pre-flight revalidate -- a stop (or a newer play
+             * that stole the slot) may have voided this request while it
+             * sat queued. Skipping the open entirely then is free. */
+            int current = 0;
+            sceKernelLockMutex(audio_mutex, 1, NULL);
+            current = v->pending_open && v->open_gen == big_gens[i];
+            sceKernelUnlockMutex(audio_mutex, 1);
+            if (!current)
+                continue;
             int ok = big_open(v, v->index) == 0;
             sceKernelLockMutex(audio_mutex, 1, NULL);
-            v->pending_open = 0;
-            if (ok) {
-                v->vol = big_vols[i];
-                v->loop = big_loops[i] ? 1 : 0;
-                v->paused = 0;
-                v->active = 1;
+            if (v->pending_open && v->open_gen == big_gens[i]) {
+                /* Still ours: activate (or drop a failed open). */
+                v->pending_open = 0;
+                if (ok) {
+                    v->vol = big_vols[i];
+                    v->loop = big_loops[i] ? 1 : 0;
+                    v->paused = 0;
+                    v->active = 1;
+                }
+            } else if (ok) {
+                /* A stop (or a newer reserve) landed mid-open: release
+                 * the fresh handle WITHOUT touching the slot's current
+                 * state -- big_close() would also clear a newer
+                 * reservation's pending_open. */
+                ov_clear(&v->vf);
+                v->opened = 0;
+                v->f = NULL;
+                if (!v->pending_open) {
+                    v->buf_frames = 0;
+                    v->frac_pos = 0.0;
+                    v->eof = 0;
+                }
             }
             sceKernelUnlockMutex(audio_mutex, 1);
         }
@@ -919,10 +955,12 @@ void audio_play_big(int index, float volume, int loop) {
         big_close(v); /* release the old ov handle before handing this slot to the mixer thread */
     v->pending_open = 1;
     v->index = index;
+    v->open_gen++; /* new reservation epoch -- voids any in-flight open */
     if (pending_big_count < MAX_PENDING_BIG) {
         pending_big[pending_big_count].slot = slot;
         pending_big[pending_big_count].volume = volume;
         pending_big[pending_big_count].loop = loop;
+        pending_big[pending_big_count].gen = v->open_gen;
         pending_big_count++;
     } else {
         /* Can't happen in practice (MAX_PENDING_BIG == MAX_BIG_VOICES, at
@@ -956,11 +994,25 @@ void audio_resume_big(int index) {
 }
 
 void audio_stop_big(int index) {
+    /* Fase 59: a stop also cancels a still-pending open (and voids an
+     * in-flight ov_open via the generation bump) -- previously a stop
+     * arriving during the deferred-open window was a silent no-op and
+     * the stream started anyway right after, which is exactly the
+     * stopRadio/playRadio churn the engine falls into when it polls
+     * state per frame (log 058 while driving). */
     sceKernelLockMutex(audio_mutex, 1, NULL);
-    for (int i = 0; i < MAX_BIG_VOICES; i++)
-        if (big_voices[i].active &&
-            (index < 0 || big_voices[i].index == index))
-            big_close(&big_voices[i]);
+    for (int i = 0; i < MAX_BIG_VOICES; i++) {
+        big_voice_t *v = &big_voices[i];
+        if (index >= 0 && v->index != index)
+            continue;
+        if (v->pending_open) {
+            cancel_pending_big_locked(i);
+            v->pending_open = 0;
+            v->open_gen++;
+        }
+        if (v->active)
+            big_close(v);
+    }
     sceKernelUnlockMutex(audio_mutex, 1);
 }
 
@@ -982,10 +1034,18 @@ int audio_is_loaded_big(int index) {
 }
 
 int audio_is_media_playing(int index) {
+    /* Fase 59: a slot with a still-pending open counts as playing.
+     * SoundManager::update() polls this every frame and re-issues
+     * playRadio/playSound on "not playing" -- reporting 0 during the
+     * deferred-open window (~one mixer tick) is what kept the engine
+     * re-firing stop+play pairs back-to-back (log 058: dozens of
+     * consecutive stopRadio/playRadio lines while driving). The open
+     * WILL complete (or be cancelled by a real stop), so answering 1
+     * here settles the retry loop instead of feeding it. */
     int playing = 0;
     sceKernelLockMutex(audio_mutex, 1, NULL);
     for (int i = 0; i < MAX_BIG_VOICES; i++)
-        if (big_voices[i].active && !big_voices[i].paused &&
+        if ((big_voices[i].active || big_voices[i].pending_open) && !big_voices[i].paused &&
             (index < 0 || big_voices[i].index == index)) {
             playing = 1;
             break;
@@ -1006,9 +1066,17 @@ void audio_stop_all(void) {
     sceKernelLockMutex(audio_mutex, 1, NULL);
     for (int i = 0; i < MAX_SFX_VOICES; i++)
         sfx_voices[i].active = 0;
-    for (int i = 0; i < MAX_BIG_VOICES; i++)
+    for (int i = 0; i < MAX_BIG_VOICES; i++) {
+        /* Fase 59: same pending-cancel as audio_stop_big -- a queued or
+         * in-flight open must not start playing after a stop-all. */
+        if (big_voices[i].pending_open) {
+            cancel_pending_big_locked(i);
+            big_voices[i].pending_open = 0;
+            big_voices[i].open_gen++;
+        }
         if (big_voices[i].active)
             big_close(&big_voices[i]);
+    }
     sceKernelUnlockMutex(audio_mutex, 1);
 }
 

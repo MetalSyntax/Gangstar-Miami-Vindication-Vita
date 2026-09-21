@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Title%20ID-PSVGMV002-ff69b4.svg?style=flat-square" alt="Title ID PSVGMV002" />
   <img src="https://img.shields.io/badge/Engine-Glitch%20Engine%200.1.0.2-brightgreen.svg?style=flat-square" alt="Engine" />
   <img src="https://img.shields.io/badge/Renderer-vitaGL%20%28GLES%201.1%29-orange.svg?style=flat-square" alt="Renderer" />
-  <img src="https://img.shields.io/badge/Status-Playable%20(WIP)-yellow.svg?style=flat-square" alt="Status: Playable, work in progress" />
+  <img src="https://img.shields.io/badge/Status-Alpha%20(test%20build)-red.svg?style=flat-square" alt="Status: Alpha, test build" />
 </p>
 
 ---
@@ -29,15 +29,31 @@ rendering backend. The `.so` has no `JNI_OnLoad`/`RegisterNatives` — every JNI
 resolved by symbol name and invoked by hand, following the exact lifecycle order of the real
 Android Activity/Renderer.
 
-### 🎮 Current Status: Playable (Work in Progress)
+### 🎮 Current Status: Alpha test build — relatively playable, not finished
 
-The game boots, renders, and reaches real third-person gameplay — driving, on-foot, vehicle entry —
-at **20-30 fps**. It got there through a long bug-by-bug history (format-string crashes, a missing
-`HAVE_SOFTFP_ABI` causing an all-black screen, a circular-pool GPU stall dragging it to ~9 fps,
-among others); see [`port_progress.md`](port_progress.md) for the full diagnosis log, one confirmed
-bug at a time, and [`PORTING_PLAN.md`](PORTING_PLAN.md) for the living engine/JNI map.
+The game boots, renders, and reaches real third-person gameplay — driving, on-foot, vehicle
+entry — and is **relatively playable as a test build**, but it is an **alpha**: expect FPS drops,
+visual glitches, and unconfirmed fixes (see "Known Issues" below and
+[`RELEASES.md`](RELEASES.md) for the per-release breakdown of what is proven on hardware vs.
+what still needs confirmation).
 
-It is **not yet polished** — see "Known Issues" below.
+It got here through a long bug-by-bug history (format-string crashes, a missing `HAVE_SOFTFP_ABI`
+causing an all-black screen, a circular-pool GPU stall dragging it to ~9 fps, among others); see
+[`port_progress.md`](port_progress.md) for the full diagnosis log, one confirmed bug at a time,
+and [`PORTING_PLAN.md`](PORTING_PLAN.md) for the living engine/JNI map.
+
+#### ✅ Confirmed on real hardware (log 059 and earlier)
+- Boots to warning screen, menus (~60 fps), and open gameplay on foot and driving.
+- Physical controls drive the game (attack/accelerate/brake/enter-car/cover/sprint + D-Pad/stick
+  movement all log their synthesized touches and act in-game).
+- Radio/music retry-loop settled: `stopRadio`/`playRadio` now fire on events only, not per frame.
+- Intro cutscene plays from the original `intro.m4v` at full 800x500 resolution, fullscreen.
+
+#### 🧪 NOT yet confirmed on hardware (latest changes, need testing)
+- Low-End device profile + bigger vitaGL pool + audio pre-demux (Fase 60): built green, awaiting
+  a console run to prove the 1 fps wells are gone.
+- Virtual buttons fully invisible while pressed/held (needs eyes on screen, L+R restores them).
+- Steering the wheel with D-Pad/stick in all driving skins (diagnostic logging added; fix pending).
 
 ### ✨ What Works
 
@@ -49,28 +65,59 @@ It is **not yet polished** — see "Known Issues" below.
 - **Audio**: Real backend (`sceAudioOut` + `libvorbisfile`) — short SFX decoded and cached, up to
   8+4 concurrent streamed voices for music/radio/voice with looping, independent music/SFX/VFX
   gain control.
-- **Intro cutscene**: Plays via `SceAvPlayer` (hardware H.264 decoder), letterboxed to the full
-  panel, skippable with Cross/Start. Note: the original `intro.m4v` ships as MPEG-4 Part 2, which
-  the Vita's hardware decoder cannot play — see "Known Issues" below. The original asset is never
-  altered by this project.
-- **Touch + physical input**: Front touchscreen mapped to the engine's multi-touch slots, D-Pad/
-  Cross/Circle/Start mapped to the same Android keycodes the real device's keyboard would send.
+- **Intro cutscene**: Plays the original `intro.m4v` **as shipped** (MPEG-4 Part 2, 800x500)
+  via a software FFmpeg decoder (`libavcodec`/`libswresample`, no transcodes — the Vita's hardware
+  decoder only handles H.264 and this project never alters original assets). Decoded at full
+  resolution and stretched to the full 960x544 panel, with its AAC audio in sync, skippable with
+  Cross/Start.
+- **Touch + physical input**: Front touchscreen mapped to the engine's multi-touch slots. Physical
+  controls drive the game by synthesizing real touches on the engine's own HUD widgets — no touch
+  needed:
+  | Vita control | On foot | In vehicle |
+  |---|---|---|
+  | Cross | Attack | Accelerate |
+  | Circle | Sprint | Brake |
+  | Triangle | Enter car / Enter shop | Exit car |
+  | Square | Take cover | — |
+  | L / R triggers | — | Brake / Accelerate |
+  | D-Pad / Left stick | Move (analog drag) | Steer the wheel (rim-grab gesture) |
+  | Start | Pause menu | Pause menu |
+  | L+R held | Show the hidden touch buttons (100%) | Same |
+- **Hidden touch buttons**: The on-screen virtual buttons/wheel/stick are hidden every frame
+  (draw-skipped, ~1% alpha fallback) so they never flash or flicker when pressed, held, or when
+  the HUD changes state. Hold **L+R** to bring them back at full opacity at any time.
 - **Overclocked + tuned for the Cortex-A9**: CPU/Bus/GPU/GPU-Xbar clocks at their ceiling, NEON
   codegen, a tuned vitaGL speedhack set, and in-memory caches for path translation and sound
   existence checks to cut down on SD-card I/O during gameplay.
 
-### ⚠️ Known Issues
+### ⚠️ Known Issues (alpha — full list in [`RELEASES.md`](RELEASES.md))
 
+**Performance / FPS drops**
+- **Wells down to ~1 fps while driving in the open world.** The world working set exhausts GPU
+  memory on 4 MB texture uploads; each miss costs a ~4.2 s driver stall (frames at 2-7 fps).
+  Fase 60 attacks it with the game's own Low-End profile + a bigger vitaGL pool — **unconfirmed**,
+  awaiting a console run. Between wells the game runs ~13-31 fps driving, ~60 fps in menus.
+- **One-time stalls:** ~8 s on the second engine frame after the intro (`Application::PostInit`),
+  shader-compile bursts at the title screen / first vehicle load (frames of 0.5-16 s). Engine-side
+  init on the render thread — not skippable from the loader; the on-disk shader cache makes repeat
+  runs faster.
+
+**Graphics**
 - **Some characters/vehicles can render solid black.** Under investigation — a vitaGL vertex-data
-  speedhack racing the GPU on large meshes was ruled out on real hardware (removing it only cost
-  performance); the current suspect is a matrix-math speedhack that can silently drop the active
-  matrix stack for `glOrtho`/`glFrustum` (see `port_progress.md`, latest phase).
-- **Intro cutscene shows no video** with the original `intro.m4v` (MPEG-4 Part 2 — the Vita's
-  hardware video decoder only supports H.264/AVC). This project does not transcode or otherwise
-  alter original game assets; audio and the rest of the boot sequence are unaffected.
-- **Multi-second freeze the first time a vehicle (or new area) loads.** Same class of one-time
-  shader-compile/asset-load stall already seen at the title screen; the on-disk shader cache
-  should make repeat loads of the same asset fast.
+  speedhack racing the GPU was ruled out on hardware; the current suspect is a matrix-math
+  speedhack that can silently drop the active matrix stack for `glOrtho`/`glFrustum`.
+- **Flatter look, no shadows (since Fase 60, unconfirmed):** the Low-End profile disables dynamic
+  lighting, shadows, far water and the retro effect to save GPU. Reversible in one line if it
+  looks unacceptable once the FPS wells are confirmed gone.
+- **Intro stretched ~10% horizontally** (800x500 → 960x544 fullscreen, on purpose) and its AAC
+  audio can lag/drop at full resolution (pre-demux added in Fase 60, unconfirmed). Skippable with
+  Cross/Start.
+
+**Controls**
+- **Steering the wheel with D-Pad/stick doesn't turn it in some driving skins** (confirmed in log
+  059: the wheel exists and passes the interactable gate, but its touch center falls outside the
+  engine's 960x480 band). Throttled `[input] wheel miss ...` diagnostics included; proper fix
+  pending. On foot, D-Pad/stick movement works.
 - **Lifecycle hooks not wired**: `nativePause`/`nativeResume`/`nativeAccelerometer`/`nativeDone`/
   `nativeOpenIGM`/`nativeCanInterrupt` are exported by the `.so` but not yet called from `main.c`
   — no suspend/resume or in-game menu integration yet.
@@ -150,6 +197,8 @@ crash-dump parsing), use **psvita-port-toolkit** instead of raw `cmake`/`make`.
   plus `cpuinfo`/`meminfo` and debug scripts.
 - `PORTING_PLAN.md`: Living plan — confirmed engine findings, JNI export table, checklist.
 - `port_progress.md`: Bug-by-bug diagnosis log, one confirmed bug at a time.
+- `RELEASES.md`: Test-build release notes — what each alpha proves on hardware, all known
+  performance/graphics/FPS errors, and what is still unconfirmed.
 
 ---
 

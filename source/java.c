@@ -427,7 +427,22 @@ jint Method_getDeviceWidth(jmethodID id, va_list args) { return 960; }
 // GetDeviceType() -> int. Android branched on Build.MANUFACTURER (motorola=1,
 // samsung=2, htc=3, motorola Droid/Milestone=4) and returned -1 for anything
 // else -- which is what the Vita is.
-jint Method_GetDeviceType(jmethodID id, va_list args) { return -1; }
+//
+// Fase 60: report 4 ("Motorola Low End") instead of -1. -1 takes none of the
+// GS3DStuff::loadPerformanceProfile() overrides (out_ghidra.c:27207-27273),
+// leaving the profile FILE's values standing -- and log 059 proves that
+// working set does not fit this hardware: driving through the open world
+// exhausts GPU memory on 4 MB texture allocs, and each miss costs a ~4.2 s
+// unsafe-GC stall (frames at 2-7 fps, unplayable). Return 4 selects the
+// game's OWN weakest shipping configuration: object spawn caps to 1
+// (211067-211085), world streaming radius to 6000 (also gStreamingRadius,
+// 25511), far plane 13000, and shadows / dynamic lighting / far water /
+// retro effect off. Fewer live objects + a smaller streamed world = fewer
+// and smaller GPU uploads per frame, which is exactly the pressure the
+// 059 wells show. Costs some visuals (flatter lighting, no shadows); one
+// line to revert if a future log shows the wells gone but the look
+// unacceptable.
+jint Method_GetDeviceType(jmethodID id, va_list args) { (void)id; (void)args; return 4; }
 
 // GetDeviceSoundType() -> int. AudioManager.getRingerMode();
 // RINGER_MODE_NORMAL == 2, i.e. sound enabled.

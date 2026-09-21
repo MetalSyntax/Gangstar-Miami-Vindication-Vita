@@ -101,7 +101,11 @@ void gamepad_actions_update(uint32_t buttons, uint32_t old_buttons);
  * Synthesizes a touch-DOWN/MOVE/UP drag on the engine's on-screen movement
  * AnalogStick widget (CHudManager+0x28) -- the D-pad acts as a full-deflection
  * override per axis, the analog stick as continuous deflection with a
- * deadzone. This is what makes physical movement input work at all: the
+ * deadzone. In a vehicle the same inputs steer the Wheel widget
+ * (CHudManager+0x2c, SlideControl +0x54/+0x58 as alternate) with the real
+ * finger gesture: grab near the top of the rim, curve down-left/down-right
+ * (Fase 58). Virtual buttons are hidden at ~1% opacity every frame
+ * (L+R restores 100%) -- physical controls drive, no touch needed. This is what makes physical movement input work at all: the
  * engine has no keycode-based movement path (Fase 47), only this HUD widget's
  * own drag tracking (AnalogStick::processTouch, via TouchScreenBase pointer-id
  * capture -- same touch relay `gamepad_actions_update()` already uses for

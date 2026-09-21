@@ -18,7 +18,9 @@
 #include "utils/logger.h"
 
 #include <psp2/ctrl.h>
+#include <psp2/kernel/processmgr.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include <so_util/so_util.h>
 
@@ -171,6 +173,7 @@ static struct pad_action s_actions[] = {
 #define GA_OFF_ANALOGSTICK 0x28
 #define GA_OFF_WHEEL       0x2c
 #define GA_OFF_SLIDECONTROL 0x54
+#define GA_OFF_SLIDECONTROL2 0x58
 
 /*
  * Touch-control opacity. `HudElement::HudElement(ASprite*, int, bool)`
@@ -234,8 +237,25 @@ static struct pad_action s_actions[] = {
  */
 #define GA_ALPHA_OFFSET      0x34
 #define GA_ALPHA_INT_OFFSET  0x54  /* this+0x54: int mirror setAlpha() itself writes/reads */
-#define GA_ALPHA_DEFAULT     100   /* engine's own default, confirmed above */
-#define GA_ALPHA_BOOST       3     /* +1% of the 0..255 range, requested bump */
+
+/* Draw-visibility flag word (this+0x8, bit31). Fase 59: this is the REAL
+ * hide switch -- every touch-widget draw2d() in the binary gates its
+ * whole PaintFrame on it (HudElement::draw2d, AnalogStick::draw2d,
+ * SlideControl::draw2d AND Wheel::draw2d all start with
+ * `if (*(this+8) << 31 < 0)`, verified in out_ghidra.c), while every
+ * touch/input path gates on this+0xc instead (VirtualButton::update and
+ * AnalogStick::update check in_r0[3]<<31, isVisible() returns
+ * *(this+0xc)&1, processTouch needs bit0). So clearing this bit hides
+ * the widget from the renderer every frame -- immune to the pressed
+ * branch (setAlpha writes 0x54=0xff for ANY flags&6 != 4, i.e. no flag
+ * combination can hide a pressed widget through alpha) and to the
+ * processTouchRelease direct 0x54=0xff write -- while synthesized and
+ * real touches keep working untouched. L+R sets it back (fully visible
+ * + touchable, the pre-Fase-54 look). */
+#define GA_DRAWVIS_OFFSET    0x8
+#define GA_DRAWVIS_BIT       0x80000000u
+#define GA_ALPHA_HIDDEN      3     /* Fase 58: ~1% of the 0..255 range (1% = 2.55) -- virtual
+                                    * buttons hidden by request, physical controls drive */
 #define GA_ALPHA_FULL        255
 #define GA_ALPHA_COMBO_MASK  (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER)
 
@@ -246,7 +266,7 @@ static const int s_alpha_quad_offsets[] = { 0x47, 0x4b, 0x4f, 0x53 };
 #define GA_NALPHA_QUAD_OFFSETS (sizeof(s_alpha_quad_offsets) / sizeof(s_alpha_quad_offsets[0]))
 
 static const int s_alpha_offsets[] = {
-    GA_OFF_ANALOGSTICK, GA_OFF_WHEEL, GA_OFF_SLIDECONTROL,
+    GA_OFF_ANALOGSTICK, GA_OFF_WHEEL, GA_OFF_SLIDECONTROL, GA_OFF_SLIDECONTROL2,
     0x30, 0x34, 0x38, 0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x5c, 0x60, 0x64, 0x68, 0x6c, 0x70,
 };
 #define GA_NALPHA_OFFSETS (sizeof(s_alpha_offsets) / sizeof(s_alpha_offsets[0]))
@@ -401,9 +421,13 @@ static int stick_region(int *cx, int *cy, float *rx, float *ry) {
     return (*cx >= 0 && *cx < GA_ENGINE_W && *cy >= 0 && *cy < GA_ENGINE_H);
 }
 
-/* Locates CHudManager+GA_OFF_WHEEL (or GA_OFF_SLIDECONTROL if using slider steering),
- * runs the interactable gate (+0x14), and fills *cx/*cy (region center) and
- * *rx/*ry in engine touch pixels. Returns 1 if interactable, 0 if hidden (e.g. on foot). */
+/* Locates CHudManager+GA_OFF_WHEEL (or either SlideControl alternate at
+ * +0x54/+0x58 if the wheel skin itself is hidden), runs the interactable
+ * gate (+0x14), and fills *cx/*cy (region center) and *rx/*ry in engine
+ * touch pixels. Returns 1 if interactable, 0 if hidden (e.g. on foot).
+ * Fase 58: the second SlideControl at +0x58 is now a candidate too -- the
+ * old code only tried +0x54, so a driving skin steering through +0x58 was
+ * never found and the wheel "didn't move". */
 static int wheel_region(int *cx, int *cy, float *rx, float *ry) {
     if (!screen_scale_ready())
         return 0;
@@ -417,8 +441,8 @@ static int wheel_region(int *cx, int *cy, float *rx, float *ry) {
     if (!(fx > 0.0f && fy > 0.0f))
         return 0;
 
-    const int offs[] = { GA_OFF_WHEEL, GA_OFF_SLIDECONTROL };
-    for (int i = 0; i < 2; i++) {
+    const int offs[] = { GA_OFF_WHEEL, GA_OFF_SLIDECONTROL, GA_OFF_SLIDECONTROL2 };
+    for (int i = 0; i < 3; i++) {
         void *wheel = *(void **)((char *)hud + offs[i]);
         if (!wheel)
             continue;
@@ -449,27 +473,94 @@ static int clampi(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-/* Writes the current target alpha (boosted default, or full while the L+R
- * combo is held) into every touch control's this+0x34 floor AND directly
- * into its this+0x54 mirror and its 4 RGBA quads' alpha bytes (see the big
- * comment above `GA_ALPHA_OFFSET` for why both are needed: this+0x34 alone
- * covers every setAlpha() branch a widget reaches in its normal idle state,
- * but the "actively pressed" branch skips re-deriving the quad bytes from
- * this+0x34 for that frame, so we stamp them ourselves too). No screen-scale
- * gate needed here (unlike pad_press/stick_region/wheel_region) -- this only
- * touches each widget's own alpha fields, not Application::GetScreenScaleFactors(). */
+/* Fase 59: steering input is present but NO wheel/slide candidate passed
+ * the lookup -- log WHY, throttled to one line per 5s of wall time (never
+ * per frame: logging changes timing under test). Log 058 proved the
+ * symptom (DeviceKeyInput:21/22 while driving with zero "wheel down"
+ * lines) but not which lookup step fails per skin (null widget? +0x14
+ * gate? degenerate rect? out-of-range center?), so this line carries all
+ * three per candidate: ptr=0/1 gate=0/1 + the raw design rect. One line
+ * per 5s is enough to catch every driving skin the user tries. */
+static void wheel_miss_diag(float nx) {
+    static uint64_t last_us = 0;
+    uint64_t now = sceKernelGetProcessTimeWide();
+    if (last_us != 0 && now - last_us < 5000000)
+        return;
+    last_us = now;
+
+    CHudManagerPtr hud = s_hudManagerAddr ? *s_hudManagerAddr : NULL;
+    if (!hud) {
+        l_note("[input] wheel miss (nx=%.2f): hud=NULL", nx);
+        return;
+    }
+    float fx = 0.0f, fy = 0.0f;
+    if (screen_scale_ready())
+        s_getScale(s_getInstance(), &fx, &fy);
+
+    static const int offs[] = { GA_OFF_WHEEL, GA_OFF_SLIDECONTROL, GA_OFF_SLIDECONTROL2 };
+    char detail[192];
+    int pos = 0;
+    for (int i = 0; i < 3 && pos < (int)sizeof(detail) - 32; i++) {
+        void *w = *(void **)((char *)hud + offs[i]);
+        int has = (w != NULL);
+        int gate = 0;
+        float rect[4] = { 0, 0, 0, 0 };
+        if (has) {
+            void **vt = *(void ***)w;
+            gate_fn g = (gate_fn)vt[GA_VT_GATE];
+            gate = (g && g(w)) ? 1 : 0;
+            if (gate) {
+                region_fn r = (region_fn)vt[GA_VT_REGION];
+                if (r) {
+                    r(rect, w);
+                    if (!(rect[2] > rect[0] && rect[3] > rect[1]))
+                        gate = 2;  /* gate ok, rect degenerate */
+                } else {
+                    gate = 3;  /* gate ok, no region fn */
+                }
+            }
+        }
+        pos += snprintf(detail + pos, sizeof(detail) - (size_t)pos,
+                        "%s+0x%x:ptr=%d gate=%d rect=(%.0f,%.0f,%.0f,%.0f)",
+                        i ? " " : "", offs[i], has, gate,
+                        rect[0], rect[1], rect[2], rect[3]);
+    }
+    l_note("[input] wheel miss (nx=%.2f, scale=%.2fx%.2f): %s", nx, fx, fy, detail);
+}
+
+/* Hides (or, with L+R held, restores) every touch control, every frame.
+ * Fase 59: two layers. (1) The draw-visibility bit (this+8 bit31, see
+ * GA_DRAWVIS_OFFSET): cleared = draw2d() skips the widget entirely, no
+ * PaintFrame at all -- this is what keeps buttons hidden "aunque cambie
+ * de estado", because NO alpha value can do that: setAlpha()'s pressed
+ * branch (raw disasm 2baa50-2baa5c: any flags&6 != 4) forces 0x54=0xff
+ * every held frame, and VirtualButton::processTouchRelease() writes
+ * 0x54=0xff directly on every release, both AFTER our poke runs. Touch
+ * dispatch is unaffected: it gates on this+0xc (update/isVisible/
+ * processTouch), a different word we never touch. (2) The alpha stamps
+ * (this+0x34 floor, this+0x54 mirror, 4 quad bytes) stay as
+ * belt-and-suspenders for any draw path that doesn't go through the
+ * draw2d gate. No screen-scale gate needed here (unlike
+ * pad_press/stick_region/wheel_region) -- this only touches each
+ * widget's own fields, not Application::GetScreenScaleFactors(). */
 static void apply_touch_alpha(void) {
     CHudManagerPtr hud = *s_hudManagerAddr;
     if (!hud)
         return;
 
-    uint32_t alpha = s_alphaFull ? GA_ALPHA_FULL : (GA_ALPHA_DEFAULT + GA_ALPHA_BOOST);
+    uint32_t alpha = s_alphaFull ? GA_ALPHA_FULL : GA_ALPHA_HIDDEN;
     uint8_t alphaByte = (uint8_t)alpha;
 
     for (unsigned i = 0; i < GA_NALPHA_OFFSETS; i++) {
         void *widget = *(void **)((char *)hud + s_alpha_offsets[i]);
         if (!widget)
             continue;
+
+        uint32_t *drawvis = (uint32_t *)((char *)widget + GA_DRAWVIS_OFFSET);
+        if (s_alphaFull)
+            *drawvis |= GA_DRAWVIS_BIT;   /* L+R: visible again */
+        else
+            *drawvis &= ~GA_DRAWVIS_BIT;  /* hidden: draw2d() skips PaintFrame */
 
         *(uint32_t *)((char *)widget + GA_ALPHA_OFFSET) = alpha;
         *(uint32_t *)((char *)widget + GA_ALPHA_INT_OFFSET) = alpha;
@@ -498,15 +589,88 @@ void gamepad_stick_update(uint32_t dpad_buttons, uint8_t lx, uint8_t ly) {
 
     int want_active = (nx != 0.0f || ny != 0.0f);
 
-    /* 1. On-foot / sniper: AnalogStick movement */
-    int cx, cy; float rx, ry;
-    if (stick_region(&cx, &cy, &rx, &ry)) {
-        if (s_wheelStick.active) {
-            s_touch(&jni, NULL, 0, s_wheelStick.last_x, s_wheelStick.last_y, (jlong)s_wheelStick.slot, 0, 0);
-            l_note("[input] wheel up (slot %d)", s_wheelStick.slot);
-            s_wheelStick.active = 0;
+    /* Fase 58: query BOTH widgets up front. On foot the movement AnalogStick
+     * is interactable and the Wheel is hidden, in a vehicle it is the other
+     * way around -- but during HUD transitions both gates can briefly report
+     * interactable, and the old code checked the stick first, so a stale
+     * stick gate starved the wheel (user report: cruceta never turned the
+     * wheel). Steering (nx) therefore goes to the wheel whenever the wheel
+     * is interactable, regardless of what the stick gate says. */
+    int scx, scy; float srx, sry;
+    int stick_ok = stick_region(&scx, &scy, &srx, &sry);
+    int wcx, wcy; float wrx, wry;
+    int wheel_ok = wheel_region(&wcx, &wcy, &wrx, &wry);
+
+    /* Fase 59: steering deflection with neither widget interactable --
+     * diagnose (throttled) instead of silently dropping it. On foot this
+     * stays quiet (the move-stick takes nx); in a vehicle with a hidden
+     * stick it pinpoints which wheel-lookup step fails per driving skin. */
+    if (nx != 0.0f && !wheel_ok && !stick_ok)
+        wheel_miss_diag(nx);
+
+    /* 1. In vehicle: steering wheel / slide control, driven with the real
+     * finger gesture -- grab near the top of the wheel rim and curve
+     * down-left / down-right like a real steering wheel.
+     *
+     * Wheel::processTouch() (out_ghidra.c) only reads deltaX =
+     * first.x - current.x (dir = sign, amount = |dx| / *(this+0x68), with
+     * 0x68 = 0x46 = 70px for full lock -- the Wheel ctor hardcodes it), so
+     * the X component below is what actually steers: DOWN lands near the
+     * top of the wheel region (cx, cy - 0.7*ry, clamped inside so the DOWN
+     * hit-tests onto the widget), then MOVE goes to
+     * (down_x + nx*85, down_y + 50*|nx|). +-85px in X clears the 70px full-
+     * lock threshold on digital input and stays proportional on the analog
+     * stick; the +50px downward curve replicates the real finger path and
+     * also exercises the Y axis for the SlideControl steering alternate
+     * (its processTouch reads both axes depending on the mode at this+0x68).
+     * Pointer-id capture (same as the AnalogStick, Fase 51) keeps routing
+     * MOVEs to the wheel once the DOWN lands, so drifting outside the drawn
+     * region is fine -- exactly what a real thumb does past the rim. */
+    if (wheel_ok && nx != 0.0f) {
+        if (s_moveStick.active) {
+            s_touch(&jni, NULL, 0, s_moveStick.last_x, s_moveStick.last_y, (jlong)s_moveStick.slot, 0, 0);
+            l_note("[input] move-stick up (slot %d)", s_moveStick.slot);
+            s_moveStick.active = 0;
         }
 
+        if (!s_wheelStick.active) {
+            /* DOWN = grab point near the top of the rim. Stored in cx/cy
+             * (fixed for the whole drag); tx/ty below derive from it. */
+            s_wheelStick.cx = wcx;
+            s_wheelStick.cy = clampi((int)(wcy - wry * 0.7f), 0, GA_ENGINE_H - 1);
+            s_wheelStick.rx = wrx;
+            s_wheelStick.ry = wry;
+            s_wheelStick.last_x = s_wheelStick.cx;
+            s_wheelStick.last_y = s_wheelStick.cy;
+            s_touch(&jni, NULL, 1, s_wheelStick.cx, s_wheelStick.cy, (jlong)s_wheelStick.slot, 0, 0);
+            s_wheelStick.active = 1;
+            l_note("[input] wheel down @(%d,%d) slot %d", s_wheelStick.cx, s_wheelStick.cy, s_wheelStick.slot);
+        }
+
+        /* nx > 0 (right) -> tx > down_x -> first.x - current.x < 0 -> dir=0 (right)
+         * nx < 0 (left)  -> tx < down_x -> first.x - current.x > 0 -> dir=1 (left)
+         * ty always grows downward, curving like a real wheel turn. */
+        float ax = nx < 0.0f ? -nx : nx;
+        int tx = clampi((int)(s_wheelStick.cx + nx * 85.0f), 0, GA_ENGINE_W - 1);
+        int ty = clampi((int)(s_wheelStick.cy + ax * 50.0f), 0, GA_ENGINE_H - 1);
+        if (tx != s_wheelStick.last_x || ty != s_wheelStick.last_y) {
+            s_touch(&jni, NULL, 2, tx, ty, (jlong)s_wheelStick.slot, 0, 0);
+            s_wheelStick.last_x = tx;
+            s_wheelStick.last_y = ty;
+            l_debug("[input] wheel move @(%d,%d) nx=%.2f", tx, ty, nx);
+        }
+        return;
+    }
+
+    /* No steering input (or wheel hidden now): center the wheel if held. */
+    if (s_wheelStick.active) {
+        s_touch(&jni, NULL, 0, s_wheelStick.last_x, s_wheelStick.last_y, (jlong)s_wheelStick.slot, 0, 0);
+        l_note("[input] wheel up (slot %d)", s_wheelStick.slot);
+        s_wheelStick.active = 0;
+    }
+
+    /* 2. On-foot / sniper: AnalogStick movement (unchanged, Fase 51). */
+    if (stick_ok) {
         if (!want_active) {
             if (s_moveStick.active) {
                 s_touch(&jni, NULL, 0, s_moveStick.last_x, s_moveStick.last_y, (jlong)s_moveStick.slot, 0, 0);
@@ -517,16 +681,16 @@ void gamepad_stick_update(uint32_t dpad_buttons, uint8_t lx, uint8_t ly) {
         }
 
         if (!s_moveStick.active) {
-            s_moveStick.cx = cx;
-            s_moveStick.cy = cy;
-            s_moveStick.rx = rx;
-            s_moveStick.ry = ry;
-            s_moveStick.last_x = cx;
-            s_moveStick.last_y = cy;
-            s_touch(&jni, NULL, 1, cx, cy, (jlong)s_moveStick.slot, 0, 0);
+            s_moveStick.cx = scx;
+            s_moveStick.cy = scy;
+            s_moveStick.rx = srx;
+            s_moveStick.ry = sry;
+            s_moveStick.last_x = scx;
+            s_moveStick.last_y = scy;
+            s_touch(&jni, NULL, 1, scx, scy, (jlong)s_moveStick.slot, 0, 0);
             s_moveStick.active = 1;
             l_note("[input] move-stick down @(%d,%d) r=(%.0f,%.0f) slot %d",
-                   cx, cy, rx, ry, s_moveStick.slot);
+                   scx, scy, srx, sry, s_moveStick.slot);
         }
 
         /* A bit past the widget's own drawn radius (1.25x) so a fully-deflected
@@ -544,56 +708,11 @@ void gamepad_stick_update(uint32_t dpad_buttons, uint8_t lx, uint8_t ly) {
         return;
     }
 
-    /* Transitioning away from on-foot: release move-stick if active */
+    /* 3. Neither stick nor wheel is interactable: release move-stick if held. */
     if (s_moveStick.active) {
         s_touch(&jni, NULL, 0, s_moveStick.last_x, s_moveStick.last_y, (jlong)s_moveStick.slot, 0, 0);
         l_note("[input] move-stick up (slot %d)", s_moveStick.slot);
         s_moveStick.active = 0;
-    }
-
-    /* 2. In vehicle: steering wheel / slide control */
-    if (wheel_region(&cx, &cy, &rx, &ry)) {
-        int want_steer = (nx != 0.0f);
-        if (!want_steer) {
-            if (s_wheelStick.active) {
-                s_touch(&jni, NULL, 0, s_wheelStick.last_x, s_wheelStick.last_y, (jlong)s_wheelStick.slot, 0, 0);
-                l_note("[input] wheel up (slot %d)", s_wheelStick.slot);
-                s_wheelStick.active = 0;
-            }
-            return;
-        }
-
-        if (!s_wheelStick.active) {
-            s_wheelStick.cx = cx;
-            s_wheelStick.cy = cy;
-            s_wheelStick.rx = rx;
-            s_wheelStick.ry = ry;
-            s_wheelStick.last_x = cx;
-            s_wheelStick.last_y = cy;
-            s_touch(&jni, NULL, 1, cx, cy, (jlong)s_wheelStick.slot, 0, 0);
-            s_wheelStick.active = 1;
-            l_note("[input] wheel down @(%d,%d) slot %d", cx, cy, s_wheelStick.slot);
-        }
-
-        /* 85px deflection reaches full lock (engine threshold is 70px in Wheel+0x68).
-         * nx > 0 (right) -> tx > cx -> first.x - current.x < 0 -> dir=0 (right)
-         * nx < 0 (left)  -> tx < cx -> first.x - current.x > 0 -> dir=1 (left) */
-        int tx = clampi((int)(s_wheelStick.cx + nx * 85.0f), 0, GA_ENGINE_W - 1);
-        int ty = s_wheelStick.cy;
-        if (tx != s_wheelStick.last_x || ty != s_wheelStick.last_y) {
-            s_touch(&jni, NULL, 2, tx, ty, (jlong)s_wheelStick.slot, 0, 0);
-            s_wheelStick.last_x = tx;
-            s_wheelStick.last_y = ty;
-            l_debug("[input] wheel move @(%d,%d) nx=%.2f", tx, ty, nx);
-        }
-        return;
-    }
-
-    /* 3. Neither stick nor wheel is interactable */
-    if (s_wheelStick.active) {
-        s_touch(&jni, NULL, 0, s_wheelStick.last_x, s_wheelStick.last_y, (jlong)s_wheelStick.slot, 0, 0);
-        l_note("[input] wheel up (slot %d)", s_wheelStick.slot);
-        s_wheelStick.active = 0;
     }
 }
 
@@ -621,7 +740,7 @@ void gamepad_actions_update(uint32_t buttons, uint32_t old_buttons) {
     if (wantFull != s_alphaFull) {
         s_alphaFull = wantFull;
         l_note("[input] touch controls opacity -> %s (L+R %s)",
-               s_alphaFull ? "100%" : "default+1%", s_alphaFull ? "held" : "released");
+               s_alphaFull ? "100%" : "hidden ~1%", s_alphaFull ? "held" : "released");
     }
     apply_touch_alpha();
 

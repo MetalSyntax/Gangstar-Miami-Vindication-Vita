@@ -133,9 +133,24 @@ extern "C" {
  */
 #define VIDEO_FRAME_SLOTS 3
 
-// One AAC packet is 1024 samples (~23ms at 44.1kHz); 64 packets is ~1.5s of
-// slack so a frame-ring stall never starves audio output and clicks.
-#define AUDIO_PKT_QUEUE_CAP 64
+// Compressed audio packets, demuxed up front (see mp4_demux_audio_all()).
+// Sized for the whole AAC track plus slack: intro.m4v carries 367 audio
+// samples (~0.5-2 KB each compressed, <1 MB total), so the queue holds the
+// entire track and the decode thread never has to interleave audio demux
+// with heavy full-res video decode -- log 059 proved one thread doing
+// both starves audio (19 blocks out in 3.2 s, wall-clock fallback, 38%
+// frames dropped late). If a future asset has more samples than fit, the
+// pre-demux simply stops early and the decode thread keeps demuxing audio
+// from the cursor it left -- seamless, same code path as before.
+#define AUDIO_PKT_QUEUE_CAP 384
+
+// Demuxed-but-not-yet-decoded video packets (decode thread internal).
+// Fase 59: this queue is what decouples audio demuxing from video ring
+// backpressure -- see video_decode_thread(). 16 entries is plenty:
+// the decoder consumes one per EAGAIN and demux only tops it up, so it
+// stays nearly empty in steady state; each entry is one compressed
+// frame (tens of KB), not a converted frame.
+#define VIDEO_PKT_QUEUE_CAP 16
 
 // Frames per channel handed to sceAudioOutOutput() per call, fixed at open
 // time. Resampled output is accumulated and emitted in whole blocks instead
@@ -830,8 +845,11 @@ out:
 }
 
 static void video_log_startup_benchmark(void) {
-    // Full container resolution (800x500) and half (400x250, what lowres=1
-    // actually decodes -- see video_play()) so a real log shows both.
+    // Both resolutions, so a real log shows the cost of each: 800x500 is
+    // what Fase 59 actually decodes (lowres=0, see video_play()), 400x250
+    // is the old half-res path kept as a reference -- if a future log
+    // ever shows full-res playback dragging, these two numbers say
+    // whether the converter is the bottleneck before touching decode.
     video_bench_convert(800, 500, 8);
     video_bench_convert(400, 250, 8);
 }
@@ -869,6 +887,12 @@ static struct Playback {
     int              aq_head, aq_tail, aq_count;
     volatile bool    aq_eof;
     pthread_mutex_t  aq_lock;
+
+    /* Demuxed video packets waiting for the decoder (decode thread only --
+     * no lock needed; Fase 59 decoupling, see video_decode_thread()). */
+    AVPacket        *vq[VIDEO_PKT_QUEUE_CAP];
+    int              vq_head, vq_tail, vq_count;
+    bool             demux_eof;
 
     /* Audio output and the clock derived from it. */
     int               aport;
@@ -921,11 +945,18 @@ static int ring_count(void) {
 /**
  * @brief Converts one decoded frame into the next free ring slot.
  *
- * Blocks -- polling, never a `pthread_cond_t` -- while the ring is full,
- * which is what paces decode to real time. Returns false if playback is
- * being torn down.
+ * Fase 59: NON-blocking -- returns false immediately when the ring is
+ * full instead of parking the caller. The old blocking version is what
+ * froze the whole pipeline on real hardware (log 058: 85 presented in
+ * 7.76s, audio_frames_played=10240 = ~0.2s of audio): the single decode
+ * thread sat in here with a full 3-slot ring and, while parked, stopped
+ * demuxing audio packets too -- the audio thread starved, the audio
+ * clock froze a few hundred ms in, and the present loop (paced on that
+ * clock) could only limp forward. Now the decode thread stashes the
+ * frame and keeps demuxing audio while it waits (see
+ * video_decode_thread()). Never a `pthread_cond_t` -- polling only.
  */
-static bool ring_push(const AVFrame *f, int64_t pts_us) {
+static bool ring_try_push(const AVFrame *f, int64_t pts_us) {
     // The NEON converter walks 2 rows / 2 columns at a time.
     unsigned w = ((unsigned) f->width) & ~1u;
     unsigned h = ((unsigned) f->height) & ~1u;
@@ -933,11 +964,8 @@ static bool ring_push(const AVFrame *f, int64_t pts_us) {
         return false;
     unsigned need = w * h * (unsigned) sizeof(unsigned short);
 
-    while (ring_count() >= P.nslots) {
-        if (P.quit)
-            return false;
-        sceKernelDelayThread(1000);
-    }
+    if (ring_count() >= P.nslots)
+        return false;  // full: caller holds the frame and retries later
     if (P.quit)
         return false;
 
@@ -1051,18 +1079,14 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     uint64_t t_draw0 = (uint64_t) now_us();
     P.upload_us += t_draw0 - t_upload0;
 
-    float srcAspect = (float) w / (float) h;
-    float dstAspect = (float) REAL_SCREEN_W / (float) REAL_SCREEN_H;
+    // Fase 59: fullscreen stretch, no letterbox. intro.m4v is 800x500
+    // (aspect 1.60) and the panel is 960x544 (aspect 1.76), so this
+    // stretches ~10% horizontally -- accepted on purpose per the user
+    // request ("pantalla completa"): the old aspect-preserving fit left
+    // ~45px black bars left/right AND upscaled a soft half-res frame on
+    // top of that. The texture itself is now full-res (lowres=0 above),
+    // so the stretch is the only sharpness cost left, and it is small.
     float qx0 = 0, qy0 = 0, qx1 = REAL_SCREEN_W, qy1 = REAL_SCREEN_H;
-    if (srcAspect > dstAspect) {
-        float qh = REAL_SCREEN_W / srcAspect;
-        qy0 = (REAL_SCREEN_H - qh) / 2.0f;
-        qy1 = qy0 + qh;
-    } else {
-        float qw = REAL_SCREEN_H * srcAspect;
-        qx0 = (REAL_SCREEN_W - qw) / 2.0f;
-        qx1 = qx0 + qw;
-    }
 
     float nx0 = qx0 / REAL_SCREEN_W * 2.0f - 1.0f;
     float nx1 = qx1 / REAL_SCREEN_W * 2.0f - 1.0f;
@@ -1300,11 +1324,16 @@ done:
 // Decode thread
 // ---------------------------------------------------------------------------
 
-static void handle_decoded_frame(AVFrame *f, int64_t *last_pts_us) {
+// Returns 0 = dropped (nothing to hold), 1 = placed in the ring,
+// 2 = ring full (frame untouched -- the caller must hold it and retry
+// ONLY the ring_try_push below, never this whole function: the pts
+// bookkeeping, first-frame log and skip_frame/drop decisions run
+// exactly once per decoded frame).
+static int handle_decoded_frame_try(const AVFrame *f, int64_t *last_pts_us, int64_t *out_pts_us) {
     if (f->format != AV_PIX_FMT_YUV420P) {
         l_warn("video: decoded frame has unexpected pix_fmt %d (expected YUV420P/%d) -- dropping frame",
                (int) f->format, (int) AV_PIX_FMT_YUV420P);
-        return;
+        return 0;
     }
 
     int64_t ts = (f->best_effort_timestamp != AV_NOPTS_VALUE) ? f->best_effort_timestamp : f->pts;
@@ -1324,11 +1353,14 @@ static void handle_decoded_frame(AVFrame *f, int64_t *last_pts_us) {
                              : (late < 100000 ? AVDISCARD_DEFAULT : P.vctx->skip_frame);
         if (late > P.frame_period_us + P.frame_period_us / 2) {
             P.dropped_late++;
-            return;
+            return 0;
         }
     }
 
-    ring_push(f, pts_us);
+    if (!ring_try_push(f, pts_us))
+        return 2;
+    *out_pts_us = pts_us;
+    return 1;
 }
 
 /**
@@ -1336,6 +1368,20 @@ static void handle_decoded_frame(AVFrame *f, int64_t *last_pts_us) {
  *
  * Canonical send/receive loop: drain every frame the decoder can produce
  * first, and only feed it another packet once it says it needs one.
+ *
+ * Fase 59 decoupling: demuxing (both streams, in file order) is NEVER
+ * allowed to stall behind a full video frame ring anymore. The old code
+ * parked this whole thread inside the blocking ring_push() with a full
+ * ring -- and while parked it demuxed nothing, so the audio packet queue
+ * drained, the audio thread starved, the audio-mastered presentation
+ * clock froze, and the present loop stopped consuming the ring: a full
+ * pipeline deadlock that played log 058's intro at ~11 fps in near
+ * silence (presented=85 in 7.76s, audio_frames_played=10240). Now a
+ * frame that doesn't fit is stashed in `held` (its one-time pts/drop
+ * decision already taken) and retried with ring_try_push() while the
+ * thread keeps demuxing -- video packets wait in the small vq FIFO,
+ * audio packets keep flowing to the audio thread, so the clock the
+ * present loop paces on keeps advancing in real time.
  */
 static void *video_decode_thread(void *arg) {
     (void) arg;
@@ -1348,21 +1394,143 @@ static void *video_decode_thread(void *arg) {
 
     AVPacket *pkt = av_packet_alloc();
     AVFrame  *frame = av_frame_alloc();
+    AVFrame  *held = av_frame_alloc();  // decoded frame waiting for ring space
+    AVPacket *held_pkt = av_packet_alloc();  // demuxed video packet waiting
+                                             // for decoder/vq space (1 slot:
+                                             // guarantees zero sample loss)
+    bool      have_held = false;
+    bool      have_held_pkt = false;
+    int64_t   held_pts_us = 0;
     int64_t   last_pts_us = -1;
-    bool      eof = false;
+    bool      flush_sent = false;
 
-    if (!pkt || !frame) {
+    if (!pkt || !frame || !held || !held_pkt) {
         l_error("video: out of memory for decode thread packet/frame");
         goto done;
     }
 
     while (!P.quit) {
+        // 1. A stashed frame goes first. If the ring still has no room,
+        // pump the demux (audio keeps flowing, video waits in vq) and
+        // retry -- never sleep with the demux cursor parked.
+        if (have_held) {
+            if (ring_try_push(held, held_pts_us)) {
+                av_frame_unref(held);
+                have_held = false;
+                continue;
+            }
+            // A previously demuxed video packet is still homeless: place
+            // it before demuxing anything new (keeps file order).
+            if (have_held_pkt) {
+                bool placed = false;
+                if (P.vq_count == 0) {
+                    uint64_t td1 = (uint64_t) now_us();
+                    int src = avcodec_send_packet(P.vctx, held_pkt);
+                    P.decode_us += (uint64_t) now_us() - td1;
+                    if (src == 0) {
+                        av_packet_unref(held_pkt);
+                        placed = true;
+                    } else if (src != AVERROR(EAGAIN)) {
+                        l_warn("video: avcodec_send_packet(video) error 0x%08x", src);
+                    }
+                }
+                if (!placed) {
+                    if (P.vq_count < VIDEO_PKT_QUEUE_CAP) {
+                        AVPacket *vp = av_packet_alloc();
+                        if (vp) {
+                            av_packet_move_ref(vp, held_pkt);
+                            P.vq[P.vq_tail] = vp;
+                            P.vq_tail = (P.vq_tail + 1) % VIDEO_PKT_QUEUE_CAP;
+                            P.vq_count++;
+                            placed = true;
+                        }
+                    }
+                }
+                if (placed) {
+                    have_held_pkt = false;
+                    continue;  // retry the stashed frame at the top
+                }
+                sceKernelDelayThread(1000);
+                continue;  // still homeless: wait, demux nothing new
+            }
+            // Ring still full: demux one packet so audio doesn't starve.
+            int si;
+            if (!P.demux_eof && mp4_next_packet(&P.mp4, pkt, &si)) {
+                if (si == MP4_STREAM_VIDEO) {
+                    // FIFO order: anything already queued goes first.
+                    // Otherwise feed the decoder directly -- send/receive
+                    // are independent, so input buffers fine while an
+                    // output frame sits stashed in `held`. Never drop a
+                    // demuxed packet here: losing a sample would skip its
+                    // pts and visibly jump/desync the clip.
+                    bool queued = false;
+                    if (P.vq_count == 0) {
+                        uint64_t td1 = (uint64_t) now_us();
+                        int src = avcodec_send_packet(P.vctx, pkt);
+                        P.decode_us += (uint64_t) now_us() - td1;
+                        if (src == 0) {
+                            av_packet_unref(pkt);
+                            // sent -- nothing more to do for this packet
+                            continue;
+                        }
+                        // EAGAIN (decoder input full) or an error: fall
+                        // through and queue it like the normal path.
+                        if (src != AVERROR(EAGAIN))
+                            l_warn("video: avcodec_send_packet(video) error 0x%08x", src);
+                    }
+                    if (P.vq_count < VIDEO_PKT_QUEUE_CAP) {
+                        AVPacket *vp = av_packet_alloc();
+                        if (vp) {
+                            av_packet_move_ref(vp, pkt);
+                            P.vq[P.vq_tail] = vp;
+                            P.vq_tail = (P.vq_tail + 1) % VIDEO_PKT_QUEUE_CAP;
+                            P.vq_count++;
+                            queued = true;
+                        }
+                    }
+                    if (!queued) {
+                        // vq full AND decoder input full: stash the packet
+                        // in held_pkt (no copy, just a ref move) instead
+                        // of dropping its sample -- the block above places
+                        // it before anything new is demuxed.
+                        av_packet_move_ref(held_pkt, pkt);
+                        have_held_pkt = true;
+                    }
+                    av_packet_unref(pkt);
+                } else if (P.actx) {
+                    AVPacket *ap = av_packet_alloc();
+                    if (ap) {
+                        av_packet_move_ref(ap, pkt);
+                        if (!aq_push(ap))
+                            av_packet_free(&ap);
+                    }
+                    av_packet_unref(pkt);
+                } else {
+                    av_packet_unref(pkt);
+                }
+            } else {
+                P.demux_eof = true;
+                sceKernelDelayThread(1000);
+            }
+            continue;
+        }
+
+        // 2. Drain the decoder.
         uint64_t td0 = (uint64_t) now_us();
         int rc = avcodec_receive_frame(P.vctx, frame);
         P.decode_us += (uint64_t) now_us() - td0;
         if (rc == 0) {
-            handle_decoded_frame(frame, &last_pts_us);
-            av_frame_unref(frame);
+            int64_t pts_us = 0;
+            int done = handle_decoded_frame_try(frame, &last_pts_us, &pts_us);
+            if (done == 2) {
+                // Ring full: stash (move the ref, no copy) and keep the
+                // demux running via path 1 above.
+                av_frame_move_ref(held, frame);
+                held_pts_us = pts_us;
+                have_held = true;
+            } else {
+                av_frame_unref(frame);
+            }
             continue;
         }
         if (rc == AVERROR_EOF)
@@ -1371,17 +1539,35 @@ static void *video_decode_thread(void *arg) {
             l_warn("video: avcodec_receive_frame(video) error 0x%08x", rc);
             break;
         }
-        if (eof)
+        if (flush_sent)
             break;  // decoder wants input after a flush; nothing left to give
 
-        int stream_index;
-        if (!mp4_next_packet(&P.mp4, pkt, &stream_index)) {
-            eof = true;
+        // 3. Decoder needs input: queued video first, else demux.
+        if (P.vq_count > 0) {
+            AVPacket *vp = P.vq[P.vq_head];
+            P.vq_head = (P.vq_head + 1) % VIDEO_PKT_QUEUE_CAP;
+            P.vq_count--;
+            td0 = (uint64_t) now_us();
+            avcodec_send_packet(P.vctx, vp);
+            P.decode_us += (uint64_t) now_us() - td0;
+            av_packet_free(&vp);
+            continue;
+        }
+        if (P.demux_eof) {
+            // File exhausted and nothing queued: flush the decoder so its
+            // delayed frames come out, then drain to EOF.
             td0 = (uint64_t) now_us();
             avcodec_send_packet(P.vctx, NULL);
             P.decode_us += (uint64_t) now_us() - td0;
             P.aq_eof = true;
+            flush_sent = true;
             continue;
+        }
+
+        int stream_index;
+        if (!mp4_next_packet(&P.mp4, pkt, &stream_index)) {
+            P.demux_eof = true;
+            continue;  // next iteration takes the flush path above
         }
 
         if (stream_index == MP4_STREAM_VIDEO) {
@@ -1404,6 +1590,8 @@ static void *video_decode_thread(void *arg) {
 
 done:
     if (frame) av_frame_free(&frame);
+    if (held) av_frame_free(&held);
+    if (held_pkt) av_packet_free(&held_pkt);
     if (pkt) av_packet_free(&pkt);
     P.aq_eof = true;      // covers the early-exit paths above
     P.decode_done = true;
@@ -1461,6 +1649,59 @@ static bool resolve_video_path(const char *name, char *path, size_t pathSize) {
     return false;
 }
 
+/**
+ * @brief Demuxes the whole audio track into the aq FIFO before playback.
+ *
+ * Fase 60: log 059 proved one thread cannot interleave full-res video
+ * decode (~29 ms/frame: 15.6 decode + 13.3 convert) with audio demux at
+ * the rate the audio thread consumes (~47 packets/s): the queue ran dry,
+ * the audio clock froze ~0.4 s in, the wall-clock fallback engaged, and
+ * 38% of frames dropped late. Pre-demuxing the entire (small: <1 MB
+ * compressed) track up front removes audio demux from the decode thread
+ * almost entirely -- it then demuxes video only, and only tops up audio
+ * if a longer-than-queue track left its cursor mid-way (seamless: same
+ * mp4_next_packet path, same cursors). Runs single-threaded before the
+ * workers start, so no locking subtleties; a counter line (l_note,
+ * once per playback) reports how much got queued.
+ */
+static void mp4_demux_audio_all(void) {
+    Mp4Track *a = &P.mp4.track[MP4_STREAM_AUDIO];
+    if (!a->present)
+        return;
+    while (a->next < a->sample_count) {
+        pthread_mutex_lock(&P.aq_lock);
+        bool full = (P.aq_count >= AUDIO_PKT_QUEUE_CAP);
+        pthread_mutex_unlock(&P.aq_lock);
+        if (full)
+            break;  // longer track than the queue holds: the decode
+                    // thread keeps demuxing audio from a->next as before
+        Mp4Sample *s = &a->samples[a->next];
+        AVPacket *ap = av_packet_alloc();
+        if (!ap)
+            break;
+        bool read_ok = false;
+        if (av_new_packet(ap, (int) s->size) == 0 &&
+            sceIoLseek(P.mp4.fd, (SceOff) s->offset, SCE_SEEK_SET) >= 0 &&
+            sceIoRead(P.mp4.fd, ap->data, (SceSize) s->size) == (int) s->size)
+            read_ok = true;
+        if (!read_ok) {
+            l_error("video: pre-demux sceIoRead failed for a %u-byte audio sample at offset %llu",
+                    s->size, (unsigned long long) s->offset);
+            av_packet_free(&ap);
+            break;
+        }
+        ap->pts = s->dts + s->cts_delta;
+        ap->dts = s->dts;
+        a->next++;
+        if (!aq_push(ap)) {
+            av_packet_free(&ap);
+            break;
+        }
+    }
+    l_note("video: pre-demuxed audio %u/%u samples (%s)", a->next, a->sample_count,
+           a->next >= a->sample_count ? "whole track queued" : "queue full, decode thread continues");
+}
+
 static bool audio_rate_supported(int rate) {
     static const int kRates[] = { 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000 };
     for (size_t i = 0; i < sizeof(kRates) / sizeof(kRates[0]); i++)
@@ -1499,6 +1740,8 @@ void video_play(const char *name) {
     P.head = P.tail = P.count = 0;
     P.aq_head = P.aq_tail = P.aq_count = 0;
     P.aq_eof = false;
+    P.vq_head = P.vq_tail = P.vq_count = 0;
+    P.demux_eof = false;
     P.aport = -1;
     P.arate = 0; P.achannels = 0;
     P.aplayed = 0; P.abase_us = 0; P.aclock_valid = false;
@@ -1540,15 +1783,22 @@ void video_play(const char *name) {
                 }
                 P.vctx->thread_count = VIDEO_DECODE_THREADS;
                 P.vctx->flags2 |= AV_CODEC_FLAG2_FAST;
-                // Decode at half resolution -- quarters the NEON conversion,
-                // the texture upload and the MPEG-4 decode itself, same fix
-                // as Asphalt-5-Vita's Bug #25. `lowres` is honored by the
-                // mpegvideo-family decoders (this asset's MPEG-4 Part 2
-                // included); must be set before avcodec_open2(). If a future
-                // FFmpeg build ever ignores it, playback still works --
-                // frames just come back full-size and ring_push()/
+                // Fase 59: decode at FULL container resolution (800x500).
+                // Half-res (lowres=1, the old Asphalt-5-Vita Bug #25 fix)
+                // is what made the intro look soft: a 400x250 frame
+                // bilinear-upscaled to the 960x544 panel can never be
+                // sharp. Cost on real hardware, measured by the startup
+                // benchmark below: yuv420p_planar_to_rgb565 = 6.2ms/call
+                // at 800x500 vs 1.4ms at 400x250, and log 058 showed
+                // decode = 7.1ms/frame at half-res -- full-res decode
+                // should land well under the ~40ms budget of this 25 fps
+                // asset now that the Fase 59 decode-thread restructure
+                // keeps the pipeline fed (see video_decode_thread).
+                // Must be set before avcodec_open2(). If a future FFmpeg
+                // build ever ignores it, playback still works -- frames
+                // just come back half-size and ring_push()/
                 // draw_video_frame() size themselves from f->width/height.
-                P.vctx->lowres = 1;
+                P.vctx->lowres = 0;
                 if (avcodec_open2(P.vctx, codec, NULL) < 0) {
                     l_error("video: avcodec_open2 failed for video stream");
                     avcodec_free_context(&P.vctx);
@@ -1638,6 +1888,13 @@ void video_play(const char *name) {
                    P.aport, P.arate, P.achannels, AUDIO_GRAIN);
         }
     }
+
+    // ---- Fase 60: whole-track audio pre-demux (see mp4_demux_audio_all)
+    // ----
+    // Only when audio will actually play (decoder + resampler + port all
+    // up): otherwise queueing would just burn startup time for silence.
+    if (atrk->present && P.swr && P.aport >= 0)
+        mp4_demux_audio_all();
 
     // ---- start the workers ----
     // pthread_create, not sceKernelCreateThread: FFmpeg's frame threading
@@ -1816,6 +2073,17 @@ cleanup:
 
     aq_drain_and_free();
 
+    // Fase 59: the decode thread may have exited (skip/teardown) with
+    // demuxed-but-undecoded video packets still in its vq FIFO -- free
+    // them here, on the same thread that joins it, so a skipped intro
+    // never leaks compressed frames.
+    while (P.vq_count > 0) {
+        AVPacket *vp = P.vq[P.vq_head];
+        P.vq_head = (P.vq_head + 1) % VIDEO_PKT_QUEUE_CAP;
+        P.vq_count--;
+        av_packet_free(&vp);
+    }
+
     if (P.aport >= 0) {
         sceAudioOutReleasePort(P.aport);
         P.aport = -1;
@@ -1826,8 +2094,9 @@ cleanup:
     if (P.vctx) avcodec_free_context(&P.vctx);
     if (P.actx) avcodec_free_context(&P.actx);
     mp4_close(&P.mp4);
-    // The ring's RGB565 buffers are ~400KB each (half-res); don't hold them
-    // for the rest of the session just because a cutscene played.
+    // The ring's RGB565 buffers are ~800KB each at full-res (800x500);
+    // don't hold them for the rest of the session just because a
+    // cutscene played.
     free_frame_slots();
     P.presenting = false;
 

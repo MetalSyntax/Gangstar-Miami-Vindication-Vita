@@ -3,6 +3,163 @@
 > Bitácora cronológica, un bug confirmado a la vez. Para el estado **estructural** del port (motor,
 > mapa JNI, filesystem, niveles de logging, checklist) ver `PORTING_PLAN.md`.
 
+## Estado actual — 2026-09-21 (Fase 60: pozos de 1 fps manejando — perfil Low-End del motor + pool vitaGL + pre-demux de audio del intro, sin confirmar en consola real)
+
+**Punto de partida:** el usuario manda `logs/debug_local_059.log` (build Fase 59 ya desplegado):
+caídas hasta ~1 fps que dejan el juego injugable.
+
+### Lo que el log 059 confirma
+
+1. **Fase 59 funciona:** `lowres=0`, primer frame 800x500, y el `wheel miss` throttled debuta con
+   dato accionable: `+0x2c:ptr=1 gate=1 rect=(-20,192,202,626)` — la rueda EXISTE y pasa el gate,
+   dato accionable: `+0x2c:ptr=1 gate=1 rect=(-20,192,202,626)` — la rueda EXISTE y pasa el
+   gate, pero `wheel_region()` exige el centro dentro del touch del motor (960x480):
+   cx=(-20+202)/2*2.00=182 ✓, cy=(192+626)/2*1.50=613 → **cy=613 ≥ GA_ENGINE_H=480** →
+   descartada. La rueda del skin de manejo vive ABAJO de la banda 480 (diseño 480x320 con
+   escala 2.00x1.50; el widget se extiende bajo la pantalla). El DOWN de Fase 58 nunca se
+   intenta porque el lookup ya falló. Fix pendiente (Fase 61): clampear el rect escalado al
+   espacio visible y centrar en la parte visible (x≈182, y≈383) en vez de descartar.
+2. **Pozos de 1 fps (lo grave):** 8+ rachas de `gpu_alloc_mapped_aligned_for_gpu failed ...
+   4194304 bytes` + `unsafe_for_gpu failed` con `tex cache recovering 0 bytes`, cada una seguida
+   de `slow render (4150-4400 ms)` (frames a 2-7 fps) — todo manejando en mundo abierto
+   (frames 2841-2983+). Mecanismo de Fase 46 de vuelta, pero el tex-cache ya no recupera NADA:
+   el working set manejando supera el pool GPU y cada textura nueva de 4 MB cuesta un ciclo
+   unsafe (4× `sceGxmFinish` + 1 s) que ADEMÁS falla el upload. Entre pozos, 13-31 fps.
+3. **Intro a full-res, marginal:** `decode=15.6ms + convert=13.3ms` (~29 ms/frame vs 40 ms de
+   presupuesto), `dropped_late=29/76` y `audio_frames_played=19456` (~0.4 s en 3.21 s): un solo
+   hilo no alcanza a demuxar audio (~47 paq/s) entre decodes full-res. El desacople de Fase 59
+   convirtió "cero demux" en "demux lento" — falta la otra mitad.
+
+### Causas y fixes (los tres con evidencia citada, reversibles en una línea cada uno)
+
+1. **Working set del mundo (`source/java.c`):** `Method_GetDeviceType` devolvía -1 = ningún
+   override de `GS3DStuff::loadPerformanceProfile()` (`out_ghidra.c:27207-27273`), quedando los
+   valores del `.gmap`. Ahora devuelve **4 (Motorola Low End)**, la config más débil que el juego
+   trae de fábrica: caps de spawn a 1 (211067-211085), radio de streaming a 6000 (también
+   `gStreamingRadius`, 25511), far plane 13000, sombras/luces dinámicas/agua lejana/retro OFF.
+   Menos objetos vivos + mundo streameado más chico = menos uploads de 4 MB por frame, justo la
+   presión de los pozos. Cuesta visual (look más plano, sin sombras).
+2. **Pool GPU chico (`source/utils/glutil.c`):** `vglInitExtended(...,12MB,...)` → **8 MB**.
+   El 4º arg se RESTA de la RAM libre para dimensionar el pool (`vgl.c`:
+   `vglInitWithCustomThreshold`), así que menos threshold = pool MÁS grande (~+4 MB = una
+   textura de 4 MB más que entra sin ciclo unsafe). El boot ya avisa
+   `Circular pool #2 spilled into VRAM`: el pool nace corto. Cuesta ~4 MB de RAM de sistema
+   (~1% del heap).
+3. **Audio del intro (`source/video.cpp`):** pre-demux de TODA la pista AAC (`mp4_demux_audio_all`,
+   367 samples, <1 MB) a una `aq` agrandada (64→384) antes de arrancar los hilos; el hilo de
+   decode queda video-only. Si un asset futuro excede la cola, el decode sigue demuxando audio
+   desde el cursor — seamless. Línea `pre-demuxed audio N/M` por reproducción para verificar.
+
+Build release verde, VPK regenerado, sin warnings nuevos.
+
+**Sin confirmar en consola real.** Qué mirar en el próximo log:
+1. Pozos: ¿siguen los `gpu_alloc...failed (4194304)` manejando? ¿cada cuánto? ¿el fps entre pozos
+   sube de 13-31? Si el mundo se ve demasiado pelado/plano, se revierte el `return 4`.
+2. Intro: `pre-demuxed audio 367/367 (whole track queued)` + `audio_frames_played≈150000+` en
+   ~3 s + `dropped_late` de un dígito.
+3. `nativeGetDeviceType returned:Motorola Low End 4` debe aparecer tras el `Lower Setting Profile1`.
+
+## Estado previo — 2026-09-21 (Fase 59: video a velocidad real full-res/fullscreen + botones ocultos por gate de dibujo + radio sin retry-loop, sin confirmar en consola real)
+
+**Punto de partida:** el usuario pide (1) video más nítido, pantalla completa y sin "pegarse"
+segundos antes del mensaje de advertencia/carga (cita `logs/debug_local_058.log`), (2) que el
+volante se simule bien, (3) más optimización (caídas importantes), (4) botones ocultos aunque
+cambien de estado (intermitentes al presionarlos), (5) README/release actualizados.
+
+### Diagnóstico del log 058 (evidencia, no teoría)
+
+- `frame 1 returned (8171617 us)`: el intro tarda 7.76 s para 85 frames presentados
+  (`avg_fps=11.0` para un asset de 25 fps = **cámara lenta ~0.44x**) y `audio_frames_played=10240`
+  (~0.2 s de audio en 7.76 s = intro casi mudo). Luego `frame 2 returned (8143309 us)`: 8.1 s de
+  `PostInit` del motor. Esos dos tramos son "los segundos pegado antes del warning".
+- Cero líneas `wheel down` con `DeviceKeyInput:21/22` (cruceta izq/der) manejando: `wheel_region()`
+  no encuentra candidato en ese skin (offsets +0x2c/+0x54/+0x58 ya verificados contra
+  `CHudManager::load()` en `out_ghidra.c:68502-68547` — el fallo está en gate/rect, no en offsets).
+- Decenas de pares `stopRadio/playRadio` consecutivos sin input manejando + `PLAYEX:1644/46/48/51`
+  por frame: el `SoundManager` re-dispara radio cada frame.
+
+### Causas raíz (todas confirmadas en código/decompilado)
+
+1. **Deadlock de pipeline en `video.cpp`:** el hilo de decode se estacionaba en el `ring_push()`
+   bloqueante con el anillo de 3 lleno y, estacionado, dejaba de demuxar audio → el hilo de audio
+   se quedaba sin paquetes → el reloj maestro (audio) se congelaba → el present dejaba de consumir
+   el anillo. Círculo completo.
+2. **Botones intermitentes:** `setAlpha()` (disasm `002ba98c`: `ands r3,#6; cmp #4; beq fade`,
+   else `0x54=0xff`+return) escribe 0x54=0xff para CUALQUIER `flags&6 != 4` — ninguna combinación de
+   flags oculta un botón presionado por vía alpha — y `VirtualButton::processTouchRelease()`
+   (`out_ghidra.c:78951-78954`) escribe `0x54=0xff` directo en cada release. El draw consume 0x54
+   (los stamps de quads de Fase 55 nunca tuvieron efecto visible). En cambio los CUATRO
+   `draw2d()` (`HudElement`/`AnalogStick`/`SlideControl`/`Wheel`) gatean el `PaintFrame` en
+   `this+8` bit31, mientras TODO el input (`update`, `isVisible`=`*(this+0xc)&1`, `processTouch`)
+   usa `this+0xc`: palabras distintas → ocultar por `this+8` no toca el input.
+3. **Radio retry-loop (Fase 56 incompleta):** `audio_is_media_playing()` reportaba 0 durante la
+   ventana de open diferido y `audio_stop_big()` era no-op sobre un pending (limitación conocida
+   de Fase 56) → el `SoundManager`, que pollea estado por frame, re-disparaba stop+play sin parar.
+
+### Cambios
+
+- **`source/video.cpp`:** (a) hilo de decode desacoplado — `ring_try_push()` no bloqueante +
+  frame en `held` + cola FIFO `vq` (16 paquetes): con el anillo lleno sigue demuxando (audio
+  fluye, video espera en `vq`, sin perder samples); (b) `lowres=0` (decode 800x500 nítido;
+  benchmark en Vita: conversor 6.2 ms full vs 1.4 ms half, presupuesto ~40 ms/frame);
+  (c) fullscreen con stretch (~10% horizontal, sin letterbox). El resumen `loop exited!` sigue
+  mostrando ms/frame por etapa para verificar en el próximo log.
+- **`source/utils/gamepad_actions.c`:** `apply_touch_alpha()` ahora también limpia/pone `this+8`
+  bit31 por widget cada frame (oculto por defecto, visible con L+R); stamps de alpha intactos como
+  red. Nuevo `wheel_miss_diag()` throttled (1 línea/5 s): con `nx!=0` y sin rueda ni stick,
+  loguea `ptr/gate/rect` de los 3 candidatos + escala — el próximo log dirá qué skin falla y dónde.
+- **`source/utils/audio.c`:** `pending_open` cuenta como *playing* en `audio_is_media_playing()`;
+  `audio_stop_big()`/`audio_stop_all()` cancelan el pending y bumpean `open_gen`, y el mixer
+  thread valida la generación antes de activar (pre-flight + post-open: un stop a mitad de
+  `ov_open` libera el handle fresco sin pisar una reserva nueva). Cierra la limitación de Fase 56.
+- **`README.md`:** sección de controles con tabla de botones, intro reescrito (software decode
+  full-res/fullscreen — el texto viejo de `SceAvPlayer`/pantalla negra era de antes de Fase 50),
+  Known Issues actualizados (freeze de PostInit documentado como del motor, tuning del volante).
+- Build: `psvita-toolkit build --preset release` verde, VPK regenerado.
+
+**Sin confirmar en consola real.** Qué mirar en el próximo log:
+1. `video: loop exited! presented≈184 ... avg_fps≈25` + `audio_frames_played≈350000` (intro a
+   velocidad real con audio) en vez de 85/11.0/10240.
+2. Botones invisibles también con acelerar frenado a fondo (hold largo) y al soltar; con L+R se ven.
+3. Si la cruceta sigue sin girar en algún auto: línea `[input] wheel miss ...` (1/5 s) con el
+   detalle del skin — reportarla.
+4. Radio: los pares `stopRadio/playRadio` deberían aparecer solo en eventos (subir/bajar del auto,
+   botón de radio), no en ráfagas de decenas por frame.
+
+## Estado previo — 2026-09-20 (Fase 58: volante con gesto curvo real + botones virtuales ocultos al ~1%, sin confirmar en consola real)
+
+**Punto de partida:** el usuario reporta que en vehículo la cruceta no mueve el volante (el gesto
+real del dedo es izquierda/derecha hacia abajo, como un volante de verdad) y pide ocultar los
+botones virtuales con opacidad del 1%.
+
+### Causa raíz (decompilado, no adivinada)
+
+- `Wheel::processTouch()` (`out_ghidra.c`) solo lee `deltaX = first.x - current.x` (dir = signo,
+  cantidad = `|dx| / *(this+0x68)`, con `0x68 = 0x46 = 70px` fijado en el ctor para full lock).
+  El DOWN anterior caía en el centro de la región y el MOVE era puramente horizontal — matemáticamente
+  daba el mismo `deltaX`, pero no replicaba el gesto real.
+- Dos gaps reales sí encontrados: (1) `wheel_region()` solo probaba `CHudManager+0x2c` (Wheel) y
+  `+0x54` (un SlideControl), pero existe un **segundo** `SlideControl` en `+0x58` — si el skin de
+  conducción gira vía `+0x58`, nunca se encontraba y el volante "no se movía". (2) El código
+  consultaba el `AnalogStick` primero: en transiciones de HUD donde ambos gates responden, el stick
+  se comía el input y el volante jamás lo veía.
+
+### Cambio (`source/utils/gamepad_actions.c/.h`)
+
+1. Gesto curvo real: DOWN cerca del borde superior del aro (`cx, cy - 0.7*ry`, clamp dentro para
+   que el DOWN caiga sobre el widget), MOVE a `(down_x + nx*85, down_y + 50*|nx|)` — ±85px en X
+   supera el umbral de 70px (full lock digital, proporcional en analógico) y la caída de +50px
+   replica el dedo; además ejercita el eje Y para el alternate `SlideControl` (su `processTouch`
+   lee ambos ejes según el modo en `this+0x68`). Capture por pointer-id igual que el AnalogStick.
+2. `wheel_region()` ahora prueba `+0x2c/+0x54/+0x58` (nuevo `GA_OFF_SLIDECONTROL2`); y con `nx != 0`
+   el volante tiene prioridad sobre el stick aunque ambos gates respondan.
+3. Opacidad: `GA_ALPHA_HIDDEN = 3` (~1% de 255 = 2.55) en vez de `100+3`; se escribe cada frame en
+   `this+0x34/+0x54`/quads igual que antes. `L+R` sigue restaurando 255. `+0x58` agregado a la
+   lista de offsets de alpha.
+
+**Sin confirmar en consola real** — falta probar en vehículo: cruceta izq/der debe girar el
+volante a tope, stick proporcional, y al soltar centra; botones casi invisibles salvo con L+R.
+
 ## Estado actual — 2026-09-20 (Fase 57: comparativa contra otros ports Android→Vita del mismo ecosistema (soloader+FalsoJNI+vitaGL) -- render thread pineado al core 0, sin confirmar en consola real)
 
 **Punto de partida:** el usuario pidió revisar cómo otros ports de Android a Vita de

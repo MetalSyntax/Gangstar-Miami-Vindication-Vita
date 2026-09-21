@@ -80,12 +80,20 @@ void gl_init() {
     // circular_data_pool_size at init time (vgl.c:364), not resizable after.
     vglSetCircularPoolSize(64 * 1024 * 1024);
 
-    // MULTISAMPLE_NONE + 12 MB (2026-09-06): the Asphalt-5 recipe from
-    // port_progress.md Fase 12. The old 4X MSAA made every vglSwapBuffers()
-    // pay a multisample resolve -- pure overhead during the minutes-long
-    // black-screen asset load -- and MSAA + the FBO OES path this engine
-    // uses is a risky combination in vitaGL. Reversible if menus look off.
-    vglInitExtended(0, 960, 544, 12 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+    // MULTISAMPLE_NONE + 8 MB (Fase 60; was 12 MB, the Asphalt-5 recipe
+    // from port_progress.md Fase 12). vglInitExtended's 4th arg is subtracted
+    // from free user RAM to size vitaGL's pool (lib/vitaGL/source/vgl.c:
+    // vglInitWithCustomThreshold), so a SMALLER threshold means a BIGGER
+    // pool: 12->8 MB hands ~4 MB extra to vitaGL -- one more 4 MB texture
+    // that fits without tripping the ~4.2 s unsafe-GC stall log 059 shows
+    // while driving (gpu_alloc_mapped_aligned_for_gpu failed on 4194304
+    // bytes, tex cache recovering 0 bytes, frames at 2-7 fps). Costs ~4 MB
+    // of system RAM against a 256 MB heap + extended memory: ~1%, and the
+    // boot log already warns "Circular pool #2 spilled into VRAM", i.e.
+    // the pool is undersized from the start. The old 4X MSAA stays off:
+    // every vglSwapBuffers() paid a multisample resolve -- pure overhead --
+    // and MSAA + the FBO OES path this engine uses is risky in vitaGL.
+    vglInitExtended(0, 960, 544, 8 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
 }
 
 void gl_swap() {
