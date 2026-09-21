@@ -29,13 +29,14 @@ rendering backend. The `.so` has no `JNI_OnLoad`/`RegisterNatives` — every JNI
 resolved by symbol name and invoked by hand, following the exact lifecycle order of the real
 Android Activity/Renderer.
 
-### 🎮 Current Status: Alpha test build — relatively playable, not finished
+### 🎮 Current Status: Alpha test build — NOT playable, for testing only
 
-The game boots, renders, and reaches real third-person gameplay — driving, on-foot, vehicle
-entry — and is **relatively playable as a test build**, but it is an **alpha**: expect FPS drops,
-visual glitches, and unconfirmed fixes (see "Known Issues" below and
+The game boots, renders, and reaches third-person gameplay — driving, on-foot, vehicle
+entry — but **it is not playable**: at best it is **relatively playable**, and this build
+exists **strictly for testing**. Expect FPS wells down to ~1 fps, visual glitches, and fixes
+that are built but unconfirmed (see "Known Issues" below and
 [`RELEASES.md`](RELEASES.md) for the per-release breakdown of what is proven on hardware vs.
-what still needs confirmation).
+what still needs confirmation). Do not treat this alpha as a finished or enjoyable release.
 
 It got here through a long bug-by-bug history (format-string crashes, a missing `HAVE_SOFTFP_ABI`
 causing an all-black screen, a circular-pool GPU stall dragging it to ~9 fps, among others); see
