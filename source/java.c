@@ -442,6 +442,13 @@ jint Method_getDeviceWidth(jmethodID id, va_list args) { return 960; }
 // 059 wells show. Costs some visuals (flatter lighting, no shadows); one
 // line to revert if a future log shows the wells gone but the look
 // unacceptable.
+//
+// Fase 62 (paso 5): the 6000 radius turned out to be what makes the city
+// feel like it is "still generating" while driving (pop-in at the
+// streaming edge; same open symptom as sibling Asphalt-6-Vita, which keeps
+// factory LOD for perf reasons). utils/perf_lod.c widens ONLY radius/far
+// (6000/13000 -> 8000/15000) at runtime, keeping every other saving of
+// this profile -- see that file, not here, to tune it.
 jint Method_GetDeviceType(jmethodID id, va_list args) { (void)id; (void)args; return 4; }
 
 // GetDeviceSoundType() -> int. AudioManager.getRingerMode();

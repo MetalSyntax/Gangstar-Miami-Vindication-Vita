@@ -47,16 +47,21 @@ and [`PORTING_PLAN.md`](PORTING_PLAN.md) for the living engine/JNI map.
 - Boots to warning screen, menus (~60 fps), and open gameplay on foot and driving.
 - Physical controls drive the game (attack/accelerate/brake/enter-car/cover/sprint + D-Pad/stick
   movement all log their synthesized touches and act in-game).
+- Steering wheel via D-Pad/stick in vehicles — **fixed (user-tested, log 061)**.
+- Virtual buttons/wheel/stick at ~1% in standby — **user-tested (log 062)**.
 - Radio/music retry-loop settled: `stopRadio`/`playRadio` now fire on events only, not per frame.
 - Intro cutscene plays from the original `intro.m4v` at full 800x500 resolution, fullscreen —
   **video fixed (user-tested)**.
 - **Black characters/vehicles fixed (user-tested)** — they render correctly now.
+- Smoother driving feel with the widened streaming radius — **user-tested feel (log 062)**,
+  numbers still unconfirmed (see below).
 
 #### 🧪 NOT yet confirmed on hardware (latest changes, need testing)
-- Low-End device profile + bigger vitaGL pool + audio pre-demux (Fase 60): built green, awaiting
-  a console run to prove the 1 fps wells are gone.
-- Virtual buttons fully invisible while pressed/held (needs eyes on screen, L+R restores them).
-- Steering the wheel with D-Pad/stick in all driving skins (diagnostic logging added; fix pending).
+- Buttons at 1% WHILE pressed/tapping and during mission highlight pulses (Fase 63 blink
+  hook; standby 1% already user-tested) — needs eyes on screen, L+R restores them + highlights.
+- Streaming radius 8000 / far 15000 actually latched (look for
+  `[lod] ... radius 6000->8000, far 13000->15000` in the log) + pop-in distance + no
+  `gpu_alloc...failed` regression.
 
 ### ✨ What Works
 
@@ -96,10 +101,16 @@ and [`PORTING_PLAN.md`](PORTING_PLAN.md) for the living engine/JNI map.
 ### ⚠️ Known Issues (alpha — full list in [`RELEASES.md`](RELEASES.md))
 
 **Performance / FPS drops**
-- **Wells down to ~1 fps while driving in the open world.** The world working set exhausts GPU
-  memory on 4 MB texture uploads; each miss costs a ~4.2 s driver stall (frames at 2-7 fps).
-  Fase 60 attacks it with the game's own Low-End profile + a bigger vitaGL pool — **unconfirmed**,
-  awaiting a console run. Between wells the game runs ~13-31 fps driving, ~60 fps in menus.
+- **Wells down to ~1 fps while driving in the open world.** No recurrence in logs 060–062
+  (20–60 fps driving, zero `gpu_alloc...failed`), but sessions were shorter than the one that
+  broke in 059 — not closed yet. Fase 62 widens the streaming radius 6000→8000 / far
+  13000→15000 to push pop-in farther out (user reports smoother driving) — **numbers
+  unconfirmed**, watch the next log for the `[lod] ... 6000->8000` line, pop-in distance,
+  and any `failed (4194304)` return.
+- **City pop-in while driving.** The Low-End profile streams at radius 6000 (same open symptom
+  as sibling Asphalt-6-Vita, which keeps factory LOD for perf reasons). Fase 62 buys back
+  distance in a measured step, keeping all Low-End savings — **unconfirmed**, report how far
+  out the city still "generates".
 - **One-time stalls:** ~8 s on the second engine frame after the intro (`Application::PostInit`),
   shader-compile bursts at the title screen / first vehicle load (frames of 0.5-16 s). Engine-side
   init on the render thread — not skippable from the loader; the on-disk shader cache makes repeat
@@ -114,11 +125,12 @@ and [`PORTING_PLAN.md`](PORTING_PLAN.md) for the living engine/JNI map.
   horizontally on purpose), skippable with Cross/Start.
 
 **Controls**
-- **Vehicles CANNOT be steered with the wheel via D-Pad/stick yet** (confirmed in log 059: the
-  wheel exists and passes the interactable gate, but its touch center falls outside the engine's
-  960x480 band). The wheel is also **semi-invisible** — virtual buttons/wheel/stick are hidden by
-  design (hold **L+R** to show them at full opacity). Throttled `[input] wheel miss ...`
-  diagnostics included; proper steering fix pending. On foot, D-Pad/stick movement works.
+- ~~Vehicles CANNOT be steered with the wheel~~ — **fixed (user-tested, log 061)**:
+  D-Pad/stick steers via the clamped wheel grab (`wheel down @(202,316)`, no more `wheel miss`).
+- Virtual buttons/wheel/stick render at ~1% opacity **always, including while pressed** —
+  Fase 63 hooks the tutorial/script highlight path that flashed them bright (hint text still
+  shows). Hold **L+R** to show them at full opacity. Pressed-state 1% is **unconfirmed** —
+  needs eyes on screen. On foot, D-Pad/stick movement works.
 - **Lifecycle hooks not wired**: `nativePause`/`nativeResume`/`nativeAccelerometer`/`nativeDone`/
   `nativeOpenIGM`/`nativeCanInterrupt` are exported by the `.so` but not yet called from `main.c`
   — no suspend/resume or in-game menu integration yet.

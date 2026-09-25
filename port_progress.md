@@ -3,7 +3,175 @@
 > Bitácora cronológica, un bug confirmado a la vez. Para el estado **estructural** del port (motor,
 > mapa JNI, filesystem, niveles de logging, checklist) ver `PORTING_PLAN.md`.
 
-## Estado actual — 2026-09-21 (Fase 60: pozos de 1 fps manejando — perfil Low-End del motor + pool vitaGL + pre-demux de audio del intro, sin confirmar en consola real)
+## Estado actual — 2026-09-25 (Fase 63: hook a HudElement::blink para el 1% en presionado + LOD con log de transiciones, sin confirmar en consola real)
+
+**Punto de partida:** el usuario prueba Fase 62 (`logs/debug_local_062.log`, 379 líneas): standby
+al 1% ✓ pero los botones NO están al 1% al presionarlos; el juego "se siente más fluido" con el
+LOD. Pide commit + README + RELEASES.
+
+### Lo que el log 062 confirma (y un descubrimiento)
+
+- Todo sigue en pie: volante (`wheel down @(202,316)`, cero `wheel miss`), cero
+  `gpu_alloc...failed`, menús a 60 fps, manejo 20–50 fps, radio por eventos, video skipeado
+  por el usuario (Triangle) sin cuelgue.
+- **Descubrimiento LOD:** `[lod] gPhonePerf radius 0->8000` — before=**0**, o sea que
+  `loadPerformanceProfile()` NO corre en `nativeInit` sino en el PostInit del frame 2 (donde
+  aparecen los `Lower Setting Profile1`/`Motorola Low End 4`, líneas 88-89). El apply tras
+  `nativeInit` escribe sobre ceros y el load pisa 6000/13000 después; el que realmente gana la
+  carrera es el refresh por frame. El "más fluido" del usuario sugiere que el latch agarró
+  8000 (o que el far por frame ya ayuda) — queda a confirmar con el log rediseñado abajo.
+
+### Diagnóstico del leak en presionado (cierre por eliminación sobre el disasm)
+
+- `setAlpha()` completo releído: pressed (2baa58) no toca quads; idle re-deriva de `0x34` o
+  de `(u8)0x54` solo si `0x54>0x34` en SIGNED — con el divisor `this+0x3c` en 0 para siempre
+  (grep exhaustivo, Fase 55) el fade colapsa al clamp a `0x34`, nunca por encima; release
+  escribe `0x54=0xff` pero el siguiente frame lo recomputa igual. `setUsed()`/`processTouch()`
+  solo flipan bit1. `resetAlpha()` corre DESPUÉS de `PaintFrame` (AnalogStick::draw2d,
+  2b85c0). Ninguna rama normal pinta quads brillantes con el poke puesto.
+- Queda UNA sola rama que pinta `0xff` in-render: **blink** (2baa00-2baa4e), con bit4 puesto
+  AL MOMENTO DEL DRAW. Y hay quien lo pone DESPUÉS de nuestro poke cada vez que importa:
+  el dispatch de touches corre en `CHudManager::update()` dentro de `nativeRender`
+  (post-poke), y `ScriptCommands::HudHighlight::update()` (out_ghidra.c:150547) re-arme el
+  blink POR FRAME mientras un paso de misión/tutorial lo tenga activo (los otros dos callers,
+  minisave 39176 y weapon 176473, son one-time con flag). Un `bic` pre-render jamás gana esa
+  carrera — por eso standby (sin highlights) sí da 1% y presionando/actuando no.
+- Inventario completo de `CHudManager::load()` hecho de paso: hay dos VirtualButton más en
+  +0x88/+0x8c (tipos 0x8c/0xc, skins de otros modos) que NO se agregan a la lista (en standby nadie
+  los ve: son de otros modos; si aparecen dos botones misteriosos, son esos). +0xd0
+  (WeaponSelector) y +0x7c (AnimatedButton/HitWarning) tampoco se tocan: son UI de gameplay,
+  deben rendir a alpha natural.
+
+### Cambios
+
+1. **`source/patch.c` — hook a `HudElement::blink` (exportado, ARM):** lo traga salvo con
+   L+R (passthrough al original vía unpatch/call/repatch). SAFE: `blink()` solo flipa bit4
+   (out_ghidra.c:73349, sin timers ni estado) e `isBlinking()` no tiene callers lógicos — el
+   bit solo lo consume la rama visual de `setAlpha()`; textos de hints/mensajes intactos.
+   COSTO: cero por frame (blink dispara por evento, no por widget por frame — a diferencia
+   de hookear `setAlpha`, que serían decenas de flushes de caché por frame). Instalado en
+   `so_patch()` (init.c:122, antes de que el motor corra). Nuevo accessor
+   `gamepad_alpha_full()` para el passthrough con L+R.
+2. **`source/utils/perf_lod.c`:** el apply ahora loguea CADA transición real y calla en estado
+   estable — el próximo log debe mostrar `radius 6000->8000, far 13000->15000` cuando el load
+   del PostInit aterrice (eso confirma timing + override de un tiro); si solo sale `0->8000`
+   y el pop-in sigue igual, el latch ganó con 6000 y toca el plan B (estático latcheado).
+
+Build release verde, VPK regenerado, sin warnings nuevos.
+
+**Sin confirmar en consola real.** Qué mirar:
+1. `[patch] HudElement::blink hooked` en el arranque + botones al 1% presionando/tappeando
+   (acelerar a fondo, ataque repetido) y durante misiones; L+R al 100% con highlights.
+2. Línea `[lod] ... 6000->8000 ...` (el timing del load) + distancia del pop-in + pozos.
+3. Si el presionado SIGUE brillante post-hook, la hipótesis que queda es un overlay de
+   pressed-state por otra vía de dibujo — reportar qué botón/acción exacta.
+
+## Estado previo — 2026-09-25 (Fase 62: paso 4 alpha 1% sostenido + paso 5 LOD 8000/15000, sin confirmar en consola real)
+
+**Punto de partida:** el usuario prueba el build Fase 61 (`logs/debug_local_061.log`): "los
+controles funcionan perfecto". El log lo confirma en hardware: `wheel down @(202,316) slot 26`
+repetido (cruceta izq/der → gesto del volante, sin un solo `wheel miss`), manejo a 26–44 fps
+sin `gpu_alloc...failed`, PostInit en 2.27 s (vs 8.2 s en 060). Pide: (paso 4) que TODOS los
+controles se mantengan a opacidad 1% aun "presionando", y (paso 5) revisar el LOD — la ciudad
+"se va generando" manejando, algo que también le pasa a Asphalt 6.
+
+### Paso 4: el mecanismo real del "aparecen al actuar" (disasm crudo, no teoría)
+
+Releído `HudElement::setAlpha()` entero (2ba98c-2bab52) + `HudElement::blink()` (out_ghidra.c:73349)
++ callers de `CHudManager::blink()` (39176/150547/176473, todos por evento):
+
+- Presionar NO era la fuga: la rama pressed (2baa58) solo fuerza el mirror `0x54=0xff` y
+  retorna SIN tocar los bytes del quad — el 1%/0% del poke pre-render sobrevive al hold.
+- La fuga era el **blink tutorial**: con bit4 (`0x10`) puesto, la rama 2baa00-2baa4e escribe
+  `0x54=0xff` Y los 4 alphas del quad a `0xff` DURANTE el render (después de nuestro poke) —
+  a pleno brillo. `CHudManager::blink()` solo flipa ese bit (orr/bic `#0x10`), se dispara en
+  eventos (primer enter-car/acelerar → coincide con "aparecen cuando hago una acción" del
+  log 060), e `isBlinking()` NO tiene callers lógicos en el binario (solo su definición) —
+  el bit solo lo consume la rama visual de `setAlpha()`.
+- El draw-gate `this+8` (Fase 59/61) nunca sobrevivía cambios de estado: `CHudManager::update()`
+  corre dentro de `nativeRender` DESPUÉS de nuestro poke y re-muestra widgets tocados — y de
+  paso rendía 0% en vez del 1% pedido.
+
+Cambios (`gamepad_actions.c`, `apply_touch_alpha()`): `GA_ALPHA_HIDDEN` 0→3; fuera toda
+manipulación de `this+8` (un widget re-mostrado simplemente dibuja al 1%); nuevo `bic 0x10`
+en `this+0xc` cada frame (pulso tutorial neutralizado, logic-safe, texto de hints intacto).
+L+R sigue restaurando 255 (y ahí sí se permiten los pulsos).
+
+### Paso 5: LOD (causa confirmada, fix medido)
+
+- `loadPerformanceProfile()` (out_ghidra.c:27166-27288): radios Motorola 6500 / Samsung 10000 /
+  HTC+LowEnd **6000** (bloque compartido 27254-27271), far 14000/30000/15000/**13000**. El
+  pop-in llega exactamente con el radio 6000 de Fase 60 (antes, device -1 = valores del .gmap,
+  nadie reportó pop-in). El radio se latchea UNA vez en `updateStreaming()` (guard init-once,
+  out_ghidra.c:25506-25514): vale lo que `gPhonePerf` tenga en su PRIMER streaming.
+- Paralelo Asphalt-6-Vita confirmado en su repo: su README lista pop-in como conocido con el
+  LOD de fábrica (0.4); forzar el LOD propio de pista (-1.0) costó ~50 ms/frame (Bugs
+  #041/#048, `source/patch.c`) y lo revirtieron. Lección: comprar distancia de a pasos chicos.
+- Cambios (nuevo `source/utils/perf_lod.{c,h}`, cableado en `main.c`, `CMakeLists.txt`):
+  device sigue 4 (TODOS sus ahorros: caps 1, sin sombras/luces/agua/retro) y solo se ensanchan
+  dos ints de `gPhonePerf` (símbolo dinámico, resuelto por nombre): radio 6000→**8000**
+  (+33% de frontera), far 13000→**15000** (valor del HTC, misma familia de flags). Apply tras
+  `nativeInit()` (loguea before/after una vez) + refresh silencioso por frame (2 stores,
+  seguro contra el reload por settings). Revertible en una línea por valor; 10000/30000
+  (Samsung) es el siguiente paso documentado SOLO si no hay regresión de pozos.
+
+Build release verde, VPK regenerado, sin warnings nuevos.
+
+**Sin confirmar en consola real.** Qué mirar en el próximo log/juego:
+1. `[lod] gPhonePerf radius 6000->8000, far 13000->15000` — confirma que el load corre en
+   `nativeInit` (before=6000/13000) y el poke aterrizó. Si before sale otra cosa, avisar.
+2. Botones al 1% siempre: actuando a fondo, en tutoriales/hints, al entrar/salir del carro;
+   L+R al 100%.
+3. Pop-in: ¿la ciudad "se genera" más lejos que antes? ¿vuelven los `failed (4194304)`?
+   (Si vuelven: revertir a 6000 primero; si el pop-in sigue igual: subir a 10000.)
+
+## Estado previo — 2026-09-25 (Fase 61: volante clampea a visible + alpha 0, sin confirmar en consola real)
+
+**Punto de partida:** el usuario prueba el build Fase 60 (`logs/debug_local_060.log`): agarra un
+carro y mueve el volante varias veces — sigue sin girar — y los botones virtuales siguen
+apareciendo al hacer una acción. Pide aplicar todo y verificar los puntos 2 y 3 de Fase 60.
+
+### Verificación del log 060 (puntos 2 y 3)
+
+- **Punto 2 (pozos de 1 fps): MEJORA CONFIRMADA, no cerrado.** Cero
+  `gpu_alloc_mapped_aligned_for_gpu failed`, cero `unsafe_for_gpu`, cero `tex cache recovering`
+  en todo el log (en el 059 había 8+ rachas). `Motorola Low End 4` entra (línea 87). Manejando
+  (frames 1606→5299): 29–60 fps estables, sin pozos. Los `slow render` que quedan (frames
+  274–321, hasta 15 s) son la ráfaga conocida de shaders/texturas de título/primer vehículo
+  (Fase 25: `first play_big idx=13` + warning del compilador vitaGL), no el mecanismo de Fase 46.
+  Matiz: `Circular pool #2 spilled into VRAM` sigue en el boot y esta sesión manejó menos que la
+  059 — falta una sesión larga en mundo abierto para cerrar.
+- **Punto 3 (intro full-res): AUDIO ✅ / SUAVIDAD ❌.** `presented=111, decoded=184,
+  dropped_late=73, audio_frames_played=374784, elapsed=7.83s, avg_fps=14.2
+  [decode=15.4ms, yuv_convert=12.3ms, tex_upload=3.2ms]`. Pre-demux 367/367 OK y audio completo
+  (7.8 s reales vs 0.2–0.4 s antes) — pero 73 drops vs dígito único esperado: ~31.5 ms/frame
+  roza el presupuesto de 33 ms a 800x500 en un hilo. Corre a velocidad real con drops (reloj por
+  audio, por diseño), no la cámara lenta de antes.
+- **Volante:** línea `wheel miss` idéntica a la 059 (`+0x2c:ptr=1 gate=1
+  rect=(-20,192,202,626)`) — tercer log con el mismo dato, diagnóstico confirmado por
+  repetición.
+
+### Cambios (`source/utils/gamepad_actions.c`, únicos en esta fase)
+
+1. **`wheel_region()` clampea en vez de descartar:** el rect escalado (-40,288,404,939) se
+   intersecta con la banda visible (0,0,960,480) y el DOWN centra en la parte visible
+   (~202,384); solo un candidato totalmente fuera de pantalla pasa al siguiente skin. El DOWN
+   (202,~317) sigue dentro de la región touch del motor, así que el hit-test del `Wheel`
+   lo acepta. `stick_region()` no se toca (a pie funciona).
+2. **`GA_ALPHA_HIDDEN` 3 → 0:** transparente total como backstop del draw-gate — en frames
+   "presionado" `setAlpha()` fuerza `0x54=0xff` sin tocar los bytes de quad (rama 2baa58), que
+   conservan nuestro 0 del poke previo al render.
+
+Build release verde, VPK regenerado.
+
+**Sin confirmar en consola real.** Qué mirar en el próximo log/juego:
+1. Manejando con cruceta/stick: debe salir `[input] wheel down @(~202,~317)` en vez de
+   `wheel miss`, y el auto girar (a tope en digital, proporcional en analógico).
+2. Botones invisibles también actuando (acelerar/frenar a fondo, entrar/salir del carro);
+   con L+R se ven al 100%.
+3. Sesión larga manejando para cerrar el punto 2 (¿vuelven los `failed (4194304)`?).
+
+## Estado previo — 2026-09-21 (Fase 60: pozos de 1 fps manejando — perfil Low-End del motor + pool vitaGL + pre-demux de audio del intro, sin confirmar en consola real)
 
 **Punto de partida:** el usuario manda `logs/debug_local_059.log` (build Fase 59 ya desplegado):
 caídas hasta ~1 fps que dejan el juego injugable.

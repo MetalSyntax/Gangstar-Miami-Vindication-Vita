@@ -112,6 +112,11 @@ void gamepad_actions_update(uint32_t buttons, uint32_t old_buttons);
  * buttons). Fase 51, see port_progress.md. */
 void gamepad_stick_update(uint32_t dpad_buttons, uint8_t lx, uint8_t ly);
 
+/* Current L+R override state (1 while the hidden controls are shown at full
+ * opacity). Used by the HudElement::blink hook in patch.c so tutorial
+ * highlights still show when the user explicitly asked to see the buttons. */
+int gamepad_alpha_full(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -4,6 +4,7 @@
 #include "utils/dialog.h"
 #include "utils/audio.h"
 #include "utils/gamepad_actions.h"
+#include "utils/perf_lod.h"
 #include "reimpl/gl.h"
 #include "video.h"
 
@@ -92,6 +93,9 @@ int main() {
     // own slots 0-4). Soft-fails (touchscreen relay below still works)
     // if the engine's internal symbols ever move.
     gamepad_actions_init(GameGLSurfaceView_nativeOnTouch);
+    // Fase 62 (paso 5): resolve the engine's perf struct early; the values
+    // are applied after Gangster2_nativeInit() below (see perf_lod.h).
+    perf_lod_init();
 
     gl_init();
     l_checkpoint(3, "main: gl_init() done");
@@ -120,6 +124,10 @@ int main() {
     audio_init();
     Gangster2_nativeInit(&jni, NULL, 1); // 1 == demo mode, matches a fresh install's default state
     l_checkpoint(8, "main: Gangster2_nativeInit() done -- most likely place the engine spawns its worker thread(s)");
+    // Fase 62 (paso 5): loadPerformanceProfile() ran inside nativeInit and
+    // wrote the Low-End radius/far (6000/13000) -- widen them now, before
+    // the first streaming update latches them (logs before/after once).
+    perf_lod_apply();
     GameRenderer_nativeInit(&jni, NULL, 1);
     l_checkpoint(9, "main: GameRenderer_nativeInit() done");
 
@@ -252,6 +260,10 @@ int main() {
         // down on press, up on release, at the currently visible skin's
         // position. Independent of the keycode loop above (CROSS/CIRCLE also
         // send keycodes 23/4 there, which the engine ignores outside menus).
+        // Fase 62 (paso 5): refresh the LOD override every frame (silent
+        // after the first logged apply) -- insurance against the
+        // settings-driven profile-reload path rewriting 6000/13000.
+        perf_lod_apply();
         gamepad_actions_update(pad.buttons, oldButtons);
         // Fase 51: physical movement input (D-pad + left analog stick) was
         // never wired to anything -- the keycode loop above only reaches

@@ -7,7 +7,45 @@
 
 ---
 
-## v0.60.0-alpha — 2026-09-21 (Fases 58–60, current)
+## v0.63.0-alpha — 2026-09-25 (Fases 61–63, current)
+
+VPK: `build/gangstarmiamivindication.vpk` (built with `psvita-toolkit build --preset release`).
+
+### What's new since v0.60.0
+- **Controls**: steering wheel works via D-Pad/stick (clamped to the visible rim,
+  `wheel down @(202,316)` — no more `wheel miss`).
+- **Buttons**: back to ~1% opacity, now held through presses AND mission/tutorial highlight
+  pulses (Fase 63 hooks `HudElement::blink`; L+R restores 100% + highlights).
+- **LOD**: streaming radius 6000→8000, far 13000→15000 (all other Low-End savings kept);
+  transition logging (`[lod] ...`) proves when the override lands.
+
+### Confirmed on hardware (logs 061–062 + user testing)
+- Steering in vehicles with D-Pad/stick — **fixed (user-tested)**.
+- Buttons at 1% in standby — **user-tested**.
+- Smoother driving feel with the wider radius — **user-tested feel**.
+- No GPU-pool failures in three sessions (060–062); menus ~60 fps, driving 20–60 fps.
+- Everything v0.60.0 had (intro video, black characters/vehicles, radio stability).
+
+### Known errors in this release
+1. Buttons at 1% WHILE pressed/tapping — fix built, **unconfirmed** (needs eyes on screen).
+2. LOD numbers actually latched — **unconfirmed** (look for
+   `[lod] ... radius 6000->8000, far 13000->15000`; log 062 showed the profile loads late,
+   in PostInit). If `failed (4194304)` returns, radius goes back to 6000.
+3. City pop-in may persist (further out now) — report the distance.
+4. One-time stalls: ~8 s engine `PostInit` after the intro; 0.5–16 s shader/texture bursts at
+   title and first vehicle/area load (better on repeat runs via on-disk shader cache).
+5. Intro stretched ~10% horizontally (on purpose, fullscreen); video plays at real speed
+   with dropped frames (14–15 fps) but full audio.
+6. No suspend/resume, no accelerometer, no in-game-menu integration (lifecycle hooks not wired).
+
+### How to report
+Play, then fetch `ux0:data/gangstarmiamivindication/logs/debug_local_NNN.log` and note: buttons
+at 1% while pressing (which button/action if not), `[lod]` lines, `[patch] ... blink hooked`,
+FPS wells, and any `wheel miss`.
+
+---
+
+## v0.60.0-alpha — 2026-09-21 (Fases 58–60)
 
 VPK: `build/gangstarmiamivindication.vpk` (built with `psvita-toolkit build --preset release`).
 

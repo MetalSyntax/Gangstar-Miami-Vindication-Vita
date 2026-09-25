@@ -254,8 +254,32 @@ static struct pad_action s_actions[] = {
  * + touchable, the pre-Fase-54 look). */
 #define GA_DRAWVIS_OFFSET    0x8
 #define GA_DRAWVIS_BIT       0x80000000u
-#define GA_ALPHA_HIDDEN      3     /* Fase 58: ~1% of the 0..255 range (1% = 2.55) -- virtual
-                                    * buttons hidden by request, physical controls drive */
+/* Fase 62: back to ~1% of the 0..255 range (1% = 2.55) -- virtual buttons
+ * faintly visible by request, physical controls drive. Was 0 (Fase 61);
+ * log 061 proved 0 hides perfectly, but the user wants the 1% look of
+ * Fase 58 HELD even while pressing (paso 4). Pressing already holds: the
+ * pressed branch of setAlpha() (2baa58) only forces the 0x54 mirror to
+ * 0xff and returns WITHOUT touching the quad bytes, which keep this 3
+ * from our pre-render poke. The leak that showed buttons "on action" in
+ * log 060 was NOT pressing -- it was the tutorial blink pulse (below). */
+#define GA_ALPHA_HIDDEN      3
+/* HudElement flags word (this+0xc) blink bit. Fase 62: THIS was the "buttons
+ * appear on action" mechanism of log 060, confirmed in raw disasm (not a
+ * guess): when bit 4 is set (tutorial hint pulse via CHudManager::blink(),
+ * fired on first actions like enter-car/accelerate -- out_ghidra.c:66954,
+ * callers at 39176/150547/176473, all event-driven), setAlpha()'s blink
+ * branch (2baa00-2baa4e) writes 0x54=0xff AND all four quad alpha bytes to
+ * 0xff DURING render, i.e. after our pre-render poke -- fully bright,
+ * immune to any alpha floor. HudElement::blink() (out_ghidra.c:73349) ONLY
+ * flips this bit (orr/bic #0x10, gated on the +0x14 predicate), and
+ * HudElement::isBlinking() has NO logic callers in the binary (only its own
+ * definition) -- the bit is consumed solely by setAlpha()'s visual branch.
+ * So clearing it pre-render every frame neuters the highlight while leaving
+ * game logic untouched (hint TEXT/messages still show; only the button
+ * flash stays at 1%). blink() fires at events, never per-frame, so the
+ * clear always lands before that frame's setAlpha(). */
+#define GA_FLAGS_OFFSET      0xc
+#define GA_BLINK_BIT         0x10u
 #define GA_ALPHA_FULL        255
 #define GA_ALPHA_COMBO_MASK  (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER)
 
@@ -427,7 +451,15 @@ static int stick_region(int *cx, int *cy, float *rx, float *ry) {
  * touch pixels. Returns 1 if interactable, 0 if hidden (e.g. on foot).
  * Fase 58: the second SlideControl at +0x58 is now a candidate too -- the
  * old code only tried +0x54, so a driving skin steering through +0x58 was
- * never found and the wheel "didn't move". */
+ * never found and the wheel "didn't move".
+ * Fase 61: the driving skin's wheel rect EXTENDS BELOW the visible band --
+ * log 059/060 (three sessions): raw design rect (-20,192,202,626) at scale
+ * 2.00x1.50 = scaled (-40,288,404,939), whose center cy=613 falls outside
+ * GA_ENGINE_H=480, so the old center-range check discarded a widget that
+ * passes the interactable gate and IS half-visible (0..404 x 288..480).
+ * Now the scaled rect is clamped to the visible engine space and the DOWN
+ * centers on the VISIBLE part (~202,384) instead of discarding. A candidate
+ * fully outside the visible band is still skipped (next skin / return 0). */
 static int wheel_region(int *cx, int *cy, float *rx, float *ry) {
     if (!screen_scale_ready())
         return 0;
@@ -460,11 +492,22 @@ static int wheel_region(int *cx, int *cy, float *rx, float *ry) {
         if (!(rect[2] > rect[0] && rect[3] > rect[1]))
             continue;
 
-        *cx = (int)((rect[0] + rect[2]) * 0.5f * fx);
-        *cy = (int)((rect[1] + rect[3]) * 0.5f * fy);
-        *rx = (rect[2] - rect[0]) * 0.5f * fx;
-        *ry = (rect[3] - rect[1]) * 0.5f * fy;
-        return (*cx >= 0 && *cx < GA_ENGINE_W && *cy >= 0 && *cy < GA_ENGINE_H);
+        /* Fase 61: scale to engine touch pixels, then clamp to the visible
+         * band -- the driving wheel sticks out below it by design. */
+        float x0 = rect[0] * fx, y0 = rect[1] * fy;
+        float x1 = rect[2] * fx, y1 = rect[3] * fy;
+        if (x0 < 0.0f) x0 = 0.0f;
+        if (y0 < 0.0f) y0 = 0.0f;
+        if (x1 > (float)(GA_ENGINE_W - 1)) x1 = (float)(GA_ENGINE_W - 1);
+        if (y1 > (float)(GA_ENGINE_H - 1)) y1 = (float)(GA_ENGINE_H - 1);
+        if (!(x1 > x0 && y1 > y0))
+            continue;  /* fully off-screen: try the next skin */
+
+        *cx = (int)((x0 + x1) * 0.5f);
+        *cy = (int)((y0 + y1) * 0.5f);
+        *rx = (x1 - x0) * 0.5f;
+        *ry = (y1 - y0) * 0.5f;
+        return 1;
     }
     return 0;
 }
@@ -528,21 +571,24 @@ static void wheel_miss_diag(float nx) {
     l_note("[input] wheel miss (nx=%.2f, scale=%.2fx%.2f): %s", nx, fx, fy, detail);
 }
 
-/* Hides (or, with L+R held, restores) every touch control, every frame.
- * Fase 59: two layers. (1) The draw-visibility bit (this+8 bit31, see
- * GA_DRAWVIS_OFFSET): cleared = draw2d() skips the widget entirely, no
- * PaintFrame at all -- this is what keeps buttons hidden "aunque cambie
- * de estado", because NO alpha value can do that: setAlpha()'s pressed
- * branch (raw disasm 2baa50-2baa5c: any flags&6 != 4) forces 0x54=0xff
- * every held frame, and VirtualButton::processTouchRelease() writes
- * 0x54=0xff directly on every release, both AFTER our poke runs. Touch
- * dispatch is unaffected: it gates on this+0xc (update/isVisible/
- * processTouch), a different word we never touch. (2) The alpha stamps
- * (this+0x34 floor, this+0x54 mirror, 4 quad bytes) stay as
- * belt-and-suspenders for any draw path that doesn't go through the
- * draw2d gate. No screen-scale gate needed here (unlike
- * pad_press/stick_region/wheel_region) -- this only touches each
- * widget's own fields, not Application::GetScreenScaleFactors(). */
+/* Holds every touch control at ~1% alpha (or, with L+R held, restores 100%),
+ * every frame -- including while pressed and during tutorial blink pulses.
+ * Fase 62 (paso 4): three layers, all reversed from earlier phases by evidence:
+ * (1) Alpha stamps (this+0x34 floor, this+0x54 mirror, 4 quad bytes) carry the
+ *     value. Idle re-derives quads from 0x34 (2bab00-2bab0e: clamps DOWN to
+ *     0x34, so 3 stays 3); pressed leaves quads untouched (2baa58), so 3
+ *     survives holds. This is the mechanism log 061 proved hides perfectly.
+ * (2) NO this+8 drawvis games anymore (Fase 59/61 cleared it): the engine's
+ *     own CHudManager::update() runs inside nativeRender AFTER our poke and
+ *     re-shows touched widgets, so the clear never survived state changes --
+ *     and worse, it rendered 0% (fully invisible) instead of the requested
+ *     1%. With the stamps at 3, a re-shown widget simply draws at 1%.
+ * (3) Blink bit (this+0xc bit 4) cleared: the tutorial pulse branch
+ *     (2baa00-2baa4e) is the only in-render path that overwrites quad alpha
+ *     (forces 0xff) -- the log-060 "buttons appear on action". See
+ *     GA_BLINK_BIT: logic-safe, hint text unaffected.
+ * Touch dispatch is unaffected: it gates on this+0xc bit0 (update/isVisible/
+ * processTouch) and the +0x14 predicate, never on alpha or bit4. */
 static void apply_touch_alpha(void) {
     CHudManagerPtr hud = *s_hudManagerAddr;
     if (!hud)
@@ -556,11 +602,8 @@ static void apply_touch_alpha(void) {
         if (!widget)
             continue;
 
-        uint32_t *drawvis = (uint32_t *)((char *)widget + GA_DRAWVIS_OFFSET);
-        if (s_alphaFull)
-            *drawvis |= GA_DRAWVIS_BIT;   /* L+R: visible again */
-        else
-            *drawvis &= ~GA_DRAWVIS_BIT;  /* hidden: draw2d() skips PaintFrame */
+        if (!s_alphaFull)
+            *(uint32_t *)((char *)widget + GA_FLAGS_OFFSET) &= ~GA_BLINK_BIT;
 
         *(uint32_t *)((char *)widget + GA_ALPHA_OFFSET) = alpha;
         *(uint32_t *)((char *)widget + GA_ALPHA_INT_OFFSET) = alpha;
@@ -730,6 +773,10 @@ void gamepad_actions_init(gamepad_touch_fn touch) {
     }
     s_ready = 1;
     l_note("gamepad_actions: ready (touch-synthesis onto HUD vbuttons)");
+}
+
+int gamepad_alpha_full(void) {
+    return s_alphaFull;
 }
 
 void gamepad_actions_update(uint32_t buttons, uint32_t old_buttons) {

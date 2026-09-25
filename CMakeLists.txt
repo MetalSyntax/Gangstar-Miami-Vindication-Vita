@@ -119,6 +119,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/utils/utils.c
                source/utils/filecache.c
                source/utils/gamepad_actions.c
+               source/utils/perf_lod.c
                lib/falso_jni/FalsoJNI.c
                lib/falso_jni/FalsoJNI_ImplBridge.c
                lib/falso_jni/FalsoJNI_Logger.c
