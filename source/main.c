@@ -17,7 +17,8 @@
 #include <falso_jni/FalsoJNI.h>
 #include <so_util/so_util.h>
 
-int _newlib_heap_size_user = 256 * 1024 * 1024;
+int _newlib_heap_size_user = 192 * 1024 * 1024;
+int sceUserMainThreadStackSize = 4 * 1024 * 1024;
 
 #ifdef USE_SCELIBC_IO
 int sceLibcHeapSize = 16 * 1024 * 1024;

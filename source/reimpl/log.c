@@ -63,7 +63,14 @@ static int is_load_spam(const char *tag, const char *text) {
         if (strncmp(text, "Duplicate parameter name : ", 27) == 0) return 1;
         if (strncmp(text, "unbound parameter ", 18) == 0) return 1;
         if (strcmp(text, "%s/%s: invalid bind symbol: %s") == 0) return 1;
+        // Runtime input and audio chatter: would otherwise cause synchronous
+        // file write on every button press / sound trigger during gameplay.
+        if (strncmp(text, "DeviceKeyInput:", 15) == 0) return 1;
+        if (strncmp(text, "stopRadio", 9) == 0) return 1;
+        if (strncmp(text, "AnimationStreamingManager", 25) == 0) return 1;
     }
+    if (tag && strcmp(tag, "SOUNDS-VV") == 0) return 1;
+    if (tag && strcmp(tag, "----Gameloft----") == 0) return 1;
     return 0;
 }
 

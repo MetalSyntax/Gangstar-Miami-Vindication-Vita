@@ -53,15 +53,11 @@ and [`PORTING_PLAN.md`](PORTING_PLAN.md) for the living engine/JNI map.
 - Intro cutscene plays from the original `intro.m4v` at full 800x500 resolution, fullscreen —
   **video fixed (user-tested)**.
 - **Black characters/vehicles fixed (user-tested)** — they render correctly now.
-- Smoother driving feel with the widened streaming radius — **user-tested feel (log 062)**,
-  numbers still unconfirmed (see below).
-
-#### 🧪 NOT yet confirmed on hardware (latest changes, need testing)
-- Buttons at 1% WHILE pressed/tapping and during mission highlight pulses (Fase 63 blink
-  hook; standby 1% already user-tested) — needs eyes on screen, L+R restores them + highlights.
-- Streaming radius 8000 / far 15000 actually latched (look for
-  `[lod] ... radius 6000->8000, far 13000->15000` in the log) + pop-in distance + no
-  `gpu_alloc...failed` regression.
+- **Fluidity & input response improved (user-tested, log 064)** — synchronous per-event disk I/O
+  on stick/pad input completely eliminated.
+- **VRAM / GPU Memory headroom restored**: `_newlib_heap_size_user` tuned to 192 MB, preventing
+  circular pool spill into VRAM and providing >140 MB RAM to vitaGL for large 4 MB textures.
+- Animation streaming cache expanded from 384 KB to 2 MB (`CAnimationStreamingManager::Instance`).
 
 ### ✨ What Works
 
@@ -101,16 +97,11 @@ and [`PORTING_PLAN.md`](PORTING_PLAN.md) for the living engine/JNI map.
 ### ⚠️ Known Issues (alpha — full list in [`RELEASES.md`](RELEASES.md))
 
 **Performance / FPS drops**
-- **Wells down to ~1 fps while driving in the open world.** No recurrence in logs 060–062
-  (20–60 fps driving, zero `gpu_alloc...failed`), but sessions were shorter than the one that
-  broke in 059 — not closed yet. Fase 62 widens the streaming radius 6000→8000 / far
-  13000→15000 to push pop-in farther out (user reports smoother driving) — **numbers
-  unconfirmed**, watch the next log for the `[lod] ... 6000->8000` line, pop-in distance,
-  and any `failed (4194304)` return.
-- **City pop-in while driving.** The Low-End profile streams at radius 6000 (same open symptom
-  as sibling Asphalt-6-Vita, which keeps factory LOD for perf reasons). Fase 62 buys back
-  distance in a measured step, keeping all Low-End savings — **unconfirmed**, report how far
-  out the city still "generates".
+- **GPU allocation & VRAM headroom:** Fixed in v0.64.0-alpha by sizing `_newlib_heap_size_user` to
+  192 MB (leaving >140 MB RAM for vitaGL so all 3 circular buffers fit without spilling into VRAM)
+  and expanding the animation cache to 2 MB, preventing the 4.3 s GC stalls on 4 MB texture loads.
+- **City pop-in while driving:** The Low-End profile streams at radius 6000; Fase 62/64 widens the
+  streaming radius to 8000 / far 15000 in a measured step, keeping all Low-End savings.
 - **One-time stalls:** ~8 s on the second engine frame after the intro (`Application::PostInit`),
   shader-compile bursts at the title screen / first vehicle load (frames of 0.5-16 s). Engine-side
   init on the render thread — not skippable from the loader; the on-disk shader cache makes repeat

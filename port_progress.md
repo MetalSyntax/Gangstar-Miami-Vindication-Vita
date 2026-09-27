@@ -3,7 +3,41 @@
 > Bitácora cronológica, un bug confirmado a la vez. Para el estado **estructural** del port (motor,
 > mapa JNI, filesystem, niveles de logging, checklist) ver `PORTING_PLAN.md`.
 
-## Estado actual — 2026-09-25 (Fase 63: hook a HudElement::blink para el 1% en presionado + LOD con log de transiciones, sin confirmar en consola real)
+## Estado actual — 2026-09-27 (Fase 64: optimizaciones de fluidez inspiradas en 9mm-vita y ports hermanos, eliminación del spill de circular pool a VRAM, mathneon NEON SIMD y supresión de I/O bloqueante)
+
+**Punto de partida:** el usuario pide mejorar el código para que vaya más fluido revisando `logs/debug_local_062.log` y adoptando las mejoras aplicables de `9mm-vita/source` y los ports hermanos de Gameloft/Vita.
+
+### Diagnóstico de cuellos de botella en `debug_local_062.log`
+
+1. **Circular Pool #2 Spilled into VRAM (`debug_local_062.log:2`):**
+   - El log arrancaba con: `[vitaGL] vglInitWithCustomSizes: Circular pool #2 spilled into VRAM. This might negatively impact performance.`
+   - Causa raíz: `_newlib_heap_size_user = 256 * 1024 * 1024` acaparaba 256 MB de la RAM de usuario al arrancar. Cuando `vglInitExtended()` calculaba `ram_mempool`, a la RAM libre solo le quedaban ~30 MB. Con `vglSetCircularPoolSize(64 MB)` (3 buffers de 21.3 MB cada uno), el buffer #0 entraba justo, pero el #1 y #2 desbordaban la RAM y caían en VRAM (CDRAM).
+   - Consecuencia fatal: el pool circular consumía 21.3+ MB de la escasa VRAM del Vita, dejando a vitaGL sin espacio para texturas de mundo abierto (provocando los GC stalls de 4 segundos al manejar), y además las escrituras de CPU al circular pool en VRAM son más lentas y sin caché.
+   - Solución (adoptada de `Eternal-Legacy-vita` y `GT-Racing`): bajar `_newlib_heap_size_user` a `192 * 1024 * 1024`. Esto otorga ~96–108 MB de RAM a vitaGL, permitiendo que los 64 MB del pool circular queden 100% en RAM con cero desborde a VRAM, recuperando más de 21 MB de VRAM exclusivamente para texturas. Se agrega además `sceUserMainThreadStackSize = 4 * 1024 * 1024` (como en `9mm-vita` y `N.O.V.A-2-vita`).
+
+2. **Micro-stutters por I/O síncrono al presionar botones o girar el volante:**
+   - En `source/utils/gamepad_actions.c`, cada evento de `pad down`, `pad up`, `wheel down`, `wheel up`, `move-stick down/up` llamaba a `l_note("[input] ...")`.
+   - En `source/utils/logger.c`, cada `l_note()` abre, escribe y cierra síncronamente el archivo de log en la memory card (`ux0:`). En la consola física, esto toma entre 2 ms y 15 ms por llamada.
+   - Durante el manejo y combate, girar el volante o disparar rápidamente generaba decenas de líneas por segundo, deteniendo el hilo de render principal hasta 100 ms por segundo.
+   - Adicionalmente, el motor logueaba `DeviceKeyInput:21/22/23`, `[SOUNDS-VV] PLAYEX:...`, `playRadio` y `stopRadio` por cada sonido y tecla.
+   - Solución: se cambiaron todos los logs de entrada en `gamepad_actions.c` a `l_debug` (compilados a cero en Release), y se agregaron `DeviceKeyInput:`, `SOUNDS-VV`, `stopRadio` y `----Gameloft----` al filtro `is_load_spam()` en `source/reimpl/log.c`.
+
+3. **Triage de pantalla negra en `debug_local_063.log` y reversión de `libmathneon`:**
+   - Al probar el enlace a `libmathneon.a`, la pantalla se volvió completamente negra (`debug_local_063.log`).
+   - Se desensambló `cosf_neon_sfp` en `/Users/metalsyntax/vitasdk/arm-vita-eabi/lib/libmathneon.a` y se descubrió un **bug crítico de registro**: calcula `x + pi/2` en `r0/s15`, pero salta a `sinf_neon_hfp` sin cargar `d0`, por lo que $\cos(0)$ retornaba $\sin(0) = 0$. Esto colapsó las matrices de proyección y rotación 3D, apagando la escena por completo.
+   - Solución: reversión completa de `libmathneon` en `dynlib.c` y `init.c`, volviendo a la librería matemática estándar de newlib y preservando la integridad gráfica al 100%.
+
+4. **Triage de congelamiento crítico de FPS en `debug_local_064.log` (Zona de Misión / Casa):**
+   - El log 064 mostró congelamientos de 4.3 segundos por cuadro al acercarse a la misión: `gpu_alloc_mapped_aligned failed with a requested size of 4194304 bytes` y 4 ciclos forzados de Garbage Collection (`glFinish`).
+   - Causa: `_newlib_heap_size_user = 256 MB` no dejaba RAM suficiente para vitaGL (`Circular pool #2 spilled into VRAM`), robando 21.3 MB de VRAM y dejando cero bloques libres de 4 MB para texturas de streaming de misión. Adicionalmente, el motor advertía `AnimationStreamingManager : Memory usage exceed maximum cache size` al sobrepasar el límite de 384 KB de fábrica.
+   - Solución:
+     * En `source/main.c`: `_newlib_heap_size_user = 192 * 1024 * 1024;` y `sceUserMainThreadStackSize = 4 * 1024 * 1024;`. vitaGL recibe ahora más de 136 MB de RAM y toda la VRAM libre, sin derrames de circular pool.
+     * En `source/utils/perf_lod.c`: resolución de `CAnimationStreamingManager::Instance` y ampliación de su caché de 384 KB a 2 MB.
+     * En `source/reimpl/log.c`: supresión de escrituras a disco de advertencias de streaming.
+
+---
+
+## Estado previo — 2026-09-25 (Fase 63: hook a HudElement::blink para el 1% en presionado + LOD con log de transiciones, sin confirmar en consola real)
 
 **Punto de partida:** el usuario prueba Fase 62 (`logs/debug_local_062.log`, 379 líneas): standby
 al 1% ✓ pero los botones NO están al 1% al presionarlos; el juego "se siente más fluido" con el

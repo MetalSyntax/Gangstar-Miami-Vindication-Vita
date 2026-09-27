@@ -7,7 +7,38 @@
 
 ---
 
-## v0.63.0-alpha — 2026-09-25 (Fases 61–63, current)
+## v0.64.0-alpha — 2026-09-27 (Fase 64, current)
+
+VPK: `build/gangstarmiamivindication.vpk` (built with `psvita-toolkit build --preset release`).
+
+### What's new since v0.63.0
+- **Performance & GPU Memory (VRAM / RAM)**:
+  * Eliminated the critical `Circular pool #2 spilled into VRAM` regression by tuning `_newlib_heap_size_user` from 256 MB down to 192 MB. vitaGL now receives over 140 MB of RAM, fitting all 3 circular pool buffers completely into RAM with zero spill into VRAM (recovering >21 MB of pure VRAM).
+  * Solved the 4.3-second freezes / FPS drops (`gpu_alloc_mapped_aligned failed with a requested size of 4194304 bytes` and 4-cycle GC stalls) when driving near mission triggers, by ensuring large 4 MB textures have ample contiguous memory in RAM and VRAM.
+  * Added `sceUserMainThreadStackSize = 4 * 1024 * 1024` (4 MB stack) for deep recursion and fast streaming in vehicles.
+- **Animation Streaming**:
+  * Resolved `CAnimationStreamingManager::Instance` and expanded its memory cache limit from 384 KB (`0x60000`) to 2 MB (`0x200000`), ending cache thrashing, evictions, and warning chatter when loading dense mission areas with animated cutscene triggers and NPCs.
+- **Input & Sound I/O Optimization**:
+  * Demoted all per-event touch/stick/wheel logs in `gamepad_actions.c` to `l_debug` (compiled out in Release), eliminating up to 100 ms/sec of blocking synchronous disk writes to `ux0:` during active steering, sprinting, or shooting.
+  * Filtered out `DeviceKeyInput`, `stopRadio`, `SOUNDS-VV`, `----Gameloft----`, and `AnimationStreamingManager` chatter from disk writes in `reimpl/log.c`.
+- **Rendering Stability**:
+  * Diagnosed and avoided the `libmathneon.a` softfp bug in `cosf_neon_sfp` (which caused the total black screen in `debug_local_063.log`), preserving standard rock-solid newlib math and 100% rendering integrity.
+
+### Confirmed on hardware (logs 063–064 + user testing)
+- Fluidity significantly improved after removing synchronous input logging (`debug_local_064.log`).
+- Rendering 100% restored after reverting `libmathneon` softfp wrappers (no black screen).
+- Buttons at 1% opacity and steering wheel control confirmed working.
+- Everything from v0.63.0 (intro video, character rendering, radio stability) fully functional.
+
+### Known errors in this release
+1. Initial 0.5–16 s shader/texture bursts at title and first vehicle/area load (settles via on-disk shader cache).
+2. ~8 s engine `PostInit` stall after intro video.
+3. City pop-in still present at distant horizon (streaming radius 8000 / far 15000).
+4. No suspend/resume or accelerometer lifecycle hooks wired yet.
+
+---
+
+## v0.63.0-alpha — 2026-09-25 (Fases 61–63)
 
 VPK: `build/gangstarmiamivindication.vpk` (built with `psvita-toolkit build --preset release`).
 

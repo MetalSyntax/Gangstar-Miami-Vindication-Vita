@@ -50,14 +50,25 @@ extern so_module so_mod;
 #define LOD_FAR_PLANE     15000
 
 static int32_t *s_perf = NULL;
+static void **s_anim_instance = NULL;
 
 void perf_lod_init(void) {
     s_perf = (int32_t *)so_symbol(&so_mod, "gPhonePerf");
     if (!s_perf)
         l_warn("[lod] gPhonePerf not resolved -- LOD override disabled");
+    s_anim_instance = (void **)so_symbol(&so_mod, "_ZN6glitch7collada26CAnimationStreamingManager8InstanceE");
+    if (!s_anim_instance)
+        l_warn("[lod] CAnimationStreamingManager::Instance not resolved");
 }
 
 void perf_lod_apply(void) {
+    if (s_anim_instance && *s_anim_instance) {
+        uint32_t *cache_limit = (uint32_t *)((uintptr_t)*s_anim_instance + 0x18);
+        if (*cache_limit < 0x200000) {
+            l_note("[lod] anim streaming cache limit %u -> %u (2MB)", *cache_limit, 0x200000);
+            *cache_limit = 0x200000;
+        }
+    }
     if (!s_perf)
         return;
     /* Fase 63: log every real transition instead of just the first apply.

@@ -387,8 +387,8 @@ static void pad_press(struct pad_action *a) {
         a->active = 1;
         a->x = x;
         a->y = y;
-        l_note("[input] pad %s down -> vbutton hud+0x%x @(%d,%d) slot %d",
-               a->name, off, x, y, a->slot);
+        l_debug("[input] pad %s down -> vbutton hud+0x%x @(%d,%d) slot %d",
+                a->name, off, x, y, a->slot);
         return; /* first interactable skin wins: one tap, never multi-fire */
     }
 
@@ -400,7 +400,7 @@ static void pad_release(struct pad_action *a) {
         return;
     s_touch(&jni, NULL, 0, a->x, a->y, (jlong)a->slot, 0, 0);
     a->active = 0;
-    l_note("[input] pad %s up (slot %d)", a->name, a->slot);
+    l_debug("[input] pad %s up (slot %d)", a->name, a->slot);
 }
 
 /* Locates CHudManager+GA_OFF_ANALOGSTICK, runs the same interactable gate
@@ -672,7 +672,7 @@ void gamepad_stick_update(uint32_t dpad_buttons, uint8_t lx, uint8_t ly) {
     if (wheel_ok && nx != 0.0f) {
         if (s_moveStick.active) {
             s_touch(&jni, NULL, 0, s_moveStick.last_x, s_moveStick.last_y, (jlong)s_moveStick.slot, 0, 0);
-            l_note("[input] move-stick up (slot %d)", s_moveStick.slot);
+            l_debug("[input] move-stick up (slot %d)", s_moveStick.slot);
             s_moveStick.active = 0;
         }
 
@@ -687,7 +687,7 @@ void gamepad_stick_update(uint32_t dpad_buttons, uint8_t lx, uint8_t ly) {
             s_wheelStick.last_y = s_wheelStick.cy;
             s_touch(&jni, NULL, 1, s_wheelStick.cx, s_wheelStick.cy, (jlong)s_wheelStick.slot, 0, 0);
             s_wheelStick.active = 1;
-            l_note("[input] wheel down @(%d,%d) slot %d", s_wheelStick.cx, s_wheelStick.cy, s_wheelStick.slot);
+            l_debug("[input] wheel down @(%d,%d) slot %d", s_wheelStick.cx, s_wheelStick.cy, s_wheelStick.slot);
         }
 
         /* nx > 0 (right) -> tx > down_x -> first.x - current.x < 0 -> dir=0 (right)
@@ -708,7 +708,7 @@ void gamepad_stick_update(uint32_t dpad_buttons, uint8_t lx, uint8_t ly) {
     /* No steering input (or wheel hidden now): center the wheel if held. */
     if (s_wheelStick.active) {
         s_touch(&jni, NULL, 0, s_wheelStick.last_x, s_wheelStick.last_y, (jlong)s_wheelStick.slot, 0, 0);
-        l_note("[input] wheel up (slot %d)", s_wheelStick.slot);
+        l_debug("[input] wheel up (slot %d)", s_wheelStick.slot);
         s_wheelStick.active = 0;
     }
 
@@ -717,7 +717,7 @@ void gamepad_stick_update(uint32_t dpad_buttons, uint8_t lx, uint8_t ly) {
         if (!want_active) {
             if (s_moveStick.active) {
                 s_touch(&jni, NULL, 0, s_moveStick.last_x, s_moveStick.last_y, (jlong)s_moveStick.slot, 0, 0);
-                l_note("[input] move-stick up (slot %d)", s_moveStick.slot);
+                l_debug("[input] move-stick up (slot %d)", s_moveStick.slot);
                 s_moveStick.active = 0;
             }
             return;
@@ -732,7 +732,7 @@ void gamepad_stick_update(uint32_t dpad_buttons, uint8_t lx, uint8_t ly) {
             s_moveStick.last_y = scy;
             s_touch(&jni, NULL, 1, scx, scy, (jlong)s_moveStick.slot, 0, 0);
             s_moveStick.active = 1;
-            l_note("[input] move-stick down @(%d,%d) r=(%.0f,%.0f) slot %d",
+            l_debug("[input] move-stick down @(%d,%d) r=(%.0f,%.0f) slot %d",
                    scx, scy, srx, sry, s_moveStick.slot);
         }
 
@@ -754,7 +754,7 @@ void gamepad_stick_update(uint32_t dpad_buttons, uint8_t lx, uint8_t ly) {
     /* 3. Neither stick nor wheel is interactable: release move-stick if held. */
     if (s_moveStick.active) {
         s_touch(&jni, NULL, 0, s_moveStick.last_x, s_moveStick.last_y, (jlong)s_moveStick.slot, 0, 0);
-        l_note("[input] move-stick up (slot %d)", s_moveStick.slot);
+        l_debug("[input] move-stick up (slot %d)", s_moveStick.slot);
         s_moveStick.active = 0;
     }
 }
