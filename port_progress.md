@@ -3,7 +3,22 @@
 > Bitácora cronológica, un bug confirmado a la vez. Para el estado **estructural** del port (motor,
 > mapa JNI, filesystem, niveles de logging, checklist) ver `PORTING_PLAN.md`.
 
-## Estado actual — 2026-11-23 (Fase 78: botón de cambiar arma, selector de armas y radio ocultos, diagnóstico de tirones; sin confirmar en consola real)
+## Estado actual — 2026-11-23 (v0.4.0 publicada; datos del log 078 para la próxima ronda de rendimiento)
+
+**Log 078** (Fase 78 en consola, confirmada por el usuario): release **v0.4.0** con el VPK de 195584a.
+Pendientes de rendimiento medidos con el umbral de 100 ms (94 frames lentos: 46 sin espera de I/O, 48 con ella):
+- **Primera carga:** frame 2 = 8.0 s (el núcleo 0 esperó I/O 783 ms). Los 2.0 s del log 076 no se
+  repitieron: la mejora de la Fase 74 en la primera carga NO está confirmada.
+- **Menú/título:** frames 143-180 a 170-260 ms cada uno (~4-5 fps) con I/O ≈ 0 → CPU (posiblemente el
+  menú en RenderFX); en cada frame se abre un archivo de menos de 1 KB.
+- **Carga intermedia:** 20.0 + 1.8 + 13.6 s; 285 archivos / 75 MB con 8.6 s de espera de I/O.
+- **Tirones al manejar:** de 100 a 320 ms al abrir `.tga` de 1365 KB (y de 1716 KB) cada ~8 frames
+  cuando se transmiten texturas; "core 0 waited 0 ms" → el costo es decodificar/subir la textura
+  (o la espera de `memfile_close`, que no se mide), no la lectura. Siguiente paso: medir `fclose`
+  y `glTexImage2D`.
+- Frames 2325-2333: 220-270 ms sin I/O → CPU.
+
+## Estado previo — 2026-11-23 (Fase 78: botón de cambiar arma, selector de armas y radio ocultos, diagnóstico de tirones; sin confirmar en consola real)
 
 **Log 077:** radio por Cuadrado OK; gameplay 47-60 fps (30 fijo desde el frame ~5045: el usuario activó
 FPS 30 en el menú); dos tirones de un frame (311 ms en el 5184, 163 ms en el 6036) sin detalle porque el
