@@ -46,8 +46,16 @@ extern so_module so_mod;
 #define PERF_OFF_RADIUS  12  /* gPhonePerf._12_4_: streaming radius, latched by updateStreaming() */
 #define PERF_OFF_FAR     16  /* gPhonePerf._16_4_: far plane */
 
-#define LOD_STREAM_RADIUS 8000
-#define LOD_FAR_PLANE     15000
+/* Fase 65: SELECT+START "Draw distance": FAR = Fase 63 values (default),
+ * NEAR = the engine's own Low-End profile (6000/13000) -- fewer streamed
+ * cells and less geometry past the fog, i.e. more fps in dense areas. */
+static int32_t LOD_STREAM_RADIUS = 8000;
+static int32_t LOD_FAR_PLANE     = 15000;
+
+void perf_lod_set_near(int near) {
+    LOD_STREAM_RADIUS = near ? 6000 : 8000;
+    LOD_FAR_PLANE     = near ? 13000 : 15000;
+}
 
 static int32_t *s_perf = NULL;
 static void **s_anim_instance = NULL;

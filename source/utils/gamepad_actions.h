@@ -112,10 +112,25 @@ void gamepad_actions_update(uint32_t buttons, uint32_t old_buttons);
  * buttons). Fase 51, see port_progress.md. */
 void gamepad_stick_update(uint32_t dpad_buttons, uint8_t lx, uint8_t ly);
 
+/* Fase 71: right analog stick (raw rx/ry, 128 = centered) -> a synthetic
+ * finger swipe on empty screen, which HudScreen turns into camera rotation,
+ * exactly like dragging a real finger. Releases the finger when centered or
+ * outside gameplay. */
+void gamepad_look_update(uint8_t rx, uint8_t ry);
+
 /* Current L+R override state (1 while the hidden controls are shown at full
  * opacity). Used by the HudElement::blink hook in patch.c so tutorial
  * highlights still show when the user explicitly asked to see the buttons. */
 int gamepad_alpha_full(void);
+
+/* Fase 65, SELECT+START port menu: keep the touch controls at 100% (same as
+ * holding L+R), and per-action physical-button remapping. */
+void gamepad_set_always_show(int on);
+int gamepad_action_count(void);
+const char *gamepad_action_name(int i);
+uint32_t gamepad_action_mask(int i);
+void gamepad_action_set_mask(int i, uint32_t mask);
+uint32_t gamepad_action_default_mask(int i);
 
 #ifdef __cplusplus
 }

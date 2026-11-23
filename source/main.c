@@ -5,6 +5,7 @@
 #include "utils/audio.h"
 #include "utils/gamepad_actions.h"
 #include "utils/perf_lod.h"
+#include "utils/port_menu.h"
 #include "reimpl/gl.h"
 #include "video.h"
 
@@ -137,6 +138,17 @@ int main() {
     l_checkpoint(10, "main: GameRenderer_nativeResize() done -- entering main loop");
 
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
+    // Fase 69: analog sampling was never enabled at boot (only after an IME
+    // dialog, utils/dialog.c), so pad.lx/ly stayed at 128 and the left stick
+    // never reached gamepad_stick_update() -- only the D-pad moved the player.
+    // Fase 70: the plain sceCtrlPeekBufferPositive() below reads the mode set
+    // by sceCtrlSetSamplingMode(); the ...Ext variant only configures the
+    // ...Ext/Ext2 readers (log 069: stick still dead with only Ext). Set both.
+    sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
+    sceCtrlSetSamplingModeExt(SCE_CTRL_MODE_ANALOG_WIDE);
+    // Fase 65: SELECT+START options menu (remap, touch controls, fps cap,
+    // draw distance, aspect, rear touch) -- loads port_menu.txt and applies.
+    port_menu_init();
 
     int touchSlotHwId[MAX_TOUCH_SLOTS] = {-1, -1, -1, -1, -1};
     int touchLastX[MAX_TOUCH_SLOTS] = {-1, -1, -1, -1, -1};
@@ -158,6 +170,15 @@ int main() {
     // up as slow frames -- frame 2 took ~7.8 s in logs/debug_local_020.log).
     // A frame-count modulo would go silent for minutes while loading, because
     // a single nativeRender can take seconds; wall-clock time does not.
+    static const struct { uint32_t btn; int code; } keymap[] = {
+        { SCE_CTRL_UP,    19 },
+        { SCE_CTRL_DOWN,  20 },
+        { SCE_CTRL_LEFT,  21 },
+        { SCE_CTRL_RIGHT, 22 },
+        { SCE_CTRL_CROSS, 23 },
+        { SCE_CTRL_START, 82 },
+    };
+
     int frame_no = 0;
     SceUInt64 last_beat = 0;
     int last_beat_frame = 0;
@@ -167,6 +188,32 @@ int main() {
         SceUInt64 frame_start = sceKernelGetProcessTimeWide();
         if (frame_no <= 10)
             l_note("[022] main loop: frame %d enter (t=%llu)", frame_no, frame_start);
+
+        sceCtrlPeekBufferPositive(0, &pad, 1);
+        // Fase 65: rear-touch quadrants act as extra bindable buttons (L2/R2/L3/R3).
+        pad.buttons |= port_menu_rear_buttons();
+        uint32_t pressed = pad.buttons & ~oldButtons;
+        const uint32_t menuCombo = SCE_CTRL_SELECT | SCE_CTRL_START;
+        if (!port_menu_active() && (pad.buttons & menuCombo) == menuCombo && (pressed & menuCombo)) {
+            // Release everything the game is holding before it freezes.
+            gamepad_actions_update(0, oldButtons);
+            gamepad_stick_update(0, 128, 128);
+            gamepad_look_update(128, 128);
+            for (unsigned k = 0; k < sizeof(keymap) / sizeof(keymap[0]); k++)
+                if (oldButtons & keymap[k].btn)
+                    Gangster2_nativeKeyUp(&jni, NULL, keymap[k].code);
+            port_menu_open();
+            pressed = 0;
+        }
+        if (port_menu_active()) {
+            // Game frozen: no touch/pad forwarding, no nativeRender.
+            port_menu_update(pressed);
+            oldButtons = pad.buttons; // no stray rising edges on close
+            port_menu_draw();
+            sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
+            gl_swap();
+            continue;
+        }
 
         SceTouchData touch;
         sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1);
@@ -213,7 +260,6 @@ int main() {
             }
         }
 
-        sceCtrlPeekBufferPositive(0, &pad, 1);
         // Android keycodes forwarded through the same s_keyDownCode/s_keyUpCode
         // path the real Activity uses (GameRenderer.onDrawFrame consumes them).
         // Decompiled reality check (Fase 47): Application::DeviceKeyPress
@@ -241,14 +287,6 @@ int main() {
         // *same* `goto LAB_002970cc` / pushState<GSInGameMenu>() under the
         // equivalent all-false state check, so Start already opens the pause
         // menu correctly on its own and needs no change.
-        static const struct { uint32_t btn; int code; } keymap[] = {
-            { SCE_CTRL_UP,    19 },
-            { SCE_CTRL_DOWN,  20 },
-            { SCE_CTRL_LEFT,  21 },
-            { SCE_CTRL_RIGHT, 22 },
-            { SCE_CTRL_CROSS, 23 },
-            { SCE_CTRL_START, 82 },
-        };
         for (unsigned k = 0; k < sizeof(keymap) / sizeof(keymap[0]); k++) {
             if ((pad.buttons & keymap[k].btn) && !(oldButtons & keymap[k].btn))
                 Gangster2_nativeKeyDown(&jni, NULL, keymap[k].code);
@@ -278,6 +316,7 @@ int main() {
         // this port).
         gamepad_stick_update(pad.buttons & (SCE_CTRL_UP | SCE_CTRL_DOWN | SCE_CTRL_LEFT | SCE_CTRL_RIGHT),
                               pad.lx, pad.ly);
+        gamepad_look_update(pad.rx, pad.ry); // Fase 71: right stick = swipe-look
         oldButtons = pad.buttons;
 
         GameRenderer_nativeRender(&jni, NULL);

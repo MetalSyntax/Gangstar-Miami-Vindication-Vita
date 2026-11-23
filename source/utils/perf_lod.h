@@ -22,6 +22,9 @@ void perf_lod_init(void);
  * profile-reload path. */
 void perf_lod_apply(void);
 
+/* 1 = engine Low-End draw distance (faster), 0 = extended (default). */
+void perf_lod_set_near(int near);
+
 #ifdef __cplusplus
 }
 #endif

@@ -57,7 +57,10 @@ static void blink_hook(void *th, int b1, int b2) {
         uintptr_t a = s_blinkHook.addr;
         kuKernelCpuUnrestrictedMemcpy((void *)a, s_blinkHook.orig_instr, sizeof(s_blinkHook.orig_instr));
         kuKernelFlushCaches((void *)a, sizeof(s_blinkHook.orig_instr));
-        ((void (*)(void *, int, int))a)(th, b1, b2);
+        /* blink() is Thumb: calling the even h.addr BLXes into ARM state and runs
+         * garbage (crash dump 0x00076c3d7f, PC in glf::GetColor). Use thumb_addr. */
+        uintptr_t fn = s_blinkHook.thumb_addr ? s_blinkHook.thumb_addr : a;
+        ((void (*)(void *, int, int))fn)(th, b1, b2);
         kuKernelCpuUnrestrictedMemcpy((void *)a, s_blinkHook.patch_instr, sizeof(s_blinkHook.patch_instr));
         kuKernelFlushCaches((void *)a, sizeof(s_blinkHook.patch_instr));
         return;
@@ -79,4 +82,67 @@ void so_patch(void) {
     so_flush_caches(&so_mod);
     s_blinkHooked = 1;
     l_note("[patch] HudElement::blink hooked -- tutorial highlights stay at 1% (L+R calls through)");
+}
+
+/* Fase 67: buttons still flashed at 100% while PRESSED (screenshot
+ * 2026-11-22-213124, the attack crosshair). Raw disasm of
+ * HudElement::setAlpha() (2ba98c): every visual branch ends at 2ba9f2,
+ * which publishes `this+0x44` (the 4 RGBA quads we stamp to alpha 0) into the
+ * global colour pointer that ASprite::PaintFrame() uses; resetAlpha() nulls
+ * it again after each draw. The PRESSED branch (flags&6 != 4, 2baa58) instead
+ * does `str 0xff,[r4,#0x54]; b 2ba9fa` -- it returns WITHOUT publishing, so
+ * the pointer stays NULL and the sprite paints with the default opaque
+ * colour, whatever alpha we stamped. (Fase 62's "pressed leaves the quads
+ * untouched, so 3 survives" was half right: the quads survive, but nobody
+ * reads them.) Fix: retarget that one `b` (2baa5c) to 2ba9f2 while the
+ * controls are hidden, so a pressed widget draws with its stamped quads
+ * (r4 = this and r5 = GOT base are both still live there). Restored to the
+ * original branch whenever the controls are shown (L+R / menu SHOWN), so
+ * pressed feedback is stock then. Side effect while hidden: other pressable
+ * HUD widgets we don't stamp draw pressed at their idle alpha instead of 255. */
+/* Fase 68: the steering wheel. Wheel::draw2d (2c0e18) tests flags bit1
+ * (pressed = being steered) at 2c0e34/2c0e36: NOT pressed -> `b 2c100a` =
+ * HudElement::draw2d (setAlpha path, honours our stamps); pressed -> its own
+ * rotated PaintFrame that never calls setAlpha, i.e. always opaque (log 068,
+ * "the wheel shows while driving"). While hidden, the `bmi` at 2c0e36 becomes
+ * a NOP so a steered wheel also takes the stamped HudElement::draw2d path
+ * (drawn unrotated at alpha 0 -- invisible either way). AnalogStick/
+ * SlideControl draw2d both call setAlpha, covered by the branch above. */
+static const struct {
+    const char *sym;
+    uint32_t off;      /* from the function start */
+    uint16_t stock, hidden;
+    const char *what;
+} s_hudPatches[] = {
+    { "_ZNK10HudElement8setAlphaEv", 0x2baa5c - 0x2ba98c, 0xe7cd /* b 2ba9fa */, 0xe7c9 /* b 2ba9f2 */, "setAlpha pressed branch" },
+    { "_ZNK5Wheel6draw2dEv",         0x2c0e36 - 0x2c0e18, 0xd400 /* bmi 2c0e3a */, 0x46c0 /* nop */,   "Wheel pressed draw" },
+};
+#define N_HUD_PATCHES (sizeof(s_hudPatches) / sizeof(s_hudPatches[0]))
+static uint16_t *s_hudPatchAddr[N_HUD_PATCHES];
+
+void patch_hud_pressed_alpha(int hidden) {
+    static int resolved = 0, state = -1;
+    if (!resolved) {
+        resolved = 1;
+        for (unsigned i = 0; i < N_HUD_PATCHES; i++) {
+            uintptr_t f = (uintptr_t)so_symbol(&so_mod, s_hudPatches[i].sym);
+            uint16_t *p = f ? (uint16_t *)((f & ~1u) + s_hudPatches[i].off) : NULL;
+            if (p && (*p == s_hudPatches[i].stock || *p == s_hudPatches[i].hidden))
+                s_hudPatchAddr[i] = p;
+            else
+                l_warn("[patch] %s not found (got 0x%04x) -- stays visible when pressed",
+                       s_hudPatches[i].what, p ? *p : 0);
+        }
+    }
+    if (state == hidden)
+        return;
+    state = hidden;
+    for (unsigned i = 0; i < N_HUD_PATCHES; i++) {
+        if (!s_hudPatchAddr[i])
+            continue;
+        uint16_t insn = hidden ? s_hudPatches[i].hidden : s_hudPatches[i].stock;
+        kuKernelCpuUnrestrictedMemcpy(s_hudPatchAddr[i], &insn, sizeof(insn));
+        kuKernelFlushCaches(s_hudPatchAddr[i], sizeof(insn));
+    }
+    l_note("[patch] pressed HUD draws (setAlpha + Wheel) -> %s", hidden ? "hidden (stamped alpha)" : "stock");
 }

@@ -131,7 +131,7 @@ extern "C" {
  * thread and the render thread. 3 slots is a frame being displayed, a frame
  * ready to go, and a frame being converted.
  */
-#define VIDEO_FRAME_SLOTS 3
+#define VIDEO_FRAME_SLOTS 4  /* Fase 66: YUV refs (~600KB each), one more of decode-ahead slack */
 
 // Compressed audio packets, demuxed up front (see mp4_demux_audio_all()).
 // Sized for the whole AAC track plus slack: intro.m4v carries 367 audio
@@ -175,6 +175,15 @@ extern "C" {
  * frames are decoded one at a time in order.
  */
 #define VIDEO_DECODE_THREADS 1
+
+/* Fase 67: YUV->RGB on the GPU. The frame's three planes are packed (stride
+ * removed, ~1 ms memcpy) and uploaded as a VGL_YUV420P_BT601 texture; the
+ * GXM sampler converts while sampling (SCE_GXM_TEXTURE_FORMAT_YUV420P3_CSC0),
+ * still drawn by the GLES1 fixed pipeline -- no GLSL (see draw_video_frame()).
+ * Same glCompressedTexImage2D path as Asphalt-7/Gangstar-Rio/MC5/MC2B in this
+ * workspace. Log 067: the NEON convert cost 12.5 ms + 3.1 ms RGB upload per
+ * presented frame on core 0. Set to 0 to go back to the NEON RGB565 path. */
+#define VIDEO_GPU_YUV 1
 
 static const AVRational kUsTimeBase = { 1, 1000000 };
 
@@ -858,9 +867,15 @@ static void video_log_startup_benchmark(void) {
 // Playback state shared by the three threads
 // ---------------------------------------------------------------------------
 
+/* Fase 66: a slot holds a REFERENCE to the decoded YUV frame, not RGB.
+ * The YUV->RGB565 conversion moved from the decode thread to the present
+ * thread (core 0, otherwise idle in sceKernelDelayThread): log 066 had the
+ * decode thread doing decode 15.9 ms + convert 13.2 ms serially per frame,
+ * and converting the 23 frames that were then dropped late. Now decode and
+ * convert run in parallel on different cores, and only presented frames
+ * are converted. */
 struct FrameSlot {
-    unsigned short *rgb;
-    unsigned        cap;      // bytes actually allocated
+    AVFrame        *frm;
     unsigned        w, h;
     int64_t         pts_us;
 };
@@ -899,6 +914,7 @@ static struct Playback {
     int               arate;
     int               achannels;
     volatile uint32_t aplayed;      // frames the hardware has finished playing
+    volatile int64_t  aplayed_at_us; // Fase 68: now_us() of the last aplayed bump
     int64_t           abase_us;     // pts of the very first sample submitted
     volatile bool     aclock_valid;
 
@@ -910,7 +926,7 @@ static struct Playback {
     int64_t          wall_base_us;
 
     /* Stats, for the one summary line at the end. */
-    int              decoded, presented, dropped_late;
+    int              decoded, presented, dropped_late, dropped_at_decode;
     uint64_t         decode_us, convert_us, upload_us, draw_us;
 } P;
 
@@ -926,7 +942,16 @@ static struct Playback {
 static int64_t playback_clock_us(void) {
     if (P.aclock_valid) {
         uint32_t played = P.aplayed;
-        return P.abase_us + (int64_t) played * 1000000LL / (int64_t) P.arate;
+        // Fase 68: interpolate inside the current 1024-frame block (21.3 ms).
+        // The raw clock moved in 21.3 ms steps; that lag + the 8 ms sleep cap
+        // + vsync ate most of the 40 ms frame interval, and the drop-to-latest
+        // rule below then discarded every other frame (log 068: 88 drops, all
+        // at present time, "at decode 0").
+        int64_t since = now_us() - P.aplayed_at_us;
+        int64_t grain = (int64_t) AUDIO_GRAIN * 1000000LL / (int64_t) P.arate;
+        if (since < 0) since = 0;
+        if (since > grain) since = grain;
+        return P.abase_us + (int64_t) played * 1000000LL / (int64_t) P.arate + since;
     }
     return now_us() - P.wall_base_us;
 }
@@ -962,30 +987,18 @@ static bool ring_try_push(const AVFrame *f, int64_t pts_us) {
     unsigned h = ((unsigned) f->height) & ~1u;
     if (!w || !h)
         return false;
-    unsigned need = w * h * (unsigned) sizeof(unsigned short);
-
     if (ring_count() >= P.nslots)
         return false;  // full: caller holds the frame and retries later
     if (P.quit)
         return false;
 
     FrameSlot *s = &P.slots[P.tail];
-    if (s->cap < need) {
-        free(s->rgb);
-        s->rgb = (unsigned short *) malloc(need);
-        s->cap = s->rgb ? need : 0;
-    }
-    if (!s->rgb) {
-        l_error("video: out of memory for a %ux%u RGB565 frame slot", w, h);
+    if (!s->frm)
+        s->frm = av_frame_alloc();
+    if (!s->frm || av_frame_ref(s->frm, f) < 0) {
+        l_error("video: out of memory referencing a %ux%u frame", w, h);
         return false;
     }
-
-    uint64_t t0 = (uint64_t) now_us();
-    yuv420p_planar_to_rgb565(f->data[0], f->linesize[0],
-                              f->data[1], f->linesize[1],
-                              f->data[2], f->linesize[2],
-                              w, h, s->rgb);
-    P.convert_us += (uint64_t) now_us() - t0;
 
     s->w = w;
     s->h = h;
@@ -1055,7 +1068,7 @@ static bool gFirstDrawLogged = false;
  * fixed-function texturing -- see the file header for why this is
  * deliberately NOT a custom GLSL program.
  */
-static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned h) {
+static void draw_video_frame(const void *pixels, unsigned w, unsigned h) {
     FIRST_DRAW_LOG("video: draw_video_frame ENTER (%ux%u)", w, h);
 
     uint64_t t_upload0 = (uint64_t) now_us();
@@ -1068,13 +1081,24 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+#if !VIDEO_GPU_YUV
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, (GLsizei) w, (GLsizei) h, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, NULL);
         FIRST_DRAW_LOG("video: glTexImage2D returned (err=0x%04x)", glGetError());
+#endif
         gVideoTexW = w;
         gVideoTexH = h;
     }
     glBindTexture(GL_TEXTURE_2D, gVideoTex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) w, (GLsizei) h, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, rgb565);
+#if VIDEO_GPU_YUV
+    // Planar formats have no glTexSubImage2D in vitaGL: (re)allocate per frame.
+    glCompressedTexImage2D(GL_TEXTURE_2D, 0, VGL_YUV420P_BT601, (GLsizei) w, (GLsizei) h, 0,
+                           (GLsizei) (w * h + 2 * ((w / 2) * (h / 2))), pixels);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    FIRST_DRAW_LOG("video: YUV420P texture upload (err=0x%04x)", glGetError());
+#else
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) w, (GLsizei) h, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, pixels);
+#endif
 
     uint64_t t_draw0 = (uint64_t) now_us();
     P.upload_us += t_draw0 - t_upload0;
@@ -1226,8 +1250,10 @@ static void *cutscene_audio_thread(void *arg) {
                     memmove(acc, acc + (size_t) AUDIO_GRAIN * ch,
                             (size_t) accFrames * ch * sizeof(int16_t));
                 sceAudioOutOutput(P.aport, blocks[blk]);
-                if (blocksOut > 0)
+                if (blocksOut > 0) {
                     P.aplayed += AUDIO_GRAIN;
+                    P.aplayed_at_us = now_us();
+                }
                 blocksOut++;
                 blk ^= 1;
                 if (P.quit)
@@ -1281,6 +1307,7 @@ static void *cutscene_audio_thread(void *arg) {
                     P.abase_us = (frame->pts != AV_NOPTS_VALUE)
                                      ? av_rescale_q(frame->pts, P.atb, kUsTimeBase) : 0;
                     __sync_synchronize();
+                    P.aplayed_at_us = now_us();
                     P.aclock_valid = true;
                     l_note("video: first audio frame decoded (out %d Hz, %d ch, base=%lldus)",
                            P.arate, ch, (long long) P.abase_us);
@@ -1307,6 +1334,7 @@ static void *cutscene_audio_thread(void *arg) {
                 memset(blocks[blk], 0, blockBytes);
                 sceAudioOutOutput(P.aport, blocks[blk]);
                 P.aplayed += AUDIO_GRAIN;
+                P.aplayed_at_us = now_us();
             }
         }
     }
@@ -1353,13 +1381,18 @@ static int handle_decoded_frame_try(const AVFrame *f, int64_t *last_pts_us, int6
                              : (late < 100000 ? AVDISCARD_DEFAULT : P.vctx->skip_frame);
         if (late > P.frame_period_us + P.frame_period_us / 2) {
             P.dropped_late++;
+            P.dropped_at_decode++;  // Fase 67: already late leaving the decoder
             return 0;
         }
     }
 
+    // Fase 71: set BEFORE the full-ring return. It used to be set only on
+    // success, so every frame stashed in `held` re-entered the ring with
+    // pts 0 -> "late by the whole clock" (log 070: lateness max=4239ms) ->
+    // dropped at present. That was the ~12 fps intro, not CPU starvation.
+    *out_pts_us = pts_us;
     if (!ring_try_push(f, pts_us))
         return 2;
-    *out_pts_us = pts_us;
     return 1;
 }
 
@@ -1390,7 +1423,8 @@ static void *video_decode_thread(void *arg) {
     // not. Set from inside the thread (has to be a real pthread; see the
     // file header), not at creation.
     sceKernelChangeThreadPriority(0, 0x60);
-    sceKernelChangeThreadCpuAffinityMask(0, SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2);
+    // Fase 71: core 1 only -- core 2 is the audio core (mixer, loader, cutscene audio).
+    sceKernelChangeThreadCpuAffinityMask(0, SCE_KERNEL_CPU_MASK_USER_1);
 
     AVPacket *pkt = av_packet_alloc();
     AVFrame  *frame = av_frame_alloc();
@@ -1611,12 +1645,15 @@ void video_init() {
     video_log_startup_benchmark();
 }
 
+static unsigned short *gPresentRgb = NULL;  // present-thread conversion target
+static unsigned gPresentRgbCap = 0;
+
 static void free_frame_slots(void) {
-    for (int i = 0; i < VIDEO_FRAME_SLOTS; i++) {
-        free(P.slots[i].rgb);
-        P.slots[i].rgb = NULL;
-        P.slots[i].cap = 0;
-    }
+    for (int i = 0; i < VIDEO_FRAME_SLOTS; i++)
+        av_frame_free(&P.slots[i].frm);
+    free(gPresentRgb);
+    gPresentRgb = NULL;
+    gPresentRgbCap = 0;
 }
 
 void video_shutdown() {
@@ -1744,9 +1781,9 @@ void video_play(const char *name) {
     P.demux_eof = false;
     P.aport = -1;
     P.arate = 0; P.achannels = 0;
-    P.aplayed = 0; P.abase_us = 0; P.aclock_valid = false;
+    P.aplayed = 0; P.aplayed_at_us = 0; P.abase_us = 0; P.aclock_valid = false;
     P.quit = false; P.decode_done = false; P.audio_done = false; P.presenting = false;
-    P.decoded = P.presented = P.dropped_late = 0;
+    P.decoded = P.presented = P.dropped_late = P.dropped_at_decode = 0;
     P.decode_us = P.convert_us = P.upload_us = P.draw_us = 0;
     P.nslots = VIDEO_FRAME_SLOTS;
     P.frame_period_us = VIDEO_FRAME_PERIOD_US;
@@ -1946,6 +1983,13 @@ void video_play(const char *name) {
         int64_t last_present_us = 0;  // wall time of the last gl_swap; 0 = none yet
 
         l_note("video: present loop starting");
+        // Fase 70: log 069 -- 87 frames dropped at present time (decoder never
+        // late, present work ~6 ms/frame), i.e. this thread keeps waking up
+        // >33 ms late: something preempts it on core 0. Run the present loop
+        // above the decode thread (0x60), below the audio threads (0x40).
+        int old_prio = sceKernelGetThreadCurrentPriority();
+        sceKernelChangeThreadPriority(0, 0x50);
+        int64_t late_max = 0, late_sum = 0;
 
         while (!P.quit) {
             sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
@@ -1998,14 +2042,17 @@ void video_play(const char *name) {
                 continue;
             }
 
-            // Drop-to-latest: if the frame after head is due as well, head's
-            // slot has already passed -- skip straight to the newest due
-            // frame instead of delaying it further.
+            // Drop-to-latest, only when really behind: drop head if the frame
+            // after it is late by MORE than a full period. Fase 68: dropping as
+            // soon as the next one was merely due threw away every other frame
+            // on clock/sleep/vsync jitter (log 068); being one frame behind is
+            // now caught up by the 30 Hz tick (25 fps content) instead.
             while (count >= 2) {
                 int nxt = (head + 1) % P.nslots;
-                if (P.slots[nxt].pts_us > clk)
+                if (P.slots[nxt].pts_us > clk - P.frame_period_us)
                     break;
                 pthread_mutex_lock(&P.ring_lock);
+                av_frame_unref(P.slots[head].frm);  // never converted: free it now
                 P.head = nxt;
                 P.count--;
                 head = P.head;
@@ -2031,7 +2078,47 @@ void video_play(const char *name) {
                 }
             }
 
-            draw_video_frame(s->rgb, s->w, s->h);
+#if VIDEO_GPU_YUV
+            unsigned need = s->w * s->h + 2 * ((s->w / 2) * (s->h / 2));
+#else
+            unsigned need = s->w * s->h * (unsigned) sizeof(unsigned short);
+#endif
+            if (gPresentRgbCap < need) {
+                free(gPresentRgb);
+                gPresentRgb = (unsigned short *) malloc(need);
+                gPresentRgbCap = gPresentRgb ? need : 0;
+            }
+            if (gPresentRgb) {
+                uint64_t t0 = (uint64_t) now_us();
+#if VIDEO_GPU_YUV
+                // Pack Y/U/V without stride; the GPU does the colour conversion.
+                unsigned char *dy = (unsigned char *) gPresentRgb;
+                unsigned hw = s->w / 2, hh = s->h / 2;
+                unsigned char *du = dy + s->w * s->h, *dv = du + hw * hh;
+                for (unsigned y = 0; y < s->h; y++)
+                    memcpy(dy + y * s->w, s->frm->data[0] + y * s->frm->linesize[0], s->w);
+                for (unsigned y = 0; y < hh; y++) {
+                    memcpy(du + y * hw, s->frm->data[1] + y * s->frm->linesize[1], hw);
+                    memcpy(dv + y * hw, s->frm->data[2] + y * s->frm->linesize[2], hw);
+                }
+#else
+                yuv420p_planar_to_rgb565(s->frm->data[0], s->frm->linesize[0],
+                                         s->frm->data[1], s->frm->linesize[1],
+                                         s->frm->data[2], s->frm->linesize[2],
+                                         s->w, s->h, gPresentRgb);
+#endif
+                P.convert_us += (uint64_t) now_us() - t0;
+            }
+            av_frame_unref(s->frm);
+            if (gPresentRgb)
+                draw_video_frame(gPresentRgb, s->w, s->h);
+            else
+                l_error("video: out of memory for the %ux%u RGB565 present buffer", s->w, s->h);
+            {
+                int64_t late = clk - s->pts_us;
+                if (late > late_max) late_max = late;
+                late_sum += late;
+            }
             P.presented++;
             last_present_us = now_us();
 
@@ -2048,14 +2135,18 @@ void video_play(const char *name) {
                 sceKernelDelayThread(2000);
         }
 
+        sceKernelChangeThreadPriority(0, old_prio);
+        l_note("video: present lateness avg=%lldms max=%lldms (priority %d -> 0x50 during playback)",
+               (long long) (P.presented ? late_sum / P.presented / 1000 : 0),
+               (long long) (late_max / 1000), old_prio);
         int64_t play_end = now_us();
         double elapsed = (double) (play_end - play_start) / 1000000.0;
         double avg_fps = elapsed > 0.0 ? (double) P.presented / elapsed : 0.0;
         int div = P.presented > 0 ? P.presented : 1;
-        l_note("video: loop exited! presented=%d, decoded=%d, dropped_late=%d, audio_frames_played=%u, "
+        l_note("video: loop exited! presented=%d, decoded=%d, dropped_late=%d (at decode %d), audio_frames_played=%u, "
                "elapsed=%.2fs, avg_fps=%.1f [decode=%.1fms/frame, yuv_convert=%.1fms/frame, "
                "tex_upload=%.1fms/frame, gl_draw+swap=%.1fms/frame]",
-               P.presented, P.decoded, P.dropped_late, (unsigned) P.aplayed, elapsed, avg_fps,
+               P.presented, P.decoded, P.dropped_late, P.dropped_at_decode, (unsigned) P.aplayed, elapsed, avg_fps,
                ((double) P.decode_us / 1000.0) / div,
                ((double) P.convert_us / 1000.0) / div,
                ((double) P.upload_us / 1000.0) / div,

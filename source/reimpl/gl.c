@@ -83,6 +83,8 @@ static SceUInt64 gl_stat_last_beat;
 
 static void gl_probe_dump_state(GLenum mode, GLsizei count);
 
+int gl_aspect_original = 0;
+
 void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count) {
     gl_stat_draws++;
     gl_probe_dump_state(mode, count);
@@ -114,8 +116,12 @@ void glViewport_soloader(GLint x, GLint y, GLsizei w, GLsizei h) {
     // los FBOs offscreen se dejan intactos (ahi las medidas son reales).
     // 480*544/480 = 544 exacto; el clamp de abajo absorbe el resto.
     if (gl_stat_cur_fbo == 0) {
-        y = (y * 544) / 480;
-        h = (h * 544) / 480;
+        if (gl_aspect_original) {
+            y += 32; /* Fase 65: SELECT+START "Aspect ratio: ORIGINAL" -- 960x480 letterboxed */
+        } else {
+            y = (y * 544) / 480;
+            h = (h * 544) / 480;
+        }
     }
     // Fase 24: clamp al panel 960x544. Un rect fuera de rango (o NaN
     // convertido a int gigante) colgaria la GPU (ver Asphalt-5-Vita). El
@@ -133,8 +139,12 @@ void glScissor_soloader(GLint x, GLint y, GLsizei w, GLsizei h) {
     // Fase 26: mismo estirado que el viewport para que el recorte de UI
     // coincida con la geometria estirada (solo framebuffer default).
     if (gl_stat_cur_fbo == 0) {
-        y = (y * 544) / 480;
-        h = (h * 544) / 480;
+        if (gl_aspect_original) {
+            y += 32; /* Fase 65: SELECT+START "Aspect ratio: ORIGINAL" -- 960x480 letterboxed */
+        } else {
+            y = (y * 544) / 480;
+            h = (h * 544) / 480;
+        }
     }
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }

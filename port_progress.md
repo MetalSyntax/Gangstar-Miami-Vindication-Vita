@@ -3,7 +3,166 @@
 > Bitácora cronológica, un bug confirmado a la vez. Para el estado **estructural** del port (motor,
 > mapa JNI, filesystem, niveles de logging, checklist) ver `PORTING_PLAN.md`.
 
-## Estado actual — 2026-09-27 (Fase 64: optimizaciones de fluidez inspiradas en 9mm-vita y ports hermanos, eliminación del spill de circular pool a VRAM, mathneon NEON SIMD y supresión de I/O bloqueante)
+## Estado actual — 2026-11-23 (Fase 71: intro a ~12 fps = pts 0 en frames retenidos; stick derecho = cámara por swipe; audio entero en el núcleo 2; sin confirmar en consola real)
+
+**Log 070** (Fase 70 en consola): `present lateness avg=631ms max=4239ms`, `presented=59 dropped_late=51
+(at decode 0)`. Una lateness de 4 s con un ring de 4 slots es imposible por CPU: es un pts falso.
+
+- **Intro (causa raíz):** `handle_decoded_frame_try()` escribía `*out_pts_us` solo si el push al ring
+  salía bien. Con el ring lleno (estado normal: decode 20 ms/frame contra 40 ms del contenido) devolvía
+  2 con `pts_us = 0`, y el frame retenido (`held`) entraba después al ring con **pts 0** → "atrasado por
+  todo el reloj" → tirado en presentación. Eso era el ~50 % de descarte de las Fases 66-70, no el
+  scheduler. Fix: asignar el pts antes del `return 2`. `ffprobe` del `intro.m4v` de la consola: solo
+  I/P, pts = dts, sin B-frames (se descartó el reordenamiento).
+- **Stick derecho (corrige la conclusión de la Fase 51):** la cámara SÍ es táctil, vía el widget de
+  pantalla completa `HudScreen` (`CHudManager+0x90`): `HudScreen::processTouch` pasa el desplazamiento
+  de cada MOVE a `updateAngles(dx,dy)` (vtable+0x18) de la cámara a pie (0) y del vehículo (1).
+  `gamepad_look_update(rx, ry)` sintetiza un swipe en el centro (480,240, slot 27) a 14 px/frame con
+  deflexión máxima, y suelta y re-presiona antes de salir de una caja de ±200x±150. El primer MOVE es
+  ≥10 px porque `processTouchRelease` toma <10 px y <500 ms como TAP (lock de objetivo o reset de
+  cámara). Solo actúa con `HudScreen+0x58` encendido y con el stick o el volante interactuable.
+- **Audio en un núcleo:** `gmv_audio_load` pasa del núcleo 1 al 2, junto al mezclador (0x40) y al audio
+  del intro. El decode del video queda solo en el núcleo 1. Núcleo 0 = render.
+
+## Estado previo — 2026-11-22 (Fase 70: stick muerto por modo Ext, audio en 2 hilos/núcleos, prioridad del intro, SKIP_ERROR_HANDLING; sin confirmar en consola real)
+
+**Log 069** (Fase 68/69): intro `presented=97 dropped_late=87 (at decode 0)` -- la interpolación del
+reloj y la regla de descarte suave NO cambiaron nada, así que el problema no es jitter del reloj:
+el hilo de presentación (núcleo 0, ~6 ms de trabajo/frame) se despierta >33 ms tarde una y otra vez.
+Gameplay mediana 37 fps. Stick izquierdo sigue sin mover.
+
+- **Stick:** Fase 69 usó `sceCtrlSetSamplingModeExt`, que configura los lectores `...Ext/Ext2`;
+  `main.c` lee con `sceCtrlPeekBufferPositive`, que usa `sceCtrlSetSamplingMode`. Se llaman ambos.
+  Log único `[input] left stick live (lx=.. ly=..)` para confirmar ejes vivos.
+- **Audio (2 núcleos):** el mezclador `gmv_audio_mix` decodificaba OGG de SFX completos y hacía
+  `ov_open` de streams EN LÍNEA antes de cada tick de mezcla -- arrancar un sonido (motor, disparo,
+  radio) frenaba la salida y el hardware se quedaba sin datos. El drenaje de peticiones pasa a
+  `audio_drain_requests()` en un hilo nuevo `gmv_audio_load` (núcleo 1, cada 2 ms); el mezclador
+  (núcleo 2) queda solo mezclando, con prioridad 0x40 (antes la default). Código del drenaje sin
+  cambios (ya corría sin lock e instala bajo `audio_mutex`).
+  Pendiente conocido: `ov_read` de streams grandes sigue dentro de la sección con lock del mezclador.
+- **Intro:** durante la reproducción el hilo de presentación sube a prioridad 0x50 (sobre el decode
+  0x60, bajo audio 0x40) y se restaura al salir. Nueva línea `video: present lateness avg/max`
+  para medir el atraso real al presentar.
+- **vitaGL (de brenu/gangstar-rio-vita, perfil `config/tested.sh`):** `SKIP_ERROR_HANDLING`
+  reactivado (se había sacado en Fase 43 solo para diagnosticar; 0 errores en logs 066-069) y
+  `LOG_ERRORS` apagado. NO adoptados: `MATH_SPEEDHACK` (reemplaza en vez de componer
+  glOrthof/glFrustumf -- este motor GLES1 los usa; brenu es GLES2) y `BUFFERS_SPEEDHACK` (reescribe
+  VBOs en uso por la GPU, la carrera que se persiguió en Fases 39-41).
+
+## Estado previo — 2026-11-22 (Fase 69: el stick izquierdo no movía al personaje; sin confirmar en consola real)
+
+- Reporte del usuario: la cruceta mueve al personaje, el stick izquierdo no.
+- Causa: `sceCtrlSetSamplingModeExt(SCE_CTRL_MODE_ANALOG_WIDE)` solo se llamaba en
+  `utils/dialog.c` tras cerrar un IME; al arrancar el pad quedaba en modo digital y
+  `pad.lx/ly` = 128 fijo, así que `gamepad_stick_update()` (que ya mezcla stick + cruceta, zona
+  muerta 24) nunca veía desviación. Fix: activarlo en `main.c` junto al muestreo táctil.
+  Afecta también al volante (el stick ya gira el volante por la misma ruta que la cruceta).
+
+## Estado previo — 2026-11-22 (Fase 68: volante visible al conducir, frames del intro tirados por jitter de reloj, revert de hilos a núcleos 1-2; sin confirmar en consola real)
+
+**Log 068** (Fase 67 en consola): intro `presented=96 dropped_late=88 (at decode 0) avg_fps=12.3`,
+convert 2.8 ms (YUV por GPU OK, colores sin queja); gameplay mediana 40 fps (antes 45); cargas de
+13.5 s y 15.2 s (frames 312/314; en 067 eran 8.5/5.1 s); el usuario reporta audio entrecortado
+(motor y radio) y el volante visible al conducir con los controles ocultos.
+
+- **Revert Fase 67 `pthr.c`** (hilos del motor a núcleos 1-2): coincidió con audio cortado, cargas
+  ~2x más lentas y peor fps. El hilo #1 nace en la carga (línea 89) -- es trabajo que el render
+  espera, y en el núcleo 2 compite con `gmv_audio_mix` (misma prioridad). No afectaba al intro
+  (los hilos nacen después del video).
+- **Intro:** los 88 descartes son TODOS en presentación (el decoder nunca entrega tarde). El reloj
+  de audio avanzaba en saltos de 21.3 ms; sumado al sleep de 8 ms y al vsync se comía el intervalo
+  de 40 ms y la regla drop-to-latest ("el siguiente ya toca") tiraba frame por medio. Fix:
+  `playback_clock_us()` interpola dentro del bloque (`aplayed_at_us`, tope 1 bloque) y solo se
+  descarta si el siguiente frame va atrasado más de un periodo; el tick de 30 Hz recupera el atraso.
+- **Volante:** `Wheel::draw2d` (2c0e18) con bit1 (presionado = conduciendo) usa su propio
+  PaintFrame rotado sin `setAlpha` → opaco siempre. Con los controles ocultos, el `bmi` de 2c0e36
+  (0xd400) pasa a NOP (0x46c0) y cae en `HudElement::draw2d` (respeta los stamps). Va en la misma
+  tabla que el parche de `setAlpha` (`patch.c: s_hudPatches`), se restaura con L+R / SHOWN.
+  AnalogStick/SlideControl::draw2d sí llaman a setAlpha (cubiertos).
+
+## Estado previo — 2026-11-22 (Fase 67: botones visibles al presionar = rama "pressed" de setAlpha sin publicar colores; hilos del motor fuera del núcleo 0; intro con YUV por GPU; sin confirmar en consola real)
+
+**Entrada:** `logs/debug_local_067.log` + captura `screenshots/ij/2026-11-22/2026-11-22-213124.jpg`
+(mira de ataque visible al presionar, con alpha 0 en los stamps).
+
+### Controles visibles al presionar (causa confirmada en desensamblado crudo)
+`HudElement::draw2d` = `setAlpha(); PaintFrame(); resetAlpha()`. Todas las ramas visuales de
+`setAlpha()` terminan en `2ba9f2`, que publica `this+0x44` (los 4 quads RGBA) en el puntero global
+de color que usa `PaintFrame`; `resetAlpha()` lo pone en NULL tras cada draw. La rama **pressed**
+(`flags&6 != 4`, `2baa58`) hace `str 0xff,[r4,#0x54]; b 2ba9fa` → retorna **sin publicar** → NULL →
+color por defecto opaco. La nota de Fase 62 ("los quads sobreviven") era cierta pero irrelevante:
+nadie los lee. **Fix (`patch.c: patch_hud_pressed_alpha`):** con los controles ocultos, el `b` de
+`2baa5c` (0xe7cd) se redirige a `2ba9f2` (0xe7c9); se restaura con L+R / menú SHOWN. Se verifica el
+halfword antes de escribir. Efecto lateral: otros widgets pulsables no estampados se ven al alpha
+idle en vez de 255 mientras está oculto. No se tocó la rama de fade por timer (`2bab1a`, mismo
+patrón) porque también la usan widgets ajenos con quads posiblemente sin inicializar.
+
+### Rendimiento
+- Log 067: gameplay mediana 45 fps (39 latidos, mín. 0.3 en cargas). Intro: `presented=111 decoded=184
+  dropped_late=73 avg_fps=14.2`, convert 12.5 ms en el hilo principal vs 6.3 ms del benchmark de
+  arranque → algo le roba ~la mitad del núcleo 0.
+- `pthr.c`: todo hilo creado por el motor se fija a núcleos 1-2 vía trampolín (el render ya está
+  fijo al 0 desde init.c). Log `[pthr] engine thread #N -> cores 1-2` por hilo creado.
+- `video.cpp` (`VIDEO_GPU_YUV 1`): los planos Y/U/V se empaquetan (~1 ms) y se suben como
+  `VGL_YUV420P_BT601`; el sampler GXM convierte (CSC0), pipeline fijo, sin GLSL. Misma ruta que
+  Asphalt-7/Gangstar-Rio/MC5/MC2B. `0` vuelve a NEON.
+- Resumen del video ahora separa `dropped_late (at decode N)` para saber si los frames llegan tarde
+  del decoder o se pierden en la presentación.
+
+## Estado previo — 2026-11-22 (Fase 66: intro a 15 fps -> conversión YUV movida al hilo de presentación; sin confirmar en consola real)
+
+**Log 066:** `presented=34, decoded=60, dropped_late=23, elapsed=2.22s, avg_fps=15.3 [decode=15.9ms,
+yuv_convert=13.2ms, tex_upload=3.2ms]`. El decoder sí sostenía ~27 fps; el problema era que el hilo
+de decode hacía decode + conversión YUV->RGB565 **en serie** (~29 ms/frame, con la conversión al
+doble de su benchmark de arranque de 6.3 ms por pelear núcleo) y convertía también los 23 frames
+que después se tiraban por tarde. El hilo de presentación (núcleo 0) estaba ocioso.
+
+**Fix (`source/video.cpp`):** el ring guarda referencias `AVFrame` (`av_frame_ref`) en vez de RGB;
+el hilo de presentación convierte solo el frame que va a mostrar, a un buffer RGB único. Los frames
+descartados se liberan sin convertir. `VIDEO_FRAME_SLOTS` 3 -> 4 (más margen de decode-ahead).
+Esperado: decode (~16 ms) y conversión (~6 ms) en paralelo en núcleos distintos -> 25-30 fps.
+
+## Estado previo — 2026-11-22 (Fase 65: crash al sostener L+R en `blink_hook`, controles a 0%, menú SELECT+START estilo Zenonia 2 / Inotia 4; sin confirmar en consola real)
+
+**Punto de partida:** `logs/debug_local_066.log` termina en `touch controls opacity -> 100% (L+R held)`
+y el dump `...-0x00076c3d7f-eboot.bin.psp2dmp` tiene PC en `libGangster2.so+0x51193c` (dentro de
+`glf::GetColor`, basura) con **LR en `blink_hook` (source/patch.c)**.
+
+### Causa raíz del crash (confirmada en el binario)
+- `HudElement::blink(bool,bool)` en `0x2ba938` es **Thumb** (`objdump`: `push {r4,r5,r6,lr}` de 16 bits).
+  `hook_thumb()` guarda `h.addr` con el bit 0 limpio (y `h.thumb_addr` con el bit puesto).
+- El call-through de `blink_hook` (solo con L+R sostenido) llamaba `((fn)s_blinkHook.addr)(...)`:
+  dirección par → `BLX` cambia a estado ARM sobre código Thumb → ejecución de basura → crash lejos.
+- Fix: llamar `s_blinkHook.thumb_addr` (igual que hace `SO_CONTINUE` en `so_util.h`).
+
+### Controles virtuales a 0%
+- `GA_ALPHA_HIDDEN` 3 → 0 (pedido del usuario: invisibles incluso al presionar). Fase 61 ya
+  había probado en consola que 0 oculta perfecto con el mismo mecanismo de stamps.
+
+### Menú SELECT+START (`source/utils/port_menu.c`, persistido en `port_menu.txt`)
+Inspirado en `Zenonia2-vita/loader/controls.c` e `Inotia4-iOS-vita/source/input.c`:
+- Remapeo por acción (Attack, Accelerate, Brake, Sprint, Enter car, Enter shop, Take cover):
+  X reemplaza, [] agrega, triángulo quita, START cancela la captura. La tabla `s_actions` quedó
+  en 7 entradas con máscara multi-botón (Accelerate = CROSS|R, Brake = CIRCLE|L por default).
+- Toque trasero por cuadrantes como botones asignables (REAR-TL/TR/BL/BR = L2/R2/L3/R3).
+- Touch controls: HIDDEN (0%) / SHOWN (igual que L+R sostenido, persistente).
+- Frame rate: 60 (vsync) / 30 FPS estable (`vsync_interval` de vitaGL = 2).
+- Draw distance: FAR (8000/15000, Fase 63) / NEAR (6000/13000, perfil Low-End del motor) -- palanca
+  de rendimiento para zonas densas (log 066: caídas a 14-26 fps con render 37-118 ms).
+- Aspect ratio: FULL SCREEN (estirado Fase 26) / ORIGINAL (960x480 con franjas, en `glViewport`/
+  `glScissor` del framebuffer default).
+- Restore defaults, Save and close (o CIRCLE). Mientras está abierto se salta `nativeRender`
+  (juego congelado) y se sueltan los botones/stick/teclas sostenidos.
+- Sin opción de idioma: el juego ya trae su propio selector.
+
+### Pendiente de verificar en consola
+- Que L+R ya no crashee con un highlight de tutorial activo.
+- Que el menú se dibuje bien sobre el estado GL congelado del motor, y que el primer frame al
+  cerrar no dé un salto grande de delta-time.
+- Modo ORIGINAL: si el motor limpia con scissor activo, las franjas podrían quedar con basura.
+
+## Estado previo — 2026-09-27 (Fase 64: optimizaciones de fluidez inspiradas en 9mm-vita y ports hermanos, eliminación del spill de circular pool a VRAM, mathneon NEON SIMD y supresión de I/O bloqueante)
 
 **Punto de partida:** el usuario pide mejorar el código para que vaya más fluido revisando `logs/debug_local_062.log` y adoptando las mejoras aplicables de `9mm-vita/source` y los ports hermanos de Gameloft/Vita.
 

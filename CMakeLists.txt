@@ -120,6 +120,8 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/utils/filecache.c
                source/utils/gamepad_actions.c
                source/utils/perf_lod.c
+               source/utils/port_menu.c
+               source/utils/menu_font.c
                lib/falso_jni/FalsoJNI.c
                lib/falso_jni/FalsoJNI_ImplBridge.c
                lib/falso_jni/FalsoJNI_Logger.c
@@ -242,7 +244,11 @@ target_compile_definitions(vitaGL_local PRIVATE
 # (lib/vitaGL/source/shaders/ffp_v.h `Jwvp = mul(Jwvp, Imodelview)`) se ejecuta
 # igual para geometria estatica que YA renderiza bien, asi que es un
 # sospechoso mas debil que SKIP_ERROR_HANDLING.
-# target_compile_definitions(vitaGL_local PRIVATE SKIP_ERROR_HANDLING)
+# Fase 70: REACTIVADO. Se habia sacado (Fase 43) solo para VER errores; la
+# causa real del negro fue DISABLE_TEXTURE_COMBINER (Fase 44) y los logs
+# 066-069 tienen 0 lineas [vitaGL]. Mismo flag que el perfil probado de
+# brenu/gangstar-rio-vita. Quita ~90 chequeos por llamada GL en el hot path.
+target_compile_definitions(vitaGL_local PRIVATE SKIP_ERROR_HANDLING)
 
 # LOG_ERRORS (reactivado en la Fase 43, mismo mecanismo que la Fase 24): sin
 # esto, SET_GL_ERROR() en vitaGL llama a vgl_log() pero vgl_log es un no-op
@@ -251,7 +257,8 @@ target_compile_definitions(vitaGL_local PRIVATE
 # error nuevo en el log. `source/reimpl/gl.c` ya tiene `vgl_log_capture()`
 # (Fase 24) que reenvia estas lineas a `l_note("[vitaGL] ...")` con dedupe, asi
 # que reactivarlo es gratis en términos de nuevo código.
-target_compile_definitions(vitaGL_local PRIVATE LOG_ERRORS)
+# Fase 70: apagado junto con SKIP_ERROR_HANDLING (sin chequeos no hay errores que loguear).
+# target_compile_definitions(vitaGL_local PRIVATE LOG_ERRORS)
 
 # DISABLE_TEXTURE_COMBINER (Fase 37) SACADO en la Fase 44 -- CAUSA RAIZ REAL
 # del negro en personajes/vehiculos, confirmada con hardware real gracias a la

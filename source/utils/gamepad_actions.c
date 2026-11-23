@@ -21,6 +21,7 @@
 #include <psp2/kernel/processmgr.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <so_util/so_util.h>
 
@@ -67,6 +68,7 @@ static getinstance_fn s_getInstance = NULL;
 static getscale_fn s_getScale = NULL;
 static int s_ready = 0;
 static int s_alphaFull = 0;
+void patch_hud_pressed_alpha(int hidden); /* patch.c */
 
 /* One representative CHudManager member offset per VirtualButton instance,
  * grouped by EvVButton::ButtonType::Type id. Taken straight from
@@ -119,15 +121,20 @@ struct pad_action {
  * Each entry gates on its button's visibility (e.g. attack is visible on foot
  * and hidden in cars; accelerate is visible in cars and hidden on foot). */
 static struct pad_action s_actions[] = {
-    { SCE_CTRL_CROSS,    "attack",     offs_attack,   4, GA_SLOT_BASE + 0, 0, 0, 0 },
-    { SCE_CTRL_CROSS,    "accelerate", offs_veh_a,    2, GA_SLOT_BASE + 1, 0, 0, 0 },
-    { SCE_CTRL_CIRCLE,   "sprint",     offs_sprint,   1, GA_SLOT_BASE + 2, 0, 0, 0 },
-    { SCE_CTRL_CIRCLE,   "brake",      offs_veh_b,    2, GA_SLOT_BASE + 3, 0, 0, 0 },
-    { SCE_CTRL_TRIANGLE, "enter-car",  offs_entercar, 4, GA_SLOT_BASE + 4, 0, 0, 0 },
-    { SCE_CTRL_TRIANGLE, "enter-shop", offs_shop,     1, GA_SLOT_BASE + 5, 0, 0, 0 },
-    { SCE_CTRL_SQUARE,   "take-cover", offs_cover,    1, GA_SLOT_BASE + 6, 0, 0, 0 },
-    { SCE_CTRL_RTRIGGER, "accelerate", offs_veh_a,    2, GA_SLOT_BASE + 7, 0, 0, 0 },
-    { SCE_CTRL_LTRIGGER, "brake",      offs_veh_b,    2, GA_SLOT_BASE + 8, 0, 0, 0 },
+    { SCE_CTRL_CROSS,                       "Attack",     offs_attack,   4, GA_SLOT_BASE + 0, 0, 0, 0 },
+    { SCE_CTRL_CROSS | SCE_CTRL_RTRIGGER,   "Accelerate", offs_veh_a,    2, GA_SLOT_BASE + 1, 0, 0, 0 },
+    { SCE_CTRL_CIRCLE | SCE_CTRL_LTRIGGER,  "Brake",      offs_veh_b,    2, GA_SLOT_BASE + 2, 0, 0, 0 },
+    { SCE_CTRL_CIRCLE,                      "Sprint",     offs_sprint,   1, GA_SLOT_BASE + 3, 0, 0, 0 },
+    { SCE_CTRL_TRIANGLE,                    "Enter car",  offs_entercar, 4, GA_SLOT_BASE + 4, 0, 0, 0 },
+    { SCE_CTRL_TRIANGLE,                    "Enter shop", offs_shop,     1, GA_SLOT_BASE + 5, 0, 0, 0 },
+    { SCE_CTRL_SQUARE,                      "Take cover", offs_cover,    1, GA_SLOT_BASE + 6, 0, 0, 0 },
+};
+
+/* Fase 65: masks are user-remappable from the SELECT+START menu (port_menu.c).
+ * Multi-bit masks fire on the first button down and release on the last up. */
+static const uint32_t s_default_masks[] = {
+    SCE_CTRL_CROSS, SCE_CTRL_CROSS | SCE_CTRL_RTRIGGER, SCE_CTRL_CIRCLE | SCE_CTRL_LTRIGGER,
+    SCE_CTRL_CIRCLE, SCE_CTRL_TRIANGLE, SCE_CTRL_TRIANGLE, SCE_CTRL_SQUARE,
 };
 
 #define GA_NACTIONS (sizeof(s_actions) / sizeof(s_actions[0]))
@@ -168,7 +175,9 @@ static struct pad_action s_actions[] = {
  * SniperControlHandler::handleStickMove for aim, not a second stick. A
  * physical right-stick "look" therefore has nothing in the original game to
  * map onto outside of a car; see port_progress.md Fase 51 for the full
- * trail. Not wired up here -- there is no HUD element it could drive.
+ * trail. CORRECTED in Fase 71: the camera IS touch-driven, through the
+ * full-screen HudScreen widget, not a ControlHandler -- see
+ * gamepad_look_update() below.
  */
 #define GA_OFF_ANALOGSTICK 0x28
 #define GA_OFF_WHEEL       0x2c
@@ -262,7 +271,8 @@ static struct pad_action s_actions[] = {
  * 0xff and returns WITHOUT touching the quad bytes, which keep this 3
  * from our pre-render poke. The leak that showed buttons "on action" in
  * log 060 was NOT pressing -- it was the tutorial blink pulse (below). */
-#define GA_ALPHA_HIDDEN      3
+/* Fase 65: 0 by request (fully invisible, even while pressing). */
+#define GA_ALPHA_HIDDEN      0
 /* HudElement flags word (this+0xc) blink bit. Fase 62: THIS was the "buttons
  * appear on action" mechanism of log 060, confirmed in raw disasm (not a
  * guess): when bit 4 is set (tutorial hint pulse via CHudManager::blink(),
@@ -621,6 +631,11 @@ void gamepad_stick_update(uint32_t dpad_buttons, uint8_t lx, uint8_t ly) {
      * analog read so a digital press always wins ties). Screen Y grows
      * downward, so "up" (ny > 0) must SUBTRACT from the touch Y target. */
     int dxRaw = (int)lx - 128, dyRaw = (int)ly - 128;
+    static int s_stickSeen = 0; /* Fase 70: one-time proof the analog axes are live */
+    if (!s_stickSeen && (dxRaw > 40 || dxRaw < -40 || dyRaw > 40 || dyRaw < -40)) {
+        s_stickSeen = 1;
+        l_note("[input] left stick live (lx=%u ly=%u)", lx, ly);
+    }
     float nx = (dxRaw > GA_STICK_DEADZONE || dxRaw < -GA_STICK_DEADZONE) ? (float)dxRaw / 128.0f : 0.0f;
     float ny = (dyRaw > GA_STICK_DEADZONE || dyRaw < -GA_STICK_DEADZONE) ? -(float)dyRaw / 128.0f : 0.0f;
     if (dpad_buttons & SCE_CTRL_LEFT)  nx = -1.0f;
@@ -759,6 +774,76 @@ void gamepad_stick_update(uint32_t dpad_buttons, uint8_t lx, uint8_t ly) {
     }
 }
 
+/* Fase 71: right stick = finger swipe on empty screen. Fase 51 missed this
+ * path: HudScreen (CHudManager+0x90) is the full-screen catch-all widget,
+ * and HudScreen::processTouch (2cd... in out_ghidra.c) feeds every MOVE's
+ * displacement to the active Follow/Vehicle camera's updateAngles(dx, dy)
+ * (vtable+0x18). processTouchRelease treats a drag of <10px AND <500ms as a
+ * TAP (target lock / camera reset), so every drag starts with a >=10px move.
+ * The finger lives around the screen center (no HUD widget there) and is
+ * lifted/re-pressed before it would leave its box, like a thumb re-swiping. */
+#define GA_OFF_HUDSCREEN   0x90
+#define GA_HS_ENABLED      0x58   /* HudScreen::processTouch bails if 0 */
+#define GA_LOOK_X          480
+#define GA_LOOK_Y          240
+#define GA_LOOK_BOX_X      200
+#define GA_LOOK_BOX_Y      150
+#define GA_LOOK_SPEED      14.0f  /* px per frame at full deflection */
+#define GA_LOOK_MIN_MOVE   10
+
+static struct { int active, x, y; } s_look = { 0, 0, 0 };
+#define GA_LOOK_SLOT (GA_SLOT_BASE + 11)
+
+static void look_release(void) {
+    if (!s_look.active)
+        return;
+    s_touch(&jni, NULL, 0, s_look.x, s_look.y, (jlong)GA_LOOK_SLOT, 0, 0);
+    s_look.active = 0;
+}
+
+void gamepad_look_update(uint8_t rx, uint8_t ry) {
+    if (!s_ready)
+        return;
+    int dxRaw = (int)rx - 128, dyRaw = (int)ry - 128;
+    float nx = (dxRaw > GA_STICK_DEADZONE || dxRaw < -GA_STICK_DEADZONE) ? (float)dxRaw / 128.0f : 0.0f;
+    float ny = (dyRaw > GA_STICK_DEADZONE || dyRaw < -GA_STICK_DEADZONE) ? (float)dyRaw / 128.0f : 0.0f;
+
+    /* Only in gameplay: HUD up, HudScreen enabled, and a movement widget
+     * (stick or wheel) interactable -- the same gate the left stick uses,
+     * so a menu never receives a stray center tap. */
+    CHudManagerPtr hud = *s_hudManagerAddr;
+    void *hs = hud ? *(void **)((char *)hud + GA_OFF_HUDSCREEN) : NULL;
+    int cx, cy; float r1, r2;
+    int gameplay = hs && *((uint8_t *)hs + GA_HS_ENABLED) &&
+                   (stick_region(&cx, &cy, &r1, &r2) || wheel_region(&cx, &cy, &r1, &r2));
+    if (!gameplay || (nx == 0.0f && ny == 0.0f)) {
+        look_release();
+        return;
+    }
+
+    int dx = (int)(nx * GA_LOOK_SPEED), dy = (int)(ny * GA_LOOK_SPEED);
+    if (dx == 0 && dy == 0)
+        return;
+
+    if (s_look.active && (abs(s_look.x + dx - GA_LOOK_X) > GA_LOOK_BOX_X ||
+                          abs(s_look.y + dy - GA_LOOK_Y) > GA_LOOK_BOX_Y))
+        look_release();
+
+    if (!s_look.active) {
+        s_look.x = GA_LOOK_X;
+        s_look.y = GA_LOOK_Y;
+        s_touch(&jni, NULL, 1, s_look.x, s_look.y, (jlong)GA_LOOK_SLOT, 0, 0);
+        s_look.active = 1;
+        /* First move >= 10px on the dominant axis so the release is a drag. */
+        if (abs(dx) >= abs(dy)) { if (abs(dx) < GA_LOOK_MIN_MOVE) dx = dx < 0 ? -GA_LOOK_MIN_MOVE : GA_LOOK_MIN_MOVE; }
+        else if (abs(dy) < GA_LOOK_MIN_MOVE) dy = dy < 0 ? -GA_LOOK_MIN_MOVE : GA_LOOK_MIN_MOVE;
+    }
+
+    s_look.x += dx;
+    s_look.y += dy;
+    s_touch(&jni, NULL, 2, s_look.x, s_look.y, (jlong)GA_LOOK_SLOT, 0, 0);
+}
+
 void gamepad_actions_init(gamepad_touch_fn touch) {
     s_touch = touch;
     s_hudManagerAddr = (CHudManagerPtr *) so_symbol(&so_mod, "_ZN11CHudManager12s_hudManagerE");
@@ -779,16 +864,26 @@ int gamepad_alpha_full(void) {
     return s_alphaFull;
 }
 
+static int s_alwaysShow = 0;
+void gamepad_set_always_show(int on) { s_alwaysShow = on; }
+
+int gamepad_action_count(void) { return (int)GA_NACTIONS; }
+const char *gamepad_action_name(int i) { return s_actions[i].name; }
+uint32_t gamepad_action_mask(int i) { return s_actions[i].mask; }
+void gamepad_action_set_mask(int i, uint32_t mask) { s_actions[i].mask = mask; }
+uint32_t gamepad_action_default_mask(int i) { return s_default_masks[i]; }
+
 void gamepad_actions_update(uint32_t buttons, uint32_t old_buttons) {
     if (!s_ready)
         return;
 
-    int wantFull = (buttons & GA_ALPHA_COMBO_MASK) == GA_ALPHA_COMBO_MASK;
+    int wantFull = s_alwaysShow || (buttons & GA_ALPHA_COMBO_MASK) == GA_ALPHA_COMBO_MASK;
     if (wantFull != s_alphaFull) {
         s_alphaFull = wantFull;
         l_note("[input] touch controls opacity -> %s (L+R %s)",
-               s_alphaFull ? "100%" : "hidden ~1%", s_alphaFull ? "held" : "released");
+               s_alphaFull ? "100%" : "hidden 0%", s_alphaFull ? "held" : "released");
     }
+    patch_hud_pressed_alpha(!s_alphaFull); /* patch.c: pressed widgets honour the stamps */
     apply_touch_alpha();
 
     for (unsigned i = 0; i < GA_NACTIONS; i++) {

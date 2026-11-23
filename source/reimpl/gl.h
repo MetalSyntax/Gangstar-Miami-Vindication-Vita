@@ -52,6 +52,9 @@ void gl_frame_tick(void);
 // swap -- see the long comment in gl.c for how to read the resulting BMP.
 void gl_probe_selftest(void);
 void gl_get_counters(unsigned *draws, unsigned *clears);
+
+/* Fase 65: 1 = keep the engine's 960x480 image letterboxed (SELECT+START menu). */
+extern int gl_aspect_original;
 void glCompressedTexImage2D_soloader(GLenum target, GLint level,
                                      GLenum internalformat, GLsizei width,
                                      GLsizei height, GLint border,
