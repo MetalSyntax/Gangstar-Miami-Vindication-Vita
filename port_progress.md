@@ -3,7 +3,24 @@
 > Bitácora cronológica, un bug confirmado a la vez. Para el estado **estructural** del port (motor,
 > mapa JNI, filesystem, niveles de logging, checklist) ver `PORTING_PLAN.md`.
 
-## Estado actual — 2026-11-23 (Fase 76: Cross/Start entran desde la pantalla de título; sin confirmar en consola real)
+## Estado actual — 2026-11-23 (Fase 77: sonido de arranque del vehículo en loop infinito; sin confirmar en consola real)
+
+**Log 076** (Fases 74-76 en consola): título con Cross OK (`[input] title screen: button -> tap`), radio
+OK (`radio: next station`), intro 184/184 frames sin descartes. Cargas: frame 2 (primera carga)
+**8.0 s → 2.0 s** (51 archivos, 4.5 MB vía núcleo 1, el núcleo 0 esperó 546 ms). Carga intermedia:
+frames 338-340 = 15.3 + 0.8 + 5.2 s (antes 13.2 + 14.9 s en el log 073); la de 15.3 s leyó 285 archivos
+/ 75 MB y el núcleo 0 esperó 8.8 s: ahora manda el ancho de banda de la memory card (~8.5 MB/s).
+
+- **Bug:** el sonido de arranque del vehículo queda en loop. El motor lo pide una sola vez:
+  `Vehicle::UpdateCarSounds` apaga `+0x1e8` (flag de arranque) después de un `CarSounds::Update`, y
+  `UpdateStartupSound` reproduce con loop=0.
+- **Causa (nuestra):** `sfx_voice_t.pos_fix` era `uint32_t` 16.16 → como mucho 65 536 frames (1.36 s a
+  48 kHz). `sfx_z06_startup` 4.3 s, `sfx_cyl4_startup` 5.5 s, `sfx_v6na_startup` 4.8 s (ffprobe de los
+  archivos de la consola): la posición da la vuelta a 0 antes de llegar al final y la voz se repite
+  para siempre. Venía de antes de la Fase 72. Afecta a todo efecto de más de 1.36 s.
+- **Fix:** `pos_fix` pasa a `uint64_t` (y el índice `p`).
+
+## Estado previo — 2026-11-23 (Fase 76: Cross/Start entran desde la pantalla de título; sin confirmar en consola real)
 
 - Reporte: en el título ningún botón entra, solo tocar la pantalla.
 - `GSSplash::update` (29bfc4) pasa a `GS3DStuff` apenas `TouchScreenBase` (vtable+0x34) reporta un

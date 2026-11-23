@@ -124,7 +124,10 @@ typedef struct {
     int active;
     int paused;
     sfx_entry_t *e;
-    uint32_t pos_fix;  /* 16.16 */
+    /* Fase 77: 64-bit. As a uint32_t 16.16 it wrapped after 65536 frames
+     * (1.36 s at 48 kHz): any longer one-shot (sfx_*_startup.ogg) never
+     * reached its end and restarted forever -- the stuck engine-start loop. */
+    uint64_t pos_fix;  /* 16.16 */
     uint32_t step_fix;
     float vol;
     float env;          /* attack/release envelope, 0..1, times vol */
@@ -666,7 +669,7 @@ static int audio_mix_thread(SceSize argc, void *argv) {
                             }
                         }
                     }
-                    uint32_t p = v->pos_fix >> 16;
+                    uint64_t p = v->pos_fix >> 16;
                     if (p >= v->e->frames) {
                         v->active = 0;
                         break;
