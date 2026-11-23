@@ -3,7 +3,16 @@
 > Bitácora cronológica, un bug confirmado a la vez. Para el estado **estructural** del port (motor,
 > mapa JNI, filesystem, niveles de logging, checklist) ver `PORTING_PLAN.md`.
 
-## Estado actual — 2026-11-23 (Fase 75: botón de radio y "agacharse"; sin confirmar en consola real)
+## Estado actual — 2026-11-23 (Fase 76: Cross/Start entran desde la pantalla de título; sin confirmar en consola real)
+
+- Reporte: en el título ningún botón entra, solo tocar la pantalla.
+- `GSSplash::update` (29bfc4) pasa a `GS3DStuff` apenas `TouchScreenBase` (vtable+0x34) reporta un
+  toque; no lee teclas. Cross/Start apoyan un dedo sintético en el centro (slot 28): down al presionar,
+  up al soltar. Solo si el estado en la cima de la pila del `StateMachine` (singleton
+  `_ZZN12StateMachine11getInstanceEvE2sm`, vector en +0xc..+0x10) tiene vptr `_ZTV8GSSplash + 8`;
+  ningún otro menú recibe ese toque. No actúa con SELECT apretado (combo del menú del port).
+
+## Estado previo — 2026-11-23 (Fase 75: botón de radio y "agacharse"; sin confirmar en consola real)
 
 - **Agacharse:** el motor no tiene agacharse libre. Lo único es cubrirse (`Character::takeCover`, botón
   HUD `+0x6c` tipo 0xe), que el HUD solo ofrece cerca de una cobertura. Forzar `takeCover()` en

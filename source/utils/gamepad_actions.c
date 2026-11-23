@@ -886,6 +886,42 @@ static void radio_next_station(void) {
     l_note("[input] radio: next station");
 }
 
+/* Fase 76: the title screen (GSSplash) only advances on a touch --
+ * GSSplash::update (29bfc4) switches to GS3DStuff as soon as
+ * TouchScreenBase (vtable+0x34) reports one. Cross/Start there put a
+ * synthetic finger at the screen center (down on press, up on release).
+ * Gated on the top of the StateMachine stack (singleton, vector of states
+ * at +0xc..+0x10) being a GSSplash (vptr == _ZTV8GSSplash + 8), so no other
+ * menu ever gets this tap. */
+#define GA_SPLASH_SLOT (GA_SLOT_BASE + 12)
+#define GA_SPLASH_KEYS (SCE_CTRL_CROSS | SCE_CTRL_START)
+static char *s_stateMachine;
+static void *s_splashVptr;
+static int s_splashDown;
+
+static int in_title_screen(void) {
+    if (!s_stateMachine || !s_splashVptr)
+        return 0;
+    void **b = *(void ***)(s_stateMachine + 0xc), **e = *(void ***)(s_stateMachine + 0x10);
+    if (!b || e <= b)
+        return 0;
+    void *top = e[-1];
+    return top && *(void **)top == s_splashVptr;
+}
+
+static void title_tap_update(uint32_t buttons, uint32_t old_buttons) {
+    uint32_t pressed = buttons & ~old_buttons & GA_SPLASH_KEYS;
+    if (s_splashDown && !(buttons & GA_SPLASH_KEYS)) {
+        s_touch(&jni, NULL, 0, GA_ENGINE_W / 2, GA_ENGINE_H / 2, (jlong)GA_SPLASH_SLOT, 0, 0);
+        s_splashDown = 0;
+    }
+    if (pressed && !(buttons & SCE_CTRL_SELECT) && !s_splashDown && in_title_screen()) {
+        s_touch(&jni, NULL, 1, GA_ENGINE_W / 2, GA_ENGINE_H / 2, (jlong)GA_SPLASH_SLOT, 0, 0);
+        s_splashDown = 1;
+        l_note("[input] title screen: button -> tap");
+    }
+}
+
 void gamepad_actions_init(gamepad_touch_fn touch) {
     s_touch = touch;
     s_hudManagerAddr = (CHudManagerPtr *) so_symbol(&so_mod, "_ZN11CHudManager12s_hudManagerE");
@@ -894,6 +930,9 @@ void gamepad_actions_init(gamepad_touch_fn touch) {
     s_sndInstance = (snd_instance_fn) so_symbol(&so_mod, "_ZN12SoundManager11getInstanceEv");
     s_sndNextStation = (snd_fn) so_symbol(&so_mod, "_ZN12SoundManager16nextRadioStationEv");
     s_setAnim = (setanim_fn) so_symbol(&so_mod, "_ZN10AnimObject7SetAnimEi");
+    s_stateMachine = (char *) so_symbol(&so_mod, "_ZZN12StateMachine11getInstanceEvE2sm");
+    char *splashVt = (char *) so_symbol(&so_mod, "_ZTV8GSSplash");
+    s_splashVptr = splashVt ? splashVt + 8 : NULL;
 
     if (!s_touch || !s_hudManagerAddr || !s_getInstance || !s_getScale) {
         l_warn("gamepad_actions: could not resolve required symbols -- "
@@ -928,6 +967,7 @@ void gamepad_actions_update(uint32_t buttons, uint32_t old_buttons) {
         l_note("[input] touch controls opacity -> %s (L+R %s)",
                s_alphaFull ? "100%" : "hidden 0%", s_alphaFull ? "held" : "released");
     }
+    title_tap_update(buttons, old_buttons);
     patch_hud_pressed_alpha(!s_alphaFull); /* patch.c: pressed widgets honour the stamps */
     apply_touch_alpha();
 
