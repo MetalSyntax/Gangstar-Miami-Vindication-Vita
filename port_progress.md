@@ -3,7 +3,26 @@
 > Bitácora cronológica, un bug confirmado a la vez. Para el estado **estructural** del port (motor,
 > mapa JNI, filesystem, niveles de logging, checklist) ver `PORTING_PLAN.md`.
 
-## Estado actual — 2026-11-23 (Fase 77: sonido de arranque del vehículo en loop infinito; sin confirmar en consola real)
+## Estado actual — 2026-11-23 (Fase 78: botón de cambiar arma, selector de armas y radio ocultos, diagnóstico de tirones; sin confirmar en consola real)
+
+**Log 077:** radio por Cuadrado OK; gameplay 47-60 fps (30 fijo desde el frame ~5045: el usuario activó
+FPS 30 en el menú); dos tirones de un frame (311 ms en el 5184, 163 ms en el 6036) sin detalle porque el
+umbral de "slow render" era 500 ms. Carga intermedia igual que en el 076 (13.5 + 0.9 + 5.3 s, el núcleo 0
+esperó 7.1 + 0.5 + 3.1 s de I/O).
+
+- **Cambiar arma:** acción **"Switch weapon"** (R por defecto, solo a pie porque R acelera en el auto;
+  campo nuevo `foot_only` que exige el stick de movimiento interactuable). Tap sintético sobre
+  `WeaponSelector` (`CHudManager+0xd0`, AnimatedButton tipo 6): su `processTouchRelease` (2c01f8) lanza
+  EvVirtualButton 7/8 → `handleSwitchWeaponButton(±1)`.
+- **Ocultos al 0 %:** el selector de armas entra en `s_alpha_offsets` (su `draw2d` pasa por `setAlpha`,
+  incluida la munición). La radio (`+0x78`) y su toggle (`+0x74`) pintan con `PaintFrame` directo y
+  su compuerta de dibujo es el mismo bit `+0xc` que su lógica táctil, así que van a `s_hudPatches`:
+  con los controles ocultos su primera instrucción (`push`) pasa a `bx lr`; L+R / SHOWN restaura.
+  Queda visible el minimapa (y las barras, el dinero y el nivel de búsqueda, que no son controles).
+- **Tirones:** umbral de "slow render" 500 → 100 ms, para que cada tirón de gameplay muestre su parte de
+  I/O (`[io: ...]`). El log de cada pulsación de radio pasa a `l_debug` (escritura síncrona en la tarjeta).
+
+## Estado previo — 2026-11-23 (Fase 77: sonido de arranque del vehículo en loop infinito; sin confirmar en consola real)
 
 **Log 076** (Fases 74-76 en consola): título con Cross OK (`[input] title screen: button -> tap`), radio
 OK (`radio: next station`), intro 184/184 frames sin descartes. Cargas: frame 2 (primera carga)

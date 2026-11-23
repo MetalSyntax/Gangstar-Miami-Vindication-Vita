@@ -116,6 +116,13 @@ static const struct {
 } s_hudPatches[] = {
     { "_ZNK10HudElement8setAlphaEv", 0x2baa5c - 0x2ba98c, 0xe7cd /* b 2ba9fa */, 0xe7c9 /* b 2ba9f2 */, "setAlpha pressed branch" },
     { "_ZNK5Wheel6draw2dEv",         0x2c0e36 - 0x2c0e18, 0xd400 /* bmi 2c0e3a */, 0x46c0 /* nop */,   "Wheel pressed draw" },
+    /* Fase 78: the HUD radio (CHudManager+0x78) and its on/off toggle (+0x74)
+     * PaintFrame directly, no setAlpha, and their draw gate is the same +0xc
+     * bit their touch logic needs. While hidden, their first instruction
+     * (push) becomes `bx lr`: nothing drawn, radio logic untouched (the
+     * Square "Radio station" action calls SoundManager directly). */
+    { "_ZNK5Radio6draw2dEv",         0, 0xb510 /* push {r4, lr} */, 0x4770 /* bx lr */, "Radio draw" },
+    { "_ZNK12ToggleButton6draw2dEv", 0, 0xb500 /* push {lr} */,     0x4770 /* bx lr */, "Radio toggle draw" },
 };
 #define N_HUD_PATCHES (sizeof(s_hudPatches) / sizeof(s_hudPatches[0]))
 static uint16_t *s_hudPatchAddr[N_HUD_PATCHES];
@@ -144,5 +151,5 @@ void patch_hud_pressed_alpha(int hidden) {
         kuKernelCpuUnrestrictedMemcpy(s_hudPatchAddr[i], &insn, sizeof(insn));
         kuKernelFlushCaches(s_hudPatchAddr[i], sizeof(insn));
     }
-    l_note("[patch] pressed HUD draws (setAlpha + Wheel) -> %s", hidden ? "hidden (stamped alpha)" : "stock");
+    l_note("[patch] HUD draws (setAlpha pressed, Wheel, Radio) -> %s", hidden ? "hidden (stamped alpha)" : "stock");
 }

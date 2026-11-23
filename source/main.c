@@ -337,7 +337,8 @@ int main() {
             l_note("[022] main loop: frame %d returned (%llu us) [io: %u files %u KB via core 1, core 0 waited %u ms]",
                    frame_no, render_us, mo, mb / 1024, mw);
         } else {
-            if (render_us > 500000)
+            // Fase 78: 100 ms (was 500) so gameplay hitches show their io share too.
+            if (render_us > 100000)
                 l_note("[022] main loop: frame %d slow render (%llu ms) [io: %u files %u KB via core 1, core 0 waited %u ms]",
                        frame_no, render_us / 1000, mo, mb / 1024, mw);
             SceUInt64 now = sceKernelGetProcessTimeWide();

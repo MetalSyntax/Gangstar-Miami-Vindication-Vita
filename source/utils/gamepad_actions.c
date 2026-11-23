@@ -102,6 +102,10 @@ static const int offs_veh_b[]     = { 0x3c, 0x44 };
 static const int offs_shop[]      = { 0x4c };
 static const int offs_cover[]     = { 0x6c };
 static const int offs_sprint[]    = { 0x70 };
+/* Fase 78: WeaponSelector (AnimatedButton type 6). Its processTouchRelease
+ * (2c01f8) raises EvVirtualButton 7/8 = handleSwitchWeaponButton(+-1) in the
+ * on-foot and driving handlers -- a tap switches weapon. */
+static const int offs_weapon[]    = { 0xd0 };
 
 struct pad_action {
     uint32_t mask;
@@ -113,7 +117,10 @@ struct pad_action {
     int x;
     int y;
     void (*fn)(void);  /* Fase 75: direct action instead of a HUD tap (radio) */
+    int foot_only;     /* Fase 78: only when the on-foot move stick is up */
 };
+
+static int stick_region(int *cx, int *cy, float *rx, float *ry);
 
 static void radio_next_station(void);
 
@@ -136,6 +143,8 @@ static struct pad_action s_actions[] = {
     /* Appended (BINDn indexes in port_menu.txt stay valid). Square is free
      * in a vehicle; the radio gate fails on foot, the cover gate in a car. */
     { SCE_CTRL_SQUARE,                      "Radio station", NULL,       0, GA_SLOT_BASE + 7, 0, 0, 0, radio_next_station },
+    /* R accelerates in a car, so this one only fires on foot. */
+    { SCE_CTRL_RTRIGGER,                    "Switch weapon", offs_weapon, 1, GA_SLOT_BASE + 8, 0, 0, 0, NULL, 1 },
 };
 
 /* Fase 65: masks are user-remappable from the SELECT+START menu (port_menu.c).
@@ -143,7 +152,7 @@ static struct pad_action s_actions[] = {
 static const uint32_t s_default_masks[] = {
     SCE_CTRL_CROSS, SCE_CTRL_CROSS | SCE_CTRL_RTRIGGER, SCE_CTRL_CIRCLE | SCE_CTRL_LTRIGGER,
     SCE_CTRL_CIRCLE, SCE_CTRL_TRIANGLE, SCE_CTRL_TRIANGLE, SCE_CTRL_SQUARE,
-    SCE_CTRL_SQUARE,
+    SCE_CTRL_SQUARE, SCE_CTRL_RTRIGGER,
 };
 
 #define GA_NACTIONS (sizeof(s_actions) / sizeof(s_actions[0]))
@@ -311,6 +320,7 @@ static const int s_alpha_quad_offsets[] = { 0x47, 0x4b, 0x4f, 0x53 };
 static const int s_alpha_offsets[] = {
     GA_OFF_ANALOGSTICK, GA_OFF_WHEEL, GA_OFF_SLIDECONTROL, GA_OFF_SLIDECONTROL2,
     0x30, 0x34, 0x38, 0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x5c, 0x60, 0x64, 0x68, 0x6c, 0x70,
+    0xd0, /* Fase 78: weapon selector (draw2d goes through setAlpha) */
 };
 #define GA_NALPHA_OFFSETS (sizeof(s_alpha_offsets) / sizeof(s_alpha_offsets[0]))
 
@@ -363,6 +373,11 @@ static void pad_press(struct pad_action *a) {
     if (a->fn) {
         a->fn();
         return;
+    }
+    if (a->foot_only) {
+        int cx, cy; float rx, ry;
+        if (!stick_region(&cx, &cy, &rx, &ry))
+            return;
     }
     if (!screen_scale_ready())
         return;
@@ -883,7 +898,7 @@ static void radio_next_station(void) {
     s_sndNextStation(snd);
     if (!((*(uint32_t *)(snd + 0x230) >> 5) & 1))
         s_setAnim(*(void **)(radio + 0x5c), *(int *)(radio + 0x60) + *(int *)(snd + 0x22c));
-    l_note("[input] radio: next station");
+    l_debug("[input] radio: next station"); /* per press: no sync card write in release */
 }
 
 /* Fase 76: the title screen (GSSplash) only advances on a touch --
