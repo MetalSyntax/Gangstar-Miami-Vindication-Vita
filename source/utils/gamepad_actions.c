@@ -112,7 +112,10 @@ struct pad_action {
     int active;
     int x;
     int y;
+    void (*fn)(void);  /* Fase 75: direct action instead of a HUD tap (radio) */
 };
+
+static void radio_next_station(void);
 
 /* Physical mapping.
  * - On foot: Cross=attack, Triangle=enter-car/shop, Square=cover, Circle=sprint.
@@ -127,7 +130,12 @@ static struct pad_action s_actions[] = {
     { SCE_CTRL_CIRCLE,                      "Sprint",     offs_sprint,   1, GA_SLOT_BASE + 3, 0, 0, 0 },
     { SCE_CTRL_TRIANGLE,                    "Enter car",  offs_entercar, 4, GA_SLOT_BASE + 4, 0, 0, 0 },
     { SCE_CTRL_TRIANGLE,                    "Enter shop", offs_shop,     1, GA_SLOT_BASE + 5, 0, 0, 0 },
-    { SCE_CTRL_SQUARE,                      "Take cover", offs_cover,    1, GA_SLOT_BASE + 6, 0, 0, 0 },
+    /* Fase 75: the engine has no free crouch -- taking cover IS its crouch
+     * (Character::takeCover), and only where the game offers cover. */
+    { SCE_CTRL_SQUARE,                      "Crouch / Cover", offs_cover, 1, GA_SLOT_BASE + 6, 0, 0, 0, NULL },
+    /* Appended (BINDn indexes in port_menu.txt stay valid). Square is free
+     * in a vehicle; the radio gate fails on foot, the cover gate in a car. */
+    { SCE_CTRL_SQUARE,                      "Radio station", NULL,       0, GA_SLOT_BASE + 7, 0, 0, 0, radio_next_station },
 };
 
 /* Fase 65: masks are user-remappable from the SELECT+START menu (port_menu.c).
@@ -135,6 +143,7 @@ static struct pad_action s_actions[] = {
 static const uint32_t s_default_masks[] = {
     SCE_CTRL_CROSS, SCE_CTRL_CROSS | SCE_CTRL_RTRIGGER, SCE_CTRL_CIRCLE | SCE_CTRL_LTRIGGER,
     SCE_CTRL_CIRCLE, SCE_CTRL_TRIANGLE, SCE_CTRL_TRIANGLE, SCE_CTRL_SQUARE,
+    SCE_CTRL_SQUARE,
 };
 
 #define GA_NACTIONS (sizeof(s_actions) / sizeof(s_actions[0]))
@@ -351,6 +360,10 @@ static int screen_scale_ready(void) {
 }
 
 static void pad_press(struct pad_action *a) {
+    if (a->fn) {
+        a->fn();
+        return;
+    }
     if (!screen_scale_ready())
         return;
 
@@ -844,11 +857,43 @@ void gamepad_look_update(uint8_t rx, uint8_t ry) {
     s_touch(&jni, NULL, 2, s_look.x, s_look.y, (jlong)GA_LOOK_SLOT, 0, 0);
 }
 
+/* Fase 75: next radio station, exactly what Radio::processTouch (2bce7c)
+ * does on a right swipe of the HUD radio (CHudManager+0x78): same widget
+ * gates (+0xc bit0 active, +0x74 bit0 clear), SoundManager::nextRadioStation(),
+ * then the HUD station label AnimObject::SetAnim(+0x5c, +0x60 + station). */
+#define GA_OFF_RADIO 0x78
+typedef void *(*snd_instance_fn)(void);
+typedef void (*snd_fn)(void *);
+typedef void (*setanim_fn)(void *, int);
+static snd_instance_fn s_sndInstance;
+static snd_fn s_sndNextStation;
+static setanim_fn s_setAnim;
+
+static void radio_next_station(void) {
+    CHudManagerPtr hud = *s_hudManagerAddr;
+    char *radio = hud ? *(char **)((char *)hud + GA_OFF_RADIO) : NULL;
+    if (!radio || !s_sndInstance || !s_sndNextStation || !s_setAnim)
+        return;
+    gate_fn gate = (gate_fn)(*(void ***)radio)[GA_VT_GATE];
+    if (!gate || !gate(radio) || !(*(uint32_t *)(radio + 0xc) & 1) || (*(uint32_t *)(radio + 0x74) & 1))
+        return;  /* radio not on screen (on foot, menus) */
+    char *snd = s_sndInstance();
+    if (!snd)
+        return;
+    s_sndNextStation(snd);
+    if (!((*(uint32_t *)(snd + 0x230) >> 5) & 1))
+        s_setAnim(*(void **)(radio + 0x5c), *(int *)(radio + 0x60) + *(int *)(snd + 0x22c));
+    l_note("[input] radio: next station");
+}
+
 void gamepad_actions_init(gamepad_touch_fn touch) {
     s_touch = touch;
     s_hudManagerAddr = (CHudManagerPtr *) so_symbol(&so_mod, "_ZN11CHudManager12s_hudManagerE");
     s_getInstance = (getinstance_fn) so_symbol(&so_mod, "_ZN11Application11GetInstanceEv");
     s_getScale = (getscale_fn) so_symbol(&so_mod, "_ZNK11Application21GetScreenScaleFactorsERfS0_");
+    s_sndInstance = (snd_instance_fn) so_symbol(&so_mod, "_ZN12SoundManager11getInstanceEv");
+    s_sndNextStation = (snd_fn) so_symbol(&so_mod, "_ZN12SoundManager16nextRadioStationEv");
+    s_setAnim = (setanim_fn) so_symbol(&so_mod, "_ZN10AnimObject7SetAnimEi");
 
     if (!s_touch || !s_hudManagerAddr || !s_getInstance || !s_getScale) {
         l_warn("gamepad_actions: could not resolve required symbols -- "

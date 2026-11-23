@@ -4,6 +4,8 @@
 #include "utils/dialog.h"
 #include "utils/audio.h"
 #include "utils/gamepad_actions.h"
+#include "reimpl/aeabi_vfp.h"
+#include "reimpl/memfile.h"
 #include "utils/perf_lod.h"
 #include "utils/port_menu.h"
 #include "reimpl/gl.h"
@@ -73,6 +75,9 @@ static fn_void_int      Gangster2_nativeKeyUp;
 int main() {
     soloader_init_all();
     l_checkpoint(1, "main: soloader_init_all() done");
+    // Fase 73: __aeabi_* float helpers now run on VFP (reimpl/aeabi_vfp.c).
+    l_note("aeabi_vfp: self-test %s", aeabi_vfp_selftest() == 0 ? "OK" : "FAILED");
+    memfile_init(); // Fase 74: core-1 asset reader
 
     RESOLVE(Gangster2_nativeSetPhone, "Java_com_gameloft_android_TBFV_GloftGMHP_ML_Gangster2_nativeSetPhone")
     RESOLVE(GameRenderer_nativeGetJNIEnv, "Java_com_gameloft_android_TBFV_GloftGMHP_ML_GameRenderer_nativeGetJNIEnv")
@@ -324,11 +329,17 @@ int main() {
         // cargas largas (el frame 2 y la rafaga de shaders tardan minutos).
         sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
         SceUInt64 render_us = sceKernelGetProcessTimeWide() - frame_start;
+        // Fase 74: per slow frame, how much asset data went through the
+        // core-1 reader and how long core 0 actually waited on it.
+        uint32_t mo, mb, mw;
+        memfile_stats(&mo, &mb, &mw);
         if (frame_no <= 10) {
-            l_note("[022] main loop: frame %d returned (%llu us)", frame_no, render_us);
+            l_note("[022] main loop: frame %d returned (%llu us) [io: %u files %u KB via core 1, core 0 waited %u ms]",
+                   frame_no, render_us, mo, mb / 1024, mw);
         } else {
             if (render_us > 500000)
-                l_note("[022] main loop: frame %d slow render (%llu ms)", frame_no, render_us / 1000);
+                l_note("[022] main loop: frame %d slow render (%llu ms) [io: %u files %u KB via core 1, core 0 waited %u ms]",
+                       frame_no, render_us / 1000, mo, mb / 1024, mw);
             SceUInt64 now = sceKernelGetProcessTimeWide();
             if (last_beat == 0) {
                 last_beat = now;

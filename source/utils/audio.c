@@ -34,8 +34,14 @@
 #endif
 
 #define OUT_RATE 48000
-#define OUT_FRAMES 2048
-#define MAX_SFX_VOICES 8
+/* Fase 72 (mixing modelled on Asphalt-5-Vita's audio.cpp): 1024-frame grain
+ * (~21 ms instead of ~43 ms -- the mixer owns core 2), 16 SFX voices instead
+ * of 8 (gunfire + engine + crowd + radio overlap constantly in this game). */
+#define OUT_FRAMES 1024
+#define MAX_SFX_VOICES 16
+#define SFX_MAX_COPIES 4      /* same sound at once; a 5th steals its oldest copy */
+#define SFX_ATTACK_FRAMES 128 /* ~2.7 ms fade-in: no click when cutting in mid-cycle */
+#define SFX_RELEASE_FRAMES 256 /* ~5 ms fade-out on stop/steal instead of a hard cut */
 #define MAX_BIG_VOICES 4
 #define SFX_CACHE_MAX 128
 #define SFX_DECODE_CAP (2 * 1024 * 1024)
@@ -121,9 +127,66 @@ typedef struct {
     uint32_t pos_fix;  /* 16.16 */
     uint32_t step_fix;
     float vol;
+    float env;          /* attack/release envelope, 0..1, times vol */
+    float env_step;
+    int env_left;       /* frames of ramp remaining */
+    int stopping;       /* fading out: already "not playing" for the engine */
+    uint32_t started;   /* start order, for stealing the oldest voice */
 } sfx_voice_t;
 
 static sfx_voice_t sfx_voices[MAX_SFX_VOICES];
+static uint32_t sfx_start_seq = 0;
+
+/* Caller holds audio_mutex. Fades the voice out (hard stop if paused). */
+static void sfx_voice_release(sfx_voice_t *v) {
+    if (!v->active || v->stopping)
+        return;
+    if (v->paused || v->env <= 0.001f) {
+        v->active = 0;
+        return;
+    }
+    v->stopping = 1;
+    v->env_left = SFX_RELEASE_FRAMES;
+    v->env_step = -v->env / (float)SFX_RELEASE_FRAMES;
+}
+
+/* Caller holds audio_mutex. Voice pick, as in Asphalt-5-Vita: a free voice,
+ * else one already fading out, else the oldest copy of this same sound once
+ * it has SFX_MAX_COPIES (rapid gunfire must not eat the whole pool), else the
+ * oldest voice overall. The stolen voice is reused with a fresh attack ramp,
+ * so a steal no longer clicks either. */
+static void sfx_voice_start_locked(sfx_entry_t *e, float volume, float pitch) {
+    sfx_voice_t *v = NULL, *oldest = NULL, *oldest_same = NULL;
+    int copies = 0;
+    for (int i = 0; i < MAX_SFX_VOICES; i++) {
+        sfx_voice_t *c = &sfx_voices[i];
+        if (!c->active) { if (!v) v = c; continue; }
+        if (c->stopping) continue;
+        if (!oldest || (int32_t)(c->started - oldest->started) < 0) oldest = c;
+        if (c->e == e) {
+            copies++;
+            if (!oldest_same || (int32_t)(c->started - oldest_same->started) < 0) oldest_same = c;
+        }
+    }
+    if (copies >= SFX_MAX_COPIES)
+        v = oldest_same;
+    for (int i = 0; !v && i < MAX_SFX_VOICES; i++)
+        if (sfx_voices[i].stopping) v = &sfx_voices[i];
+    if (!v)
+        v = oldest ? oldest : &sfx_voices[0];
+
+    v->active = 1;
+    v->paused = 0;
+    v->stopping = 0;
+    v->e = e;
+    v->pos_fix = 0;
+    v->step_fix = (uint32_t)((double)pitch * 65536.0);
+    v->vol = volume;
+    v->env = 0.0f;
+    v->env_left = SFX_ATTACK_FRAMES;
+    v->env_step = 1.0f / (float)SFX_ATTACK_FRAMES;
+    v->started = ++sfx_start_seq;
+}
 
 static sfx_entry_t *sfx_find(int index) {
     for (int i = 0; i < SFX_CACHE_MAX; i++)
@@ -370,7 +433,7 @@ static int big_open(big_voice_t *v, int index) {
  * the actual fopen()/decode happens on the dedicated mixer thread
  * (audio_mix_thread(), core 2 per audio_init()) at the top of its own
  * loop, never blocking the render thread. Worst case, a brand-new sound
- * starts one mixer tick (~OUT_FRAMES/OUT_RATE, ~43 ms) later than before,
+ * starts one mixer tick (~OUT_FRAMES/OUT_RATE, ~21 ms) later than before,
  * or drops one mixer output buffer while decoding -- an inaudible-to-minor
  * audio hiccup instead of a multi-second visual freeze. */
 #define MAX_PENDING_SFX 8
@@ -512,16 +575,7 @@ static void audio_drain_requests(void) {
             /* audio_play(): actually start a voice. A plain
              * audio_load() preload (activate=0) only needed the decode
              * + cache install above -- no voice to start. */
-            int slot = -1;
-            for (int s = 0; s < MAX_SFX_VOICES; s++)
-                if (!sfx_voices[s].active) { slot = s; break; }
-            if (slot < 0) slot = 0;
-            sfx_voices[slot].active = 1;
-            sfx_voices[slot].paused = 0;
-            sfx_voices[slot].e = e;
-            sfx_voices[slot].pos_fix = 0;
-            sfx_voices[slot].step_fix = (uint32_t)((double)sfx_reqs[i].pitch * 65536.0);
-            sfx_voices[slot].vol = sfx_reqs[i].volume;
+            sfx_voice_start_locked(e, sfx_reqs[i].volume, sfx_reqs[i].pitch);
         }
         sceKernelUnlockMutex(audio_mutex, 1);
     }
@@ -585,6 +639,14 @@ static int audio_mix_thread(SceSize argc, void *argv) {
 
         sceKernelLockMutex(audio_mutex, 1, NULL);
 
+        int audible = 0;
+        for (int i = 0; i < MAX_SFX_VOICES; i++)
+            if (sfx_voices[i].active && !sfx_voices[i].paused && !sfx_voices[i].stopping)
+                audible++;
+        for (int i = 0; i < MAX_BIG_VOICES; i++)
+            if (big_voices[i].active && !big_voices[i].paused)
+                audible++;
+
         if (!audio_blocked) {
             for (int i = 0; i < MAX_SFX_VOICES; i++) {
                 sfx_voice_t *v = &sfx_voices[i];
@@ -593,13 +655,25 @@ static int audio_mix_thread(SceSize argc, void *argv) {
                 float g = v->vol * cat_gain(v->e->index);
                 if (g > 1.5f) g = 1.5f;
                 for (int n = 0; n < OUT_FRAMES; n++) {
+                    if (v->env_left > 0) {
+                        v->env += v->env_step;
+                        if (--v->env_left == 0) {
+                            v->env = v->stopping ? 0.0f : 1.0f;
+                            if (v->stopping) {
+                                v->active = 0;
+                                v->stopping = 0;
+                                break;
+                            }
+                        }
+                    }
                     uint32_t p = v->pos_fix >> 16;
                     if (p >= v->e->frames) {
                         v->active = 0;
                         break;
                     }
-                    acc[n * 2 + 0] += (int32_t)(v->e->pcm[p * 2 + 0] * g);
-                    acc[n * 2 + 1] += (int32_t)(v->e->pcm[p * 2 + 1] * g);
+                    float ge = g * v->env;
+                    acc[n * 2 + 0] += (int32_t)(v->e->pcm[p * 2 + 0] * ge);
+                    acc[n * 2 + 1] += (int32_t)(v->e->pcm[p * 2 + 1] * ge);
                     v->pos_fix += v->step_fix;
                 }
             }
@@ -700,8 +774,17 @@ static int audio_mix_thread(SceSize argc, void *argv) {
 
         sceKernelUnlockMutex(audio_mutex, 1);
 
-        for (int n = 0; n < OUT_FRAMES * 2; n++)
-            mix_buf[n] = soft_clip16(acc[n]);
+        /* Fase 72 (Asphalt-5-Vita): scale by 1/sqrt(N audible voices) so a
+         * pile-up of loud SFX does not slam the limiter, gliding per sample
+         * (~10 ms) so a short sound starting/ending never steps the music
+         * level (a click per sound). A lone voice keeps its full level. */
+        static float comp = 1.0f;
+        float comp_target = 1.0f / sqrtf(audible > 1 ? (float)audible : 1.0f);
+        for (int n = 0; n < OUT_FRAMES; n++) {
+            comp += (comp_target - comp) * 0.00208f;
+            mix_buf[n * 2 + 0] = soft_clip16((int32_t)((float)acc[n * 2 + 0] * comp));
+            mix_buf[n * 2 + 1] = soft_clip16((int32_t)((float)acc[n * 2 + 1] * comp));
+        }
         if (audio_port >= 0)
             sceAudioOutOutput(audio_port, mix_buf);
     }
@@ -770,21 +853,7 @@ void audio_play(int index, float volume, float pitch) {
      * synchronous exactly like before. */
     sfx_entry_t *e = sfx_find(index);
     if (e) {
-        /* Steal the first free (or oldest = slot 0) voice. */
-        int slot = -1;
-        for (int i = 0; i < MAX_SFX_VOICES; i++)
-            if (!sfx_voices[i].active) {
-                slot = i;
-                break;
-            }
-        if (slot < 0)
-            slot = 0;
-        sfx_voices[slot].active = 1;
-        sfx_voices[slot].paused = 0;
-        sfx_voices[slot].e = e;
-        sfx_voices[slot].pos_fix = 0;
-        sfx_voices[slot].step_fix = (uint32_t)((double)pitch * 65536.0);
-        sfx_voices[slot].vol = volume;
+        sfx_voice_start_locked(e, volume, pitch);
         sceKernelUnlockMutex(audio_mutex, 1);
         return;
     }
@@ -793,7 +862,7 @@ void audio_play(int index, float volume, float pitch) {
      * engine's own JNI call from inside GameRenderer_nativeRender(), see
      * the comment above enqueue_play_sfx_locked()). Defer it to the mixer
      * thread and return immediately; the voice starts up to one mixer
-     * tick (~43 ms) later instead of freezing the frame. */
+     * tick (~21 ms) later instead of freezing the frame. */
     enqueue_play_sfx_locked(index, volume, pitch, 1 /* start a voice once decoded */);
     sceKernelUnlockMutex(audio_mutex, 1);
 }
@@ -812,7 +881,7 @@ static void sfx_stop(int index) {
     for (int i = 0; i < MAX_SFX_VOICES; i++)
         if (sfx_voices[i].active && sfx_voices[i].e &&
             sfx_voices[i].e->index == index)
-            sfx_voices[i].active = 0;
+            sfx_voice_release(&sfx_voices[i]);
     sceKernelUnlockMutex(audio_mutex, 1);
 }
 
@@ -832,10 +901,12 @@ void audio_stop_sfx(int index, int instance) {
 }
 
 void audio_unload(int index) {
-    sceKernelLockMutex(audio_mutex, 1, NULL);
-    sfx_stop(index);
+    sceKernelLockMutex(audio_mutex, 1, NULL); /* non-recursive: no sfx_stop() in here */
     sfx_entry_t *e = sfx_find(index);
     if (e) {
+        for (int i = 0; i < MAX_SFX_VOICES; i++)
+            if (sfx_voices[i].active && sfx_voices[i].e == e)
+                sfx_voices[i].active = 0; /* hard stop: the PCM is freed below */
         free(e->pcm);
         e->pcm = NULL;
         e->used = 0;
@@ -1081,7 +1152,7 @@ int audio_is_media_playing(int index) {
         }
     if (!playing) {
         for (int i = 0; i < MAX_SFX_VOICES; i++)
-            if (sfx_voices[i].active && !sfx_voices[i].paused &&
+            if (sfx_voices[i].active && !sfx_voices[i].paused && !sfx_voices[i].stopping &&
                 (index < 0 || (sfx_voices[i].e && sfx_voices[i].e->index == index))) {
                 playing = 1;
                 break;
@@ -1094,7 +1165,7 @@ int audio_is_media_playing(int index) {
 void audio_stop_all(void) {
     sceKernelLockMutex(audio_mutex, 1, NULL);
     for (int i = 0; i < MAX_SFX_VOICES; i++)
-        sfx_voices[i].active = 0;
+        sfx_voice_release(&sfx_voices[i]);
     for (int i = 0; i < MAX_BIG_VOICES; i++) {
         /* Fase 59: same pending-cancel as audio_stop_big -- a queued or
          * in-flight open must not start playing after a stop-all. */

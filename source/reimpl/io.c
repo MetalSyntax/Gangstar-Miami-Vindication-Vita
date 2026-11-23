@@ -25,6 +25,7 @@
 #include "utils/logger.h"
 #include "utils/utils.h"
 #include "utils/filecache.h"
+#include "reimpl/memfile.h"
 
 // Includes the following inline utilities:
 // int oflags_musl_to_newlib(int flags);
@@ -236,6 +237,12 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
     }
 
 #ifdef USE_SCELIBC_IO
+    // Fase 74: small read-only assets -> RAM, streamed by the core-1 reader.
+    if (!is_write && in_data) {
+        FILE *mf = memfile_open(path);
+        if (mf)
+            return mf;
+    }
     FILE* ret = sceLibcBridge_fopen(path, mode);
     if (ret && !is_write) {
         sceLibcBridge_setvbuf(ret, NULL, _IOFBF, 128 * 1024);
@@ -363,6 +370,8 @@ int fclose_soloader(FILE * f) {
     // 2026-09-05): log BEFORE the call too -- if the crash is inside fclose
     // on a garbage FILE*, only the entry line will appear. Remove once found.
     l_debug("fclose(%p)...", f);
+    if (memfile_close(f))
+        return 0;
 #ifdef USE_SCELIBC_IO
     int ret = sceLibcBridge_fclose(f);
 #else

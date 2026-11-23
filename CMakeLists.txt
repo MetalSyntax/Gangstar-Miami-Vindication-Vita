@@ -96,6 +96,8 @@ endif()
 add_executable(${CMAKE_PROJECT_NAME}
                source/main.c
                source/dynlib.c
+               source/reimpl/aeabi_vfp.c
+               source/reimpl/memfile.c
                source/java.c
                source/patch.c
                source/video.cpp
@@ -132,6 +134,8 @@ add_executable(${CMAKE_PROJECT_NAME}
 
 add_subdirectory(lib/libc_bridge)
 add_dependencies(${CMAKE_PROJECT_NAME} SceLibcBridge)
+# Fase 73: the __aeabi_* VFP replacements must keep IEEE NaN/compare semantics.
+set_source_files_properties(source/reimpl/aeabi_vfp.c PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
 
 target_include_directories(${CMAKE_PROJECT_NAME} SYSTEM
                            PUBLIC ${CMAKE_SOURCE_DIR}/lib

@@ -325,20 +325,45 @@ PTHR_INLINE int _cond_t_static_init(pthread_cond_t_bionic * cond, const pthread_
     return ret;
 }
 
+/* Fase 72: every engine thread runs on cores 0-1, never on core 2 (the
+ * audio core: mixer, loader, cutscene audio). Fase 67 pinned them to 1-2 and
+ * collided with the mixer (choppy audio, 2x slower loads, reverted in 68);
+ * 0-1 shares the render core instead, and the scheduler can still move the
+ * load-time worker to core 1 while the render thread is busy. */
+typedef struct { void *(*start)(void *); void *param; } engine_thread_arg_t;
+
+static void *engine_thread_entry(void *p) {
+    engine_thread_arg_t a = *(engine_thread_arg_t *)p;
+    free(p);
+    sceKernelChangeThreadCpuAffinityMask(0, SCE_KERNEL_CPU_MASK_USER_0 | SCE_KERNEL_CPU_MASK_USER_1);
+    return a.start(a.param);
+}
+
 int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr, void *(*start)(void *), void *param) {
     int ret;
+    engine_thread_arg_t *ta = malloc(sizeof(*ta));
+    if (ta) {
+        ta->start = start;
+        ta->param = param;
+    }
+    void *(*entry)(void *) = ta ? engine_thread_entry : start;
+    void *arg = ta ? (void *)ta : param;
 
     if (!attr) {
         pthread_attr_t a;
         pthread_attr_init(&a);
         pthread_attr_setstacksize(&a, 512 * 1024);
-        ret = pthread_create(thread, &a, start, param);
+        ret = pthread_create(thread, &a, entry, arg);
         pthread_attr_destroy(&a);
     } else{
         _attr_t_static_init((pthread_attr_t_bionic *) attr);
         pthread_attr_setstacksize(attr->real_ptr, 512 * 1024);
-        ret = pthread_create(thread, attr->real_ptr, start, param);
+        ret = pthread_create(thread, attr->real_ptr, entry, arg);
     }
+    if (ret != 0)
+        free(ta);
+    else
+        l_note("[pthr] engine thread -> cores 0-1");
 
     return ret;
 }

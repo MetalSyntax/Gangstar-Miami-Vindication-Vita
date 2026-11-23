@@ -3,7 +3,84 @@
 > Bitácora cronológica, un bug confirmado a la vez. Para el estado **estructural** del port (motor,
 > mapa JNI, filesystem, niveles de logging, checklist) ver `PORTING_PLAN.md`.
 
-## Estado actual — 2026-11-23 (Fase 71: intro a ~12 fps = pts 0 en frames retenidos; stick derecho = cámara por swipe; audio entero en el núcleo 2; sin confirmar en consola real)
+## Estado actual — 2026-11-23 (Fase 75: botón de radio y "agacharse"; sin confirmar en consola real)
+
+- **Agacharse:** el motor no tiene agacharse libre. Lo único es cubrirse (`Character::takeCover`, botón
+  HUD `+0x6c` tipo 0xe), que el HUD solo ofrece cerca de una cobertura. Forzar `takeCover()` en
+  cualquier lado reproduce una animación de agacharse (0x56), pero el usuario eligió no inventar
+  comportamiento: la acción "Take cover" se renombra **"Crouch / Cover"** (Cuadrado, como antes).
+- **Radio:** nueva acción **"Radio station"** (Cuadrado por defecto; Cuadrado está libre en el
+  vehículo, y la compuerta de la radio falla a pie igual que la de cubrirse falla en el auto).
+  Replica `Radio::processTouch` (2bce7c) en un swipe a la derecha: mismas compuertas del widget
+  `CHudManager+0x78` (vtable+0x14, `+0xc` bit0, `+0x74` bit0 libre), `SoundManager::nextRadioStation()`
+  y la etiqueta del HUD con `AnimObject::SetAnim(+0x5c, +0x60 + estación)`. Va al final de
+  `s_actions` para que los `BINDn` de `port_menu.txt` sigan válidos. `pad_action` gana `fn`, una
+  acción directa en vez de un tap sintético.
+- Release v0.4.0 pendiente: el usuario pidió probar primero (la Fase 74 aún no llegó a la consola).
+
+## Estado previo — 2026-11-23 (Fase 74: assets leídos a RAM por un hilo en el núcleo 1 durante las cargas; sin confirmar en consola real)
+
+**Log 073** (Fase 73 en consola): `aeabi_vfp: self-test OK`; gameplay pasó de 32-47 fps a **52-60 fps**
+(render 11-18 ms). Las cargas siguen largas: frame 2 = 8.0 s (primera carga), frames 311-320 = 2 s,
+13.2 s y 14.9 s (carga intermedia). (El latido imprime `render 3212.2` para 13212 ms: el `%f` del
+logger corta 5 cifras; vale la línea `slow render`.)
+
+- **Causa probable:** el motor parsea `.bdae`/`.bsprite`/`.tga` con miles de pares `fseek`+`fread`
+  pequeños (traza de la Fase 16). `fopen_soloader` pone un buffer de 128 KB y cada `fseek` de SceLibc
+  lo descarta: cada par vuelve a leer de la memory card, en serie, en el núcleo 0. Datos en consola:
+  3216 archivos, 334 `.tga` (242 MB), 216 `.bdae`; todo pesa menos de 2.4 MB salvo `miami.bdae`
+  (18 MB) y `fontall.ttf` (16 MB).
+- **Fix (`reimpl/memfile.c`):** un `fopen` de solo lectura dentro de `data/` y de hasta 4 MB devuelve
+  un FILE en RAM. El hilo `memfile_reader` (núcleo 1, prioridad 0x80) lo lee completo en bloques de
+  256 KB mientras el núcleo 0 ya parsea lo que llegó. `fread`/`fseek`/`ftell`/`fgetc`/`getc`/
+  `ungetc`/`feof`/`ferror`/`fgetpos`/`fsetpos`/`setvbuf`/`fflush` del motor pasan por `mf_*` (memcpy,
+  y espera solo si piden bytes que aún no llegaron); lo que no es memfile va a SceLibcBridge igual
+  que antes. `fclose` cancela o espera al lector antes de liberar. Máximo 64 abiertos; si se pasa,
+  se usa el camino nativo.
+- **Medición:** cada frame lento (y los 10 primeros) agrega `[io: N files K KB via core 1, core 0
+  waited W ms]`. Si W es una fracción pequeña del frame, el resto de la carga es CPU del motor
+  (parseo y descompresión) o subida de texturas: eso es lo siguiente a atacar.
+
+## Estado previo — 2026-11-23 (Fase 73: aritmética de punto flotante del motor por VFP en vez de emulación libgcc; sin confirmar en consola real)
+
+**Log 072:** solo nacen 2 hilos del motor (`[pthr] engine thread -> cores 0-1`); gameplay 32-47 fps con
+render 20-35 ms. El usuario ve el núcleo 0 al 100 %, el 1 casi ocioso y el 2 a media carga. Todo el
+juego corre dentro de `nativeRender()` en el hilo principal, así que fijar afinidades no mueve ese
+trabajo; hay que abaratarlo.
+
+- **Causa:** el `.so` es armeabi soft-float. Cada operación float/double del motor es una llamada a
+  `__aeabi_fmul`/`fadd`/`fdiv`/`fcmp*`/`i2f`/`d*` (p. ej. el bucle de vértices de
+  `CColladaSoftwareSkinTechnique::skin` está hecho solo de `__aeabi_fmul`/`__aeabi_fadd`). `dynlib.c`
+  las resolvía contra libgcc, cuya `__aeabi_fmul` son ~120 instrucciones enteras sin `vmul`
+  (objdump de `libgcc.a`).
+- **Fix (`reimpl/aeabi_vfp.c`):** 28 reemplazos `vfp_*` compilados con `-mfloat-abi=softfp` (el mismo
+  ABI que `__aeabi_*`) y `-fno-fast-math` (semántica IEEE de NaN en las comparaciones). Cada uno queda
+  en `vmov`+1 instrucción VFP+`vmov`+`bx lr` (verificado con objdump). Las conversiones de 64 bits
+  y las divisiones enteras siguen en libgcc (no hay instrucción VFP para ellas; el A9 no tiene sdiv).
+  Autotest al arrancar: `aeabi_vfp: self-test OK`.
+- Riesgo: la Vita puede correr con flush-to-zero; los denormales que antes emulaba libgcc ahora
+  pasan a 0. Irrelevante para física y render, pero vigilar si aparece algún NaN o glitch nuevo.
+
+## Estado previo — 2026-11-23 (Fase 72: mezclador estilo Asphalt-5-Vita, hilos del motor en núcleos 0-1; sin confirmar en consola real)
+
+**Log 071** confirmó la Fase 71: intro `avg_fps=25.1 dropped_late=0` (lateness media 18 ms), stick derecho
+OK (usuario). Publicado como **v0.3.0** (commit 13f649e).
+
+- **Audio (`utils/audio.c`, modelo `Asphalt-5-Vita/source/audio.cpp`):** 16 voces SFX (antes 8, y
+  robaba siempre la voz 0). Robo: libre → en fade-out → la copia más vieja del mismo sonido si ya hay
+  4 → la más vieja en general. Envolvente: ataque de 128 frames y fade de 256 al parar o robar (antes
+  corte seco = click). Compensación 1/√N de voces audibles con desliz por muestra (~10 ms) antes del
+  limitador suave. Grano 2048 → 1024 frames (~21 ms de latencia). `audio_is_media_playing` ignora las
+  voces en fade. `audio_unload` tomaba el mutex no recursivo y llamaba a `sfx_stop()`, que lo volvía a
+  tomar: ahora hace el corte seco en la misma sección (el PCM se libera ahí mismo).
+- **Núcleos (`reimpl/pthr.c`):** todo hilo creado por el motor pasa por un trampolín que lo fija a
+  núcleos 0-1 (`[pthr] engine thread -> cores 0-1`). Núcleo 2 = solo audio. La Fase 67 los fijaba a 1-2
+  y chocaba con el mezclador.
+- **Build:** `lib/libc_bridge` declara el stub como `BYPRODUCTS` (el build Ninja de psvita-toolkit fallaba).
+  Este último cambio ya va en v0.3.0.
+- Pendiente conocido sin tocar: `ov_read` de los streams sigue dentro de la sección con lock del mezclador.
+
+## Estado previo — 2026-11-23 (Fase 71: intro a ~12 fps = pts 0 en frames retenidos; stick derecho = cámara por swipe; audio entero en el núcleo 2; sin confirmar en consola real)
 
 **Log 070** (Fase 70 en consola): `present lateness avg=631ms max=4239ms`, `presented=59 dropped_late=51
 (at decode 0)`. Una lateness de 4 s con un ring de 4 slots es imposible por CPU: es un pts falso.

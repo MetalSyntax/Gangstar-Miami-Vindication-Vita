@@ -12,6 +12,8 @@
  * @brief Resolving dynamic imports of the .so.
  */
 
+#include "reimpl/aeabi_vfp.h"
+#include "reimpl/memfile.h"
 #include <psp2/kernel/clib.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -181,36 +183,36 @@ so_default_dynlib default_dynlib[] = {
         { "_ZnajRKSt9nothrow_t", (uintptr_t)&_ZnajRKSt9nothrow_t },
         { "_Znwj", (uintptr_t)&_Znwj },
         { "__aeabi_atexit", (uintptr_t)&__aeabi_atexit },
-        { "__aeabi_d2f", (uintptr_t)&__aeabi_d2f },
-        { "__aeabi_d2iz", (uintptr_t)&__aeabi_d2iz },
+        { "__aeabi_d2f", (uintptr_t)&vfp_d2f }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_d2iz", (uintptr_t)&vfp_d2iz }, /* Fase 73: VFP, not libgcc soft-float */
         { "__aeabi_d2lz", (uintptr_t)&__aeabi_d2lz },
-        { "__aeabi_d2uiz", (uintptr_t)&__aeabi_d2uiz },
+        { "__aeabi_d2uiz", (uintptr_t)&vfp_d2uiz }, /* Fase 73: VFP, not libgcc soft-float */
         { "__aeabi_d2ulz", (uintptr_t)&__aeabi_d2ulz },
-        { "__aeabi_dadd", (uintptr_t)&__aeabi_dadd },
-        { "__aeabi_dcmpeq", (uintptr_t)&__aeabi_dcmpeq },
-        { "__aeabi_dcmpge", (uintptr_t)&__aeabi_dcmpge },
-        { "__aeabi_dcmpgt", (uintptr_t)&__aeabi_dcmpgt },
-        { "__aeabi_dcmple", (uintptr_t)&__aeabi_dcmple },
-        { "__aeabi_dcmplt", (uintptr_t)&__aeabi_dcmplt },
-        { "__aeabi_dcmpun", (uintptr_t)&__aeabi_dcmpun },
-        { "__aeabi_ddiv", (uintptr_t)&__aeabi_ddiv },
-        { "__aeabi_dmul", (uintptr_t)&__aeabi_dmul },
-        { "__aeabi_dsub", (uintptr_t)&__aeabi_dsub },
-        { "__aeabi_f2d", (uintptr_t)&__aeabi_f2d },
-        { "__aeabi_f2iz", (uintptr_t)&__aeabi_f2iz },
+        { "__aeabi_dadd", (uintptr_t)&vfp_dadd }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_dcmpeq", (uintptr_t)&vfp_dcmpeq }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_dcmpge", (uintptr_t)&vfp_dcmpge }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_dcmpgt", (uintptr_t)&vfp_dcmpgt }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_dcmple", (uintptr_t)&vfp_dcmple }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_dcmplt", (uintptr_t)&vfp_dcmplt }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_dcmpun", (uintptr_t)&vfp_dcmpun }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_ddiv", (uintptr_t)&vfp_ddiv }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_dmul", (uintptr_t)&vfp_dmul }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_dsub", (uintptr_t)&vfp_dsub }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_f2d", (uintptr_t)&vfp_f2d }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_f2iz", (uintptr_t)&vfp_f2iz }, /* Fase 73: VFP, not libgcc soft-float */
         { "__aeabi_f2lz", (uintptr_t)&__aeabi_f2lz },
         { "__aeabi_f2ulz", (uintptr_t)&__aeabi_f2ulz },
-        { "__aeabi_fadd", (uintptr_t)&__aeabi_fadd },
-        { "__aeabi_fcmpeq", (uintptr_t)&__aeabi_fcmpeq },
-        { "__aeabi_fcmpge", (uintptr_t)&__aeabi_fcmpge },
-        { "__aeabi_fcmpgt", (uintptr_t)&__aeabi_fcmpgt },
-        { "__aeabi_fcmple", (uintptr_t)&__aeabi_fcmple },
-        { "__aeabi_fcmplt", (uintptr_t)&__aeabi_fcmplt },
-        { "__aeabi_fdiv", (uintptr_t)&__aeabi_fdiv },
-        { "__aeabi_fmul", (uintptr_t)&__aeabi_fmul },
-        { "__aeabi_fsub", (uintptr_t)&__aeabi_fsub },
-        { "__aeabi_i2d", (uintptr_t)&__aeabi_i2d },
-        { "__aeabi_i2f", (uintptr_t)&__aeabi_i2f },
+        { "__aeabi_fadd", (uintptr_t)&vfp_fadd }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_fcmpeq", (uintptr_t)&vfp_fcmpeq }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_fcmpge", (uintptr_t)&vfp_fcmpge }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_fcmpgt", (uintptr_t)&vfp_fcmpgt }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_fcmple", (uintptr_t)&vfp_fcmple }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_fcmplt", (uintptr_t)&vfp_fcmplt }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_fdiv", (uintptr_t)&vfp_fdiv }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_fmul", (uintptr_t)&vfp_fmul }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_fsub", (uintptr_t)&vfp_fsub }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_i2d", (uintptr_t)&vfp_i2d }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_i2f", (uintptr_t)&vfp_i2f }, /* Fase 73: VFP, not libgcc soft-float */
         { "__aeabi_idiv", (uintptr_t)&__aeabi_idiv },
         { "__aeabi_idivmod", (uintptr_t)&__aeabi_idivmod },
         { "__aeabi_l2d", (uintptr_t)&__aeabi_l2d },
@@ -229,8 +231,8 @@ so_default_dynlib default_dynlib[] = {
         { "__aeabi_memset", (uintptr_t)&__aeabi_memset },
         { "__aeabi_memset4",  (uintptr_t)&__aeabi_memset4 },
         { "__aeabi_memset8", (uintptr_t)&__aeabi_memset8 },
-        { "__aeabi_ui2d", (uintptr_t)&__aeabi_ui2d },
-        { "__aeabi_ui2f", (uintptr_t)&__aeabi_ui2f },
+        { "__aeabi_ui2d", (uintptr_t)&vfp_ui2d }, /* Fase 73: VFP, not libgcc soft-float */
+        { "__aeabi_ui2f", (uintptr_t)&vfp_ui2f }, /* Fase 73: VFP, not libgcc soft-float */
         { "__aeabi_uidiv", (uintptr_t)&__aeabi_uidiv },
         { "__aeabi_uidivmod", (uintptr_t)&__aeabi_uidivmod },
         { "__aeabi_ul2d", (uintptr_t)&__aeabi_ul2d },
@@ -438,11 +440,11 @@ so_default_dynlib default_dynlib[] = {
 
         #ifdef USE_SCELIBC_IO
             { "fdopen", (uintptr_t)&sceLibcBridge_fdopen },
-            { "feof", (uintptr_t)&sceLibcBridge_feof },
-            { "ferror", (uintptr_t)&sceLibcBridge_ferror },
-            { "fflush", (uintptr_t)&sceLibcBridge_fflush },
-            { "fgetc", (uintptr_t)&sceLibcBridge_fgetc },
-            { "fgetpos", (uintptr_t)&sceLibcBridge_fgetpos },
+            { "feof", (uintptr_t)&mf_feof }, /* Fase 74: memfile, else SceLibc */
+            { "ferror", (uintptr_t)&mf_ferror }, /* Fase 74: memfile, else SceLibc */
+            { "fflush", (uintptr_t)&mf_fflush }, /* Fase 74: memfile, else SceLibc */
+            { "fgetc", (uintptr_t)&mf_fgetc }, /* Fase 74: memfile, else SceLibc */
+            { "fgetpos", (uintptr_t)&mf_fgetpos }, /* Fase 74: memfile, else SceLibc */
             { "fgets", (uintptr_t)&sceLibcBridge_fgets },
             { "fileno", (uintptr_t)&sceLibcBridge_fileno },
             { "fputc", (uintptr_t)&sceLibcBridge_fputc },
@@ -451,22 +453,22 @@ so_default_dynlib default_dynlib[] = {
             { "fread", (uintptr_t)&fread_soloader },
             { "fseek", (uintptr_t)&fseek_soloader },
         #else
-            { "fread", (uintptr_t)&sceLibcBridge_fread },
-            { "fseek", (uintptr_t)&sceLibcBridge_fseek },
+            { "fread", (uintptr_t)&mf_fread }, /* Fase 74: memfile, else SceLibc */
+            { "fseek", (uintptr_t)&mf_fseek }, /* Fase 74: memfile, else SceLibc */
         #endif
             { "freopen", (uintptr_t)&freopen_soloader },
-            { "fsetpos", (uintptr_t)&sceLibcBridge_fsetpos },
-            { "ftell", (uintptr_t)&sceLibcBridge_ftell },
+            { "fsetpos", (uintptr_t)&mf_fsetpos }, /* Fase 74: memfile, else SceLibc */
+            { "ftell", (uintptr_t)&mf_ftell }, /* Fase 74: memfile, else SceLibc */
             { "fwide", (uintptr_t)&sceLibcBridge_fwide },
             { "fwrite", (uintptr_t)&sceLibcBridge_fwrite },
-            { "getc", (uintptr_t)&sceLibcBridge_getc },
+            { "getc", (uintptr_t)&mf_getc }, /* Fase 74: memfile, else SceLibc */
             { "getwc", (uintptr_t)&sceLibcBridge_getwc },
             { "putc", (uintptr_t)&sceLibcBridge_putc },
             { "putchar", (uintptr_t)&sceLibcBridge_putchar },
             { "puts", (uintptr_t)&sceLibcBridge_puts },
             { "putwc", (uintptr_t)&sceLibcBridge_putwc },
-            { "setvbuf", (uintptr_t)&sceLibcBridge_setvbuf },
-            { "ungetc", (uintptr_t)&sceLibcBridge_ungetc },
+            { "setvbuf", (uintptr_t)&mf_setvbuf }, /* Fase 74: memfile, else SceLibc */
+            { "ungetc", (uintptr_t)&mf_ungetc }, /* Fase 74: memfile, else SceLibc */
             { "ungetwc", (uintptr_t)&sceLibcBridge_ungetwc },
         #else
             { "fdopen", (uintptr_t)&fdopen },
